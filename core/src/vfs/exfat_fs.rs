@@ -1456,6 +1456,10 @@ impl ExFatFs {
         }
         let mut queue: VecDeque<(Ext, u64, String)> = VecDeque::new();
         queue.push_back((root, rn, "/".into()));
+        // A directory whose clusters are reached twice (e.g. a subdirectory pointing back at
+        // the root) is a loop: walk it once.
+        let mut seen_dirs = std::collections::HashSet::new();
+        seen_dirs.insert(self.b.root);
         let mut dirs = 0usize;
         while let Some((x, n, path)) = queue.pop_front() {
             dirs += 1;
@@ -1493,7 +1497,11 @@ impl ExFatFs {
                             mark(c, &mut used);
                         }
                         if s_attr(&e.set) & A_DIR != 0 && len <= MAX_DIR_BYTES {
-                            queue.push_back((Ext { first, nofat }, alloc, format!("{p}/")));
+                            if seen_dirs.insert(first) {
+                                queue.push_back((Ext { first, nofat }, alloc, format!("{p}/")));
+                            } else {
+                                problems.push(format!("directory {p} shares its clusters with another directory (loop)"));
+                            }
                         }
                     }
                     Err(err) => {

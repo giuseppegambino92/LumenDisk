@@ -419,7 +419,7 @@ impl NtfsFs {
         // $Bitmap location (contents loaded lazily)
         let bm = fs.load_inode(6)?;
         match fs.stream(&bm, AT_DATA, &[])? {
-            Some(Stream::NonRes { runs, size, .. }) if size * 8 >= total_clusters => fs.vbm_runs = runs,
+            Some(Stream::NonRes { runs, size, .. }) if size.saturating_mul(8) >= total_clusters => fs.vbm_runs = runs,
             _ => return corrupt("$Bitmap missing or too small"),
         }
         // Keep new data out of the MFT zone (first 1/8th after the MFT).
@@ -495,20 +495,23 @@ impl NtfsFs {
     /// Visit the physical segments backing `[off, off+len)` of a run-mapped stream.
     fn map_runs(&self, runs: &[Run], off: u64, len: u64, mut f: impl FnMut(u64, Option<u64>, u64) -> FsResult<()>) -> FsResult<()> {
         let cs = self.cluster;
+        // Byte offset of a VCN. Runs may reach 2^48 clusters (layout::MAX_CLUSTERS), which
+        // times a 2 MiB cluster exceeds u64: saturate (such a VCN is never reachable).
+        let at = |vcn: u64| vcn.saturating_mul(cs);
         let mut pos = off;
-        let end = off + len;
-        let mut idx = runs.partition_point(|r| (r.vcn + r.len) * cs <= pos);
+        let end = off.checked_add(len).ok_or_else(|| FsError::Corrupt("access beyond 2^64 bytes".into()))?;
+        let mut idx = runs.partition_point(|r| at(r.vcn + r.len) <= pos);
         while pos < end {
             let r = match runs.get(idx) {
-                Some(r) if r.vcn * cs <= pos => *r,
+                Some(r) if at(r.vcn) <= pos => *r,
                 _ => return corrupt("read beyond mapped runs"),
             };
-            let run_end = (r.vcn + r.len) * cs;
+            let run_end = at(r.vcn + r.len);
             let n = (run_end.min(end)) - pos;
             let phys = match r.lcn {
                 Some(l) => {
                     self.check_lcn(l, r.len)?;
-                    Some(l * cs + (pos - r.vcn * cs))
+                    Some(l * cs + (pos - at(r.vcn)))
                 }
                 None => None,
             };
@@ -567,7 +570,7 @@ impl NtfsFs {
 
     fn read_record_raw(&self, no: u64) -> FsResult<Vec<u8>> {
         let rs = self.rec_size as u64;
-        if (no + 1) * rs > self.mft_size {
+        if no.checked_add(1).and_then(|n| n.checked_mul(rs)).map_or(true, |e| e > self.mft_size) {
             return Err(FsError::NotFound);
         }
         let mut raw = vec![0u8; self.rec_size];
@@ -582,7 +585,7 @@ impl NtfsFs {
 
     fn write_record_raw(&mut self, no: u64, raw: &[u8]) -> FsResult<()> {
         let rs = self.rec_size as u64;
-        if (no + 1) * rs > self.mft_size {
+        if no.checked_add(1).and_then(|n| n.checked_mul(rs)).map_or(true, |e| e > self.mft_size) {
             return corrupt("record beyond $MFT");
         }
         self.write_runs(&self.mft_runs, no * rs, raw)?;
@@ -829,7 +832,7 @@ impl NtfsFs {
             for &(lcn, len) in &got {
                 push_run(&mut n.runs, Some(lcn), len);
             }
-            n.alloc = (cur_clusters + grow) * cs;
+            n.alloc = (cur_clusters + grow).checked_mul(cs).filter(|&b| b <= self.dev.size()).ok_or_else(|| FsError::Corrupt("$MFT larger than the volume".into()))?;
             new_size = n.alloc / rs * rs;
             n.size = new_size;
             n.init = new_size;
@@ -1037,7 +1040,7 @@ impl NtfsFs {
                     }
                     runs.extend_from_slice(&e.runs);
                 }
-                if runs_end(&runs) * self.cluster < n0.size.min(n0.alloc) {
+                if runs_end(&runs).saturating_mul(self.cluster) < n0.size.min(n0.alloc) {
                     return corrupt("runlist shorter than attribute size");
                 }
                 Ok(Some(Stream::NonRes { runs, size: n0.size, init: n0.init.min(n0.size), flags: first.flags, comp_unit: n0.comp_unit }))
@@ -1075,10 +1078,11 @@ impl NtfsFs {
     }
 
     fn read_compressed(&self, runs: &[Run], comp_unit: u8, off: u64, out: &mut [u8]) -> FsResult<()> {
-        if comp_unit > 8 {
+        // Windows only writes 16-cluster units with clusters <= 4 KiB; bound the unit buffer.
+        let cs = self.cluster;
+        if comp_unit > 8 || (cs << comp_unit) > 1 << 20 {
             return corrupt("bad compression unit");
         }
-        let cs = self.cluster;
         let cu_cl = 1u64 << comp_unit;
         let cu_bytes = cu_cl * cs;
         let end = off + out.len() as u64;
@@ -2056,6 +2060,154 @@ fn lznt1_decompress(src: &[u8], dst: &mut [u8]) -> FsResult<()> {
         }
     }
     Ok(())
+}
+
+/// Greedy LZNT1 compressor (4 KiB chunks). Only used to build test volumes: the driver itself
+/// never writes compressed files.
+fn lznt1_compress(src: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    for chunk in src.chunks(4096) {
+        let mut body = vec![];
+        let mut pos = 0usize;
+        while pos < chunk.len() {
+            let flag_at = body.len();
+            body.push(0u8);
+            for bit in 0..8 {
+                if pos >= chunk.len() {
+                    break;
+                }
+                let mut lbits = 12usize;
+                let mut p = pos.saturating_sub(1);
+                while p >= 0x10 {
+                    lbits -= 1;
+                    p >>= 1;
+                }
+                let (max_disp, max_len) = (1usize << (16 - lbits), (1usize << lbits) + 2);
+                let mut best = (0usize, 0usize);
+                for disp in 1..=pos.min(max_disp) {
+                    let mut l = 0;
+                    while l < max_len && pos + l < chunk.len() && chunk[pos + l] == chunk[pos + l - disp] {
+                        l += 1;
+                    }
+                    if l > best.1 {
+                        best = (disp, l);
+                    }
+                }
+                if best.1 >= 3 {
+                    let t = ((best.0 - 1) << lbits) | (best.1 - 3);
+                    body.extend_from_slice(&(t as u16).to_le_bytes());
+                    body[flag_at] |= 1 << bit;
+                    pos += best.1;
+                } else {
+                    body.push(chunk[pos]);
+                    pos += 1;
+                }
+            }
+        }
+        if body.len() < chunk.len() {
+            out.extend_from_slice(&(0xB000u16 | (body.len() as u16 - 1)).to_le_bytes());
+            out.extend_from_slice(&body);
+        } else {
+            out.extend_from_slice(&(0x3000u16 | (chunk.len() as u16 - 1)).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+    }
+    out
+}
+
+/// Value of an `IO_REPARSE_TAG_MOUNT_POINT` (junction) reparse point (test volumes).
+#[doc(hidden)]
+pub fn debug_junction_value(subst: &str, print: &str) -> Vec<u8> {
+    let s = utf16_bytes(&to_utf16(subst));
+    let p = utf16_bytes(&to_utf16(print));
+    let mut d = vec![0u8; 8];
+    put16(&mut d, 2, s.len() as u16 + 2);
+    put16(&mut d, 4, s.len() as u16 + 2);
+    put16(&mut d, 6, p.len() as u16);
+    d.extend_from_slice(&s);
+    d.extend_from_slice(&[0, 0]);
+    d.extend_from_slice(&p);
+    d.extend_from_slice(&[0, 0]);
+    let mut v = vec![0u8; 8];
+    put32(&mut v, 0, IO_REPARSE_TAG_MOUNT_POINT);
+    put16(&mut v, 4, d.len() as u16);
+    v.extend_from_slice(&d);
+    v
+}
+
+// ─────────────── test hooks (seed images for fuzzkit.rs; not a stable API) ───────────────
+
+#[doc(hidden)]
+impl NtfsFs {
+    /// Make `ino` (an empty file) an LZNT1-compressed file holding `data`, laid out like
+    /// Windows does it: 16-cluster compression units, each either stored raw, compressed
+    /// (followed by a sparse run) or entirely sparse.
+    pub fn debug_make_compressed(&mut self, ino: Ino, data: &[u8]) -> FsResult<()> {
+        self.writable()?;
+        let cs = self.cluster;
+        if cs > 4096 {
+            return Err(FsError::Unsupported("compression needs clusters <= 4 KiB".into()));
+        }
+        let cu_bytes = 16 * cs as usize;
+        let mut runs: Vec<Run> = vec![];
+        let mut allocated = 0u64;
+        for unit in data.chunks(cu_bytes) {
+            let vcn = runs_end(&runs);
+            let packed = lznt1_compress(unit);
+            let (bytes, stored) = if unit.iter().all(|&b| b == 0) {
+                (vec![], 0)
+            } else if packed.len() as u64 <= 15 * cs {
+                let n = ceil_div(packed.len() as u64, cs);
+                (packed, n)
+            } else {
+                (unit.to_vec(), 16)
+            };
+            if stored > 0 {
+                let got = self.alloc_clusters(stored, self.data_hint)?;
+                let mut v = bytes;
+                v.resize((stored * cs) as usize, 0);
+                let mut o = 0usize;
+                for (lcn, len) in got {
+                    self.dev.write_at(lcn * cs, &v[o..o + (len * cs) as usize])?;
+                    o += (len * cs) as usize;
+                    runs.push(Run { vcn: runs_end(&runs), lcn: Some(lcn), len });
+                }
+                allocated += stored * cs;
+            }
+            if stored < 16 {
+                runs.push(Run { vcn: runs_end(&runs), lcn: None, len: vcn + 16 - runs_end(&runs) });
+            }
+        }
+        let mut i = self.load_inode(ino)?;
+        let l = self.single_loc(&i, AT_DATA, &[])?;
+        let mut a = Attribute::nonresident(AT_DATA, &[], runs, data.len() as u64, cs);
+        a.flags = 0x0001;
+        a.instance = i.attr(l).instance;
+        if let Body::NonRes(n) = &mut a.body {
+            n.comp_unit = 4;
+            n.comp_size = allocated;
+        }
+        *i.attr_mut(l) = a;
+        let mut si = i.std_info();
+        si.attrs |= FILE_ATTR_COMPRESSED;
+        i.set_std_info(&si);
+        self.store_inode(&mut i)?;
+        self.sync_dup(ino)
+    }
+
+    /// Turn a node into a reparse point with an arbitrary value (what Windows creates).
+    pub fn debug_set_reparse(&mut self, ino: Ino, value: Vec<u8>) -> FsResult<()> {
+        self.writable()?;
+        let tag = tag_of(&value).ok_or_else(|| FsError::Invalid("short reparse value".into()))?;
+        let mut i = self.load_inode(ino)?;
+        i.add(Attribute::resident(AT_REPARSE_POINT, &[], value));
+        let mut si = i.std_info();
+        si.attrs |= FILE_ATTR_REPARSE;
+        i.set_std_info(&si);
+        self.store_inode(&mut i)?;
+        self.r_insert(tag, i.mref())?;
+        self.sync_dup(ino)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

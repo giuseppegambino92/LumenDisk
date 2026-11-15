@@ -414,8 +414,8 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     put64(&mut boot, 0x38, mirr_lcn);
     boot[0x40] = (-10i8) as u8; // 2^10 = 1024-byte records
     boot[0x44] = 1; // one cluster per index block
-    let serial = uuid::Uuid::new_v4();
-    boot[0x48..0x50].copy_from_slice(&serial.as_bytes()[..8]);
+    let serial = crate::vfs::random_id();
+    boot[0x48..0x50].copy_from_slice(&serial[..8]);
     let code = hex(BOOT_CODE);
     boot[0x54..0x54 + code.len()].copy_from_slice(&code);
     boot[510] = 0x55;

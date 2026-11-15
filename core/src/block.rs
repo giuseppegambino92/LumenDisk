@@ -35,8 +35,11 @@ pub trait BlockDev: Send + Sync {
     /// because the last committed metadata may still reference it. Default: nothing to do.
     fn note_freed(&self, _offset: u64, _len: u64) {}
 
-    /// Convenience helper.
+    /// Convenience helper. The range is checked against the device size *before* the buffer
+    /// is allocated, so a length taken from corrupt on-disk metadata can't trigger a huge
+    /// allocation.
     fn read_vec(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        bounds(offset, len, self.size())?;
         let mut v = vec![0u8; len];
         self.read_at(offset, &mut v)?;
         Ok(v)
@@ -262,6 +265,10 @@ pub struct MemDev {
 impl MemDev {
     pub fn new(size: usize) -> Self {
         MemDev { data: Mutex::new(vec![0u8; size]) }
+    }
+    /// Device backed by an existing image (no copy).
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        MemDev { data: Mutex::new(data) }
     }
     pub fn snapshot(&self) -> Vec<u8> {
         self.data.lock().unwrap().clone()
