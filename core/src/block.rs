@@ -65,6 +65,8 @@ pub struct FileDev {
     file: File,
     size: u64,
     ro: bool,
+    /// Logical sector size of a device node (DKIOCGETBLOCKSIZE); None for regular files.
+    sector: Option<u32>,
 }
 
 impl FileDev {
@@ -81,16 +83,23 @@ impl FileDev {
     }
 
     fn from_file(file: File, ro: bool) -> io::Result<Self> {
-        let size = device_size(&file)?;
-        Ok(FileDev { file, size, ro })
+        let (size, sector) = device_geometry(&file)?;
+        Ok(FileDev { file, size, ro, sector })
+    }
+
+    /// Logical sector size of a device node: raw (`/dev/rdisk*`) nodes accept only I/O whose
+    /// offset and length are multiples of it. None for regular files.
+    pub fn sector_size(&self) -> Option<u32> {
+        self.sector
     }
 }
 
-/// Size of a regular file or of a block/char device (via DKIOCGETBLOCKCOUNT).
-fn device_size(file: &File) -> io::Result<u64> {
+/// Size (and, for a block/char device, logical sector size) of a regular file or device node.
+/// A partition node (`/dev/diskNsM`) reports the size of the partition.
+fn device_geometry(file: &File) -> io::Result<(u64, Option<u32>)> {
     let md = file.metadata()?;
     if md.is_file() {
-        return Ok(md.len());
+        return Ok((md.len(), None));
     }
     #[cfg(target_os = "macos")]
     {
@@ -104,8 +113,9 @@ fn device_size(file: &File) -> io::Result<u64> {
         unsafe {
             if libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKSIZE, &mut bs) == 0
                 && libc::ioctl(file.as_raw_fd(), DKIOCGETBLOCKCOUNT, &mut bc) == 0
+                && bs > 0
             {
-                return Ok(bs as u64 * bc);
+                return Ok((bs as u64 * bc, Some(bs)));
             }
         }
     }
@@ -146,7 +156,12 @@ impl BlockDev for FileDev {
                             return Err(err);
                         }
                     }
-                    libc::ioctl(self.file.as_raw_fd(), DKIOCSYNCHRONIZECACHE);
+                    if libc::ioctl(self.file.as_raw_fd(), DKIOCSYNCHRONIZECACHE) != 0 {
+                        let err = io::Error::last_os_error();
+                        if !matches!(err.raw_os_error(), Some(libc::ENOTTY) | Some(libc::ENOTSUP) | Some(libc::ENODEV)) {
+                            return Err(err);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -159,9 +174,12 @@ impl BlockDev for FileDev {
 }
 
 /// Makes arbitrary byte-granular I/O work on raw devices that require sector alignment.
+/// (Memory alignment is not needed: macOS accepts unaligned user buffers on raw nodes.)
 pub struct AlignedDev {
     inner: Arc<dyn BlockDev>,
     sector: u64,
+    /// Serialises writes: an aligned write landing between the read and the write-back of a
+    /// read-modify-write of the same sector would otherwise be undone.
     lock: Mutex<()>,
 }
 
@@ -169,9 +187,11 @@ impl AlignedDev {
     pub fn new(inner: Arc<dyn BlockDev>, sector: u64) -> Self {
         AlignedDev { inner, sector: sector.max(512), lock: Mutex::new(()) }
     }
+    /// The sector-aligned range covering `offset..offset+len`. The end is clamped to the device
+    /// size, which is a whole number of the device's own sectors but not necessarily of ours.
     fn span(&self, offset: u64, len: usize) -> (u64, u64) {
         let start = offset / self.sector * self.sector;
-        let end = (offset + len as u64).div_ceil(self.sector) * self.sector;
+        let end = ((offset + len as u64).div_ceil(self.sector) * self.sector).min(self.inner.size());
         (start, end)
     }
 }
@@ -193,10 +213,10 @@ impl BlockDev for AlignedDev {
     fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
         bounds(offset, buf.len(), self.inner.size())?;
         let (s, e) = self.span(offset, buf.len());
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         if s == offset && e == offset + buf.len() as u64 {
             return self.inner.write_at(offset, buf);
         }
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut tmp = vec![0u8; (e - s) as usize];
         self.inner.read_at(s, &mut tmp)?;
         let o = (offset - s) as usize;
@@ -599,25 +619,27 @@ pub fn authopen_fd(path: &str, read_write: bool) -> io::Result<RawFd> {
 /// access, otherwise through authopen.
 pub fn open_source(path: &str, read_only: bool, passed_fd: Option<RawFd>) -> io::Result<Arc<dyn BlockDev>> {
     let is_dev = path.starts_with("/dev/");
-    let base: Arc<dyn BlockDev> = if let Some(fd) = passed_fd {
-        Arc::new(FileDev::from_fd(fd, read_only)?)
+    let base = if let Some(fd) = passed_fd {
+        FileDev::from_fd(fd, read_only)?
     } else if is_dev {
         match FileDev::open(Path::new(path), read_only) {
-            Ok(d) => Arc::new(d),
+            Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 let fd = authopen_fd(path, !read_only)?;
-                Arc::new(FileDev::from_fd(fd, read_only)?)
+                FileDev::from_fd(fd, read_only)?
             }
             Err(e) => return Err(e),
         }
     } else {
-        Arc::new(FileDev::open(Path::new(path), read_only)?)
+        FileDev::open(Path::new(path), read_only)?
     };
-    if is_dev || passed_fd.is_some() {
-        Ok(Arc::new(AlignedDev::new(base, 4096)))
-    } else {
-        Ok(base)
+    // Device nodes (and descriptors from authopen / DiskArbitration): sector-aligned I/O, at the
+    // device's own sector size, as raw nodes require.
+    if !is_dev && passed_fd.is_none() {
+        return Ok(Arc::new(base));
     }
+    let sector = base.sector_size().map(u64::from).unwrap_or(4096);
+    Ok(Arc::new(AlignedDev::new(Arc::new(base), sector)))
 }
 
 #[cfg(test)]
@@ -643,6 +665,105 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].start, 2048 * 512);
         assert_eq!(p[1].type_name, "Linux");
+    }
+
+    /// Behaves like a raw `/dev/rdisk*` node: I/O must start and end on a sector boundary
+    /// inside the device (EINVAL otherwise).
+    struct RawSim {
+        mem: MemDev,
+        sector: u64,
+    }
+
+    impl BlockDev for RawSim {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.check(offset, buf.len())?;
+            self.mem.read_at(offset, buf)
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+            self.check(offset, buf.len())?;
+            self.mem.write_at(offset, buf)
+        }
+        fn size(&self) -> u64 {
+            self.mem.size()
+        }
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn read_only(&self) -> bool {
+            false
+        }
+    }
+
+    impl RawSim {
+        fn new(size: usize, sector: u64) -> Self {
+            assert_eq!(size as u64 % sector, 0);
+            RawSim { mem: MemDev::new(size), sector }
+        }
+        fn check(&self, offset: u64, len: usize) -> io::Result<()> {
+            if offset % self.sector != 0 || len as u64 % self.sector != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            bounds(offset, len, self.size())
+        }
+    }
+
+    /// A slice of 79 875 sectors (like `/dev/diskNs1` in the device e2e test) isn't a whole
+    /// number of 4 KiB blocks: its last sectors must still be readable and writable.
+    #[test]
+    fn aligned_dev_reaches_the_end_of_an_odd_sized_device() {
+        let size = 79_875 * 512;
+        for align in [512u64, 4096] {
+            let raw: Arc<dyn BlockDev> = Arc::new(RawSim::new(size, 512));
+            let a = AlignedDev::new(raw.clone(), align);
+            let last = size as u64 - 512;
+            a.write_at(last, &[0xAB; 512]).unwrap();
+            a.write_at(size as u64 - 3, b"end").unwrap();
+            let mut b = [0u8; 512];
+            a.read_at(last, &mut b).unwrap();
+            assert_eq!(&b[..509], &[0xAB; 509][..], "align {align}");
+            assert_eq!(&b[509..], b"end");
+            let mut tail = [0u8; 100];
+            a.read_at(size as u64 - 100, &mut tail).unwrap();
+            assert_eq!(&tail[97..], b"end");
+            assert!(a.read_at(size as u64 - 2, &mut [0u8; 3]).is_err(), "past the end");
+            assert!(a.write_at(size as u64, b"x").is_err(), "past the end");
+        }
+    }
+
+    /// Random byte-granular reads and writes through AlignedDev onto a raw-like device match a
+    /// plain in-memory reference.
+    #[test]
+    fn aligned_dev_random_io_matches_reference() {
+        for (sector, align) in [(512u64, 512u64), (512, 4096), (4096, 4096)] {
+            let size = (3 * 4096 + 5 * 512) / sector as usize * sector as usize; // (not 4 KiB-aligned)
+            let raw: Arc<dyn BlockDev> = Arc::new(RawSim::new(size, sector));
+            let a = AlignedDev::new(raw, align);
+            let reference = MemDev::new(size);
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ sector ^ align;
+            let mut rnd = |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            for i in 0..3000u64 {
+                let off = rnd(size as u64);
+                let len = 1 + rnd((size as u64 - off).min(9000)) as usize;
+                if i % 2 == 0 {
+                    let data: Vec<u8> = (0..len as u64).map(|k| (k + off + i) as u8).collect();
+                    a.write_at(off, &data).unwrap();
+                    reference.write_at(off, &data).unwrap();
+                } else {
+                    let (mut got, mut want) = (vec![0u8; len], vec![0u8; len]);
+                    a.read_at(off, &mut got).unwrap();
+                    reference.read_at(off, &mut want).unwrap();
+                    assert!(got == want, "sector {sector} align {align}: read {off}+{len} differs");
+                }
+            }
+            let mut all = vec![0u8; size];
+            a.read_at(0, &mut all).unwrap();
+            assert!(all == reference.snapshot());
+        }
     }
 
     #[test]
