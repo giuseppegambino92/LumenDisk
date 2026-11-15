@@ -174,7 +174,8 @@ pub struct Counts {
 /// Identity of the volume a session belongs to.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Identity {
-    /// "local" (image file or device) or "image_url".
+    /// "local" (image file or device), "image_url", or a remote server: "sftp", "webdav",
+    /// "lan" (see [`Identity::is_remote`]).
     pub kind: String,
     pub fs_type: String,
     pub uuid: String,
@@ -185,6 +186,21 @@ pub struct Identity {
     pub size: u64,
     #[serde(default)]
     pub media_uuid: Option<String>,
+    /// Remote servers: canonical, credential-free endpoint the session key is derived from
+    /// (`sftp://pi@host:22/home/pi`, `webdav+https://user@nas:443/dav`, `lan://<share id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Remote servers: how to name the session in lists (`user@host:/path`, the URL, the
+    /// share name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+impl Identity {
+    /// A session on an SFTP / WebDAV server or on another Mac's LAN share.
+    pub fn is_remote(&self) -> bool {
+        matches!(self.kind.as_str(), "sftp" | "webdav" | "lan")
+    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -243,9 +259,13 @@ pub fn sessions_root(support: &Path) -> PathBuf {
 /// Stable session key of a volume. Volumes with a filesystem UUID / serial are keyed by it
 /// (plus type and size, so that two cards flashed from the same image don't collide unless
 /// they are identical); volumes without one by source path, partition, label and size.
+/// Remote servers are keyed by their canonical endpoint only: never by credentials, nor by
+/// anything that changes from one connection to the next.
 pub fn session_key(id: &Identity) -> String {
     use sha2::Digest;
-    let basis = if id.kind == "image_url" {
+    let basis = if id.is_remote() {
+        format!("remote|{}|{}", id.kind, id.endpoint.as_deref().unwrap_or(&id.source_path))
+    } else if id.kind == "image_url" {
         format!("url|{}|{}", id.source_path, id.partition)
     } else if !id.uuid.trim().is_empty() {
         format!("local|{}|{}|{}", id.fs_type, id.uuid, id.size)
@@ -354,5 +374,39 @@ mod tests {
         m.partition = 2;
         assert_ne!(session_key(&n), session_key(&m));
         assert!(session_key(&n).starts_with("fat16-"));
+    }
+
+    #[test]
+    fn remote_keys_use_the_endpoint_only() {
+        let a = Identity {
+            kind: "sftp".into(),
+            fs_type: "SFTP".into(),
+            source_path: "sftp://pi@Pi.local/~/x".into(),
+            label: "Raspberry".into(),
+            endpoint: Some("sftp://pi@pi.local:22/home/pi/x".into()),
+            ..Default::default()
+        };
+        let mut b = a.clone();
+        b.source_path = "sftp://pi@pi.local:22/home/pi/x/".into();
+        b.label = "Other name".into();
+        b.size = 12345;
+        assert_eq!(session_key(&a), session_key(&b));
+        assert!(session_key(&a).starts_with("sftp-"));
+        b.endpoint = Some("sftp://root@pi.local:22/home/pi/x".into());
+        assert_ne!(session_key(&a), session_key(&b));
+        let mut w = a.clone();
+        w.kind = "webdav".into();
+        assert_ne!(session_key(&a), session_key(&w));
+    }
+
+    #[test]
+    fn manifests_without_remote_fields_still_load() {
+        // A manifest written before remote sessions existed.
+        let old = r#"{"format":1,"key":"ext4-0011","identity":{"kind":"local","fs_type":"EXT4","uuid":"u","label":"L","source_path":"/x.img","partition":0,"size":9},"created":1,"updated":2,"state":"pending"}"#;
+        let m: Manifest = serde_json::from_str(old).unwrap();
+        assert_eq!(m.identity.endpoint, None);
+        assert!(!m.identity.is_remote());
+        let s = serde_json::to_string(&m.identity).unwrap();
+        assert!(!s.contains("endpoint"), "local identities serialize as before: {s}");
     }
 }
