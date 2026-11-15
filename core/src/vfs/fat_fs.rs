@@ -148,6 +148,9 @@ pub(crate) fn utc_tm(secs: i64) -> Tm {
 }
 
 pub(crate) fn local_tm(secs: i64) -> Tm {
+    if super::deterministic() {
+        return utc_tm(secs);
+    }
     let t = secs as libc::time_t;
     // SAFETY: zeroed tm is a valid out-param; localtime_r is thread safe.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -167,6 +170,9 @@ pub(crate) fn local_tm(secs: i64) -> Tm {
 }
 
 pub(crate) fn local_to_unix(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+    if super::deterministic() {
+        return civil_to_unix(y, mo, d, h, mi, s);
+    }
     // SAFETY: zeroed tm is valid; mktime only reads/normalises it.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     tm.tm_year = (y - 1900) as i32;

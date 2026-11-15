@@ -4,6 +4,8 @@
 //! The C ABI (see `include/lumendisk_ffi.h`) exchanges JSON strings with the Swift app.
 
 pub mod block;
+#[doc(hidden)]
+pub mod fuzzkit;
 pub mod health;
 pub mod i18n;
 pub mod lan;

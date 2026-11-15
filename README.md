@@ -85,11 +85,14 @@ All screenshots come from the real engine with real volumes (see [Verification](
 Requirements: Xcode with Swift 6, [rustup](https://rustup.rs). The `aarch64` and `x86_64` macOS targets are added automatically.
 
 ```sh
-scripts/build_and_verify.sh                           # build, run every test suite, install to /Applications
-SKIP_E2E=1 SKIP_UI=1 NO_INSTALL=1 scripts/build_and_verify.sh   # just build + unit tests
+scripts/build_and_verify.sh                                 # build and run every test suite
+INSTALL=1 scripts/build_and_verify.sh                       # also install the development build to /Applications
+SKIP_E2E=1 SKIP_UI=1 SKIP_FUZZ=1 scripts/build_and_verify.sh  # just build + unit and corrupted-image tests
 ```
 
 The script produces `dist/LumenDisk.app` (universal, ad-hoc signed) and `build/bin/lumendisk` (CLI). The end-to-end suites need Docker; the UI pass opens app windows.
+
+This development build is ad-hoc signed. macOS shows the system socket table only to Developer ID–signed apps, so such a build can't check who connects to its loopback NFS server. It refuses to mount unless you set `LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK=1`; the test scripts set it for you. See [SECURITY.md](SECURITY.md).
 
 To publish, `scripts/release.sh` signs that bundle with a Developer ID, notarizes it and builds the DMGs, the zip and the CLI archive in `dist/release/`. It uses the Apple account logged into Xcode, so no certificate or password setup is needed.
 
@@ -100,6 +103,10 @@ lumendisk mkfs ext4 test.img 512 MyDisk
 lumendisk inspect raspios.img
 lumendisk mount raspios.img --partition 2 --mode shadow
 ```
+
+### Fuzzing
+
+A USB stick or an image can be deliberately malformed, so every volume is treated as untrusted input. `scripts/fuzz.sh [seconds per target]` runs coverage-guided libFuzzer targets (`core/fuzz`: ext4, NTFS, FAT, exFAT and the MBR/GPT parser). Each input is a whole image that is mounted read-only and read-write, walked, modified and repaired. The seeds are images made by LumenDisk's own mkfs and, when Docker is available, by `mkfs.ext4 -d`, `mkfs.vfat` + `mcopy`, `mkntfs` + `ntfscp` and `mkfs.exfat`. It needs a nightly toolchain and cargo-fuzz (`rustup toolchain install nightly`, `cargo install cargo-fuzz`). If they're missing, it says so and skips. `build_and_verify.sh` runs it for 30 s per target when they are installed (`SKIP_FUZZ=1` skips it). Crashes are saved in `core/fuzz/artifacts/`. Before fixing one, `cargo run --profile robust --example fuzz_seeds -- core/tests/corrupt_regressions --regression <target> <file>` turns it into a minimized regression case (a few bytes patched into a reproducible seed image) that runs with every `cargo test`.
 
 ## How it works
 
@@ -127,17 +134,22 @@ mount_nfs 127.0.0.1:/<random export>  →  ~/Volumes/<Name>
 
 | Suite | What it proves |
 |---|---|
-| Unit (102) | every driver passes the same conformance suite; WAL crash replay; Ghost Shield; Shadow, incl. journal replay of random sessions, torn journals, a simulated crash at every step of a commit on ext4 and FAT32, and changes made to the disk elsewhere; remote cache races |
+| Unit (107) | every driver passes the same conformance suite; WAL crash replay; Ghost Shield; Shadow, incl. journal replay of random sessions, torn journals, a simulated crash at every step of a commit on ext4 and FAT32, and changes made to the disk elsewhere; remote cache races; a driver panic fails only its volume, fast (EIO), without poisoning locks |
 | ext4 vs e2fsprogs (5) | real `mkfs.ext4` volumes (64bit, flex_bg, metadata_csum, orphan_file) modified by LumenDisk stay `e2fsck`-clean; jbd2 replay of a real transaction |
 | End-to-end (26) | real `mount_nfs` + Finder's NFS client on ext4 / FAT32 / exFAT / NTFS; Shadow, incl. `kill -9` of the server with staged changes and in the middle of a commit, then `e2fsck`; Doctor; Raspberry Pi image; NTFS symlinks; loopback security; HTTP Range images; offline LAN shares; SFTP; power loss with a 64 MB file; Apache WebDAV with offline queue across restarts; TLS through a sniffing proxy (no plaintext); a real attached block device |
-| LAN server (21) · SFTP (4) | WebDAV/portal protocol over TLS; OpenSSH auth, timeouts and reconnects |
+| Corrupted images (16,000 mutants + regressions) | valid, populated volumes (ext2/ext4 with extents, htree, symlinks and a pending journal transaction; NTFS with index blocks, attribute lists, LZNT1-compressed files and reparse points; FAT12/16/32; exFAT) mutated with a bias towards metadata, plus mutated MBR/GPT tables and every bug found as a regression case: each mutant is mounted read-only and read-write, walked, modified and repaired with no panic, no hang (20 s limit) and no allocation over 1 GiB. A driver panic disables only that volume (EIO from then on) and never wedges it. `LUMENDISK_CORRUPT_CASES` raises the count |
+| LAN server (22) · SFTP (4) | WebDAV/portal protocol over TLS; OpenSSH auth, timeouts and reconnects |
 | UI | every screen driven with the real engine and real volumes, in English and Italian |
+
+## Security
+
+The threat model (who can reach the loopback NFS server and why `AUTH_SYS` is safe only behind a fail-closed connection filter, the Wi-Fi portal, LAN sharing, remote storage and untrusted volumes) is in [SECURITY.md](SECURITY.md).
 
 ## Known limitations
 
 - Volumes appear in `~/Volumes/<Name>`, because an app without administrator rights can't create folders in `/Volumes`.
 - Remote volumes can't open files offline that were never opened while online; they fail quickly instead of hanging.
-- The Wi-Fi portal's HTTPS address shows a one-time certificate warning on phones. The compatibility HTTP address avoids it but isn't encrypted.
+- The Wi-Fi portal's HTTPS address shows a one-time certificate warning on phones. For phones that refuse it, an unencrypted HTTP address can be switched on, after an explicit warning. It is off by default, and while it is on, the PIN and the files travel in clear text on the network.
 - NTFS: compressed and encrypted files are read-only; not yet verified against Windows `chkdsk`.
 - ext4 volumes using inline_data, encryption, casefold, bigalloc, quota or verity mount read-only.
 - Most USB bridges hide SMART data from macOS; LumenDisk then says so plainly.

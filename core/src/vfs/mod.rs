@@ -22,6 +22,7 @@ use crate::block::BlockDev;
 pub mod ext4_fs;
 pub mod exfat_fs;
 pub mod fat_fs;
+pub mod fence;
 pub mod ghost;
 pub mod ntfs_fs;
 pub mod shadow;
@@ -44,8 +45,52 @@ pub struct Timestamp {
     pub nsecs: u32,
 }
 
+thread_local! {
+    /// Test images only (`fuzzkit`): frozen clock + counter for "random" ids on this thread,
+    /// so seed volumes are byte-for-byte reproducible.
+    static DETERMINISTIC: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Freeze the clock (2023-11-14 22:13:20 UTC), use UTC for FAT/exFAT local times and
+/// reproducible ids for volumes built on this thread. Test images only.
+#[doc(hidden)]
+pub fn set_deterministic(on: bool) {
+    DETERMINISTIC.with(|d| d.set(on.then_some(0x5EED)));
+}
+
+pub(crate) fn deterministic() -> bool {
+    DETERMINISTIC.with(|d| d.get().is_some())
+}
+
+/// 16 random bytes (volume UUIDs, serials, hash seeds); reproducible in deterministic mode.
+pub(crate) fn random_id() -> [u8; 16] {
+    let ctr = DETERMINISTIC.with(|d| {
+        let v = d.get();
+        if let Some(c) = v {
+            d.set(Some(c + 1));
+        }
+        v
+    });
+    match ctr {
+        Some(c) => {
+            let mut out = [0u8; 16];
+            let mut x = c.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for b in out.iter_mut() {
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                *b = (x >> 56) as u8;
+            }
+            out
+        }
+        None => *uuid::Uuid::new_v4().as_bytes(),
+    }
+}
+
 impl Timestamp {
     pub fn now() -> Self {
+        if deterministic() {
+            return Timestamp { secs: 1_700_000_000, nsecs: 0 };
+        }
         let d = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -299,9 +344,11 @@ pub fn probe(dev: &dyn BlockDev) -> Option<FsType> {
     fat_fs::probe(dev)
 }
 
-/// Open the right driver for a device.
+/// Open the right driver for a device. The driver is wrapped in a [`fence::PanicFence`]: a
+/// panic on a malformed volume becomes an error and disables the volume instead of unwinding
+/// through the callers' locks.
 pub fn open_fs(dev: Arc<dyn BlockDev>, read_only: bool, defaults: MountDefaults) -> FsResult<Box<dyn FileSystem>> {
-    match probe(dev.as_ref()) {
+    fence::open_fenced(|| match probe(dev.as_ref()) {
         Some(FsType::Ext2 | FsType::Ext3 | FsType::Ext4) => Ok(Box::new(ext4_fs::Ext4Fs::open(dev, read_only)?)),
         Some(FsType::Ntfs) => Ok(Box::new(ntfs_fs::NtfsFs::open(dev, read_only, defaults)?)),
         Some(FsType::ExFat) => Ok(Box::new(exfat_fs::ExFatFs::open(dev, read_only, defaults)?)),
@@ -309,7 +356,7 @@ pub fn open_fs(dev: Arc<dyn BlockDev>, read_only: bool, defaults: MountDefaults)
             Ok(Box::new(fat_fs::FatFs::open(dev, read_only, defaults)?))
         }
         None => Err(FsError::Unsupported("no supported filesystem found".into())),
-    }
+    })
 }
 
 /// Format a device with the requested filesystem (used by the "Crea Disco Virtuale Test" wizard).

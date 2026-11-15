@@ -44,6 +44,9 @@ pub struct ChangeTracker {
     /// Directories never report times older than this (bumped when the whole tree changes
     /// under the client's feet: Shadow commit / rollback).
     dir_floor: Mutex<Timestamp>,
+    /// Set when a call panicked: from then on every call fails with EIO without touching the
+    /// (possibly inconsistent) stack.
+    failed: Mutex<Option<String>>,
 }
 
 impl ChangeTracker {
@@ -53,6 +56,11 @@ impl ChangeTracker {
         self.changed.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.exact.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *self.dir_floor.lock().unwrap_or_else(|e| e.into_inner()) = Timestamp::now();
+    }
+
+    /// Why the volume stopped serving requests after an internal error, if it did.
+    pub fn failure(&self) -> Option<String> {
+        self.failed.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -164,10 +172,19 @@ impl<S: FileSystem + 'static> NfsBridge<S> {
     }
 
     /// Run `f` under the volume lock. Blocking disk I/O is moved off the async reactor and a
-    /// panicking driver turns into NFS3ERR_IO instead of taking the whole volume down.
+    /// panic turns into NFS3ERR_IO instead of taking the whole volume down. Drivers are
+    /// already fenced (`vfs::fence`); a panic caught here (any layer of the stack) disables
+    /// the volume: every later call answers EIO at once, so the client fails fast instead of
+    /// hanging, and nothing touches the stack's possibly half-updated state again.
     fn with<T>(&self, f: impl FnOnce(&mut S) -> Result<T, FsError>) -> Result<T, nfsstat3> {
+        if self.tracker.failure().is_some() {
+            return Err(nfsstat3::NFS3ERR_IO);
+        }
         let run = || {
             let mut g = self.fs.lock().unwrap_or_else(|e| e.into_inner());
+            if self.tracker.failure().is_some() {
+                return Err(nfsstat3::NFS3ERR_IO);
+            }
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut g))) {
                 Ok(r) => r.map_err(|e| {
                     if std::env::var_os("LUMENDISK_TRACE").is_some() {
@@ -175,8 +192,10 @@ impl<S: FileSystem + 'static> NfsBridge<S> {
                     }
                     map_err(e)
                 }),
-                Err(_) => {
-                    eprintln!("lumendisk: driver panic caught, returning EIO");
+                Err(p) => {
+                    let why = crate::vfs::fence::panic_message(p.as_ref());
+                    eprintln!("lumendisk: internal error ({why}); volume disabled, every further request fails with EIO");
+                    *self.tracker.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
                     Err(nfsstat3::NFS3ERR_IO)
                 }
             }
@@ -726,6 +745,122 @@ fn peer_owner(peer: std::net::SocketAddr, server_port: u16) -> Result<PeerOwner,
 pub fn security_policy() -> Arc<nfsserve::context::Security> {
     let me = unsafe { libc::geteuid() };
     Arc::new(nfsserve::context::Security { allowed_uids: vec![me, 0], single_mount: true, ..Default::default() })
+}
+
+#[cfg(test)]
+mod panic_tests {
+    use super::*;
+    use crate::block::MemDev;
+    use crate::vfs::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A FAT volume behind a layer that panics on one inode (a bug above the driver fence).
+    struct Flaky {
+        inner: Box<dyn FileSystem>,
+        bad: Ino,
+        calls: Arc<AtomicU32>,
+    }
+
+    macro_rules! fwd {
+        ($s:ident, $e:expr) => {{
+            $s.calls.fetch_add(1, Ordering::SeqCst);
+            $e
+        }};
+    }
+
+    impl FileSystem for Flaky {
+        fn volume_info(&self) -> VolumeInfo {
+            self.inner.volume_info()
+        }
+        fn statfs(&mut self) -> FsResult<FsStat> {
+            fwd!(self, self.inner.statfs())
+        }
+        fn root_ino(&self) -> Ino {
+            self.inner.root_ino()
+        }
+        fn lookup(&mut self, p: Ino, n: &str) -> FsResult<Ino> {
+            fwd!(self, self.inner.lookup(p, n))
+        }
+        fn getattr(&mut self, i: Ino) -> FsResult<Attr> {
+            if i == self.bad {
+                panic!("simulated bug");
+            }
+            fwd!(self, self.inner.getattr(i))
+        }
+        fn setattr(&mut self, i: Ino, s: &SetAttr) -> FsResult<Attr> {
+            fwd!(self, self.inner.setattr(i, s))
+        }
+        fn read(&mut self, i: Ino, o: u64, l: u32) -> FsResult<Vec<u8>> {
+            fwd!(self, self.inner.read(i, o, l))
+        }
+        fn write(&mut self, i: Ino, o: u64, d: &[u8]) -> FsResult<u32> {
+            fwd!(self, self.inner.write(i, o, d))
+        }
+        fn readdir(&mut self, d: Ino) -> FsResult<Vec<DirEntry>> {
+            fwd!(self, self.inner.readdir(d))
+        }
+        fn create(&mut self, p: Ino, n: &str, m: u16, u: u32, g: u32) -> FsResult<Ino> {
+            fwd!(self, self.inner.create(p, n, m, u, g))
+        }
+        fn mkdir(&mut self, p: Ino, n: &str, m: u16, u: u32, g: u32) -> FsResult<Ino> {
+            fwd!(self, self.inner.mkdir(p, n, m, u, g))
+        }
+        fn symlink(&mut self, p: Ino, n: &str, t: &str, u: u32, g: u32) -> FsResult<Ino> {
+            fwd!(self, self.inner.symlink(p, n, t, u, g))
+        }
+        fn readlink(&mut self, i: Ino) -> FsResult<String> {
+            fwd!(self, self.inner.readlink(i))
+        }
+        fn unlink(&mut self, p: Ino, n: &str) -> FsResult<()> {
+            fwd!(self, self.inner.unlink(p, n))
+        }
+        fn rmdir(&mut self, p: Ino, n: &str) -> FsResult<()> {
+            fwd!(self, self.inner.rmdir(p, n))
+        }
+        fn rename(&mut self, a: Ino, b: &str, c: Ino, d: &str) -> FsResult<()> {
+            fwd!(self, self.inner.rename(a, b, c, d))
+        }
+        fn sync(&mut self) -> FsResult<()> {
+            fwd!(self, self.inner.sync())
+        }
+        fn dirty_state(&mut self) -> DirtyState {
+            self.inner.dirty_state()
+        }
+        fn repair(&mut self) -> FsResult<String> {
+            fwd!(self, self.inner.repair())
+        }
+    }
+
+    /// After a caught panic the server answers EIO to everything, immediately, without
+    /// entering the stack again; the lock stays usable for the runtime (sync / unmount).
+    #[test]
+    fn panic_fails_the_volume_fast() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build().unwrap();
+        let dev = Arc::new(MemDev::new(4 << 20));
+        crate::vfs::fat_fs::format(dev.clone(), FsType::Fat16, "NFSP").unwrap();
+        let d = MountDefaults { uid: 501, gid: 20, file_perm: 0o644, dir_perm: 0o755 };
+        let mut inner = open_fs(dev, false, d).unwrap();
+        let bad = inner.create(1, "bad", 0o644, 0, 0).unwrap();
+        let good = inner.create(1, "good", 0o644, 0, 0).unwrap();
+        let calls = Arc::new(AtomicU32::new(0));
+        let fs = Arc::new(Mutex::new(Flaky { inner, bad, calls: calls.clone() }));
+        let tracker = Arc::new(ChangeTracker::default());
+        let bridge = NfsBridge::new(fs.clone(), false, 1, tracker.clone());
+        rt.block_on(async {
+            assert!(bridge.getattr(good).await.is_ok());
+            assert!(matches!(bridge.getattr(bad).await, Err(nfsstat3::NFS3ERR_IO)));
+            let before = calls.load(Ordering::SeqCst);
+            let t0 = std::time::Instant::now();
+            assert!(matches!(bridge.getattr(good).await, Err(nfsstat3::NFS3ERR_IO)));
+            assert!(matches!(bridge.read(good, 0, 10).await, Err(nfsstat3::NFS3ERR_IO)));
+            assert!(matches!(bridge.fsstat().await, Err(nfsstat3::NFS3ERR_IO)));
+            assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+            assert_eq!(calls.load(Ordering::SeqCst), before, "the stack was used after the panic");
+        });
+        assert!(tracker.failure().unwrap().contains("simulated bug"));
+        assert!(!fs.is_poisoned());
+        assert!(fs.try_lock().is_ok());
+    }
 }
 
 #[cfg(test)]

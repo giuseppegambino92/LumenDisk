@@ -360,6 +360,8 @@ pub struct Ext4Fs {
     dir_group_hint: u32,
     /// Set when anything was written since the last sync (avoids idle superblock writes).
     modified: bool,
+    /// A group descriptor points outside the volume: mounted read-only, Doctor refuses.
+    bad_gd: Option<String>,
 }
 
 /// Detect ext2/3/4.
@@ -442,18 +444,35 @@ impl Ext4Fs {
         let rev = r32(&sb, S_REV);
         let inode_size = if rev == 0 { 128 } else { r16(&sb, S_INODE_SIZE) as usize };
         let first_ino = if rev == 0 { 11 } else { r32(&sb, S_FIRST_INO) };
-        if bpg == 0 || ipg == 0 || inode_size < 128 || inode_size as u64 > bs || blocks_count <= fdb {
+        // Same limits the kernel enforces (ext4_fill_super): one bitmap block per group, power
+        // of two inode size, first data block 0/1. Everything below relies on them.
+        if bpg == 0
+            || bpg > 8 * bs
+            || ipg == 0
+            || ipg as u64 > 8 * bs
+            || inode_size < 128
+            || !inode_size.is_power_of_two()
+            || inode_size as u64 > bs
+            || (ipg as u64) < bs / inode_size as u64
+            || fdb > 1
+            || blocks_count <= fdb
+            || (rev != 0 && first_ino < 11)
+        {
             return corrupt("invalid superblock geometry");
         }
-        if blocks_count * bs > dev.size() + bs {
-            return corrupt(format!(
-                "filesystem ({} bytes) is larger than the device ({} bytes)",
-                blocks_count * bs,
-                dev.size()
-            ));
+        let fs_bytes = blocks_count.checked_mul(bs).unwrap_or(u64::MAX);
+        if fs_bytes > dev.size().saturating_add(bs) {
+            return corrupt(format!("filesystem ({fs_bytes} bytes) is larger than the device ({} bytes)", dev.size()));
         }
-        let ngroups = (blocks_count - fdb).div_ceil(bpg) as u32;
+        let ngroups64 = (blocks_count - fdb).div_ceil(bpg);
+        if ngroups64.checked_mul(ipg as u64).map_or(true, |n| n > u32::MAX as u64) {
+            return corrupt("too many inodes for the group count");
+        }
+        let ngroups = ngroups64 as u32;
         let desc_size = if sixty_four { (r16(&sb, S_DESC_SIZE) as usize).max(32) } else { 32 };
+        if !desc_size.is_power_of_two() || desc_size as u64 > bs.min(1024) {
+            return corrupt(format!("invalid group descriptor size {desc_size}"));
+        }
         let csum = ro_compat & RO_METADATA_CSUM != 0;
         let gdt_csum = !csum && ro_compat & RO_GDT_CSUM != 0;
         let seed = if incompat & INCOMPAT_CSUM_SEED != 0 {
@@ -513,8 +532,16 @@ impl Ext4Fs {
             fs_type,
             dir_group_hint: 0,
             modified: false,
+            bad_gd: None,
         };
+        if incompat & INCOMPAT_META_BG != 0 && r32(&fs.sb, S_FIRST_META_BG) as u64 > fs.gdt_blocks() {
+            return corrupt("first meta block group too large");
+        }
+        if r16(&fs.sb, S_RESERVED_GDT) as u64 > bs / 4 {
+            return corrupt("too many reserved GDT blocks");
+        }
         fs.load_gds()?;
+        fs.check_descriptors();
         Ok(fs)
     }
 
@@ -618,6 +645,24 @@ impl Ext4Fs {
         }
         self.gds = gds;
         Ok(())
+    }
+
+    /// Like the kernel's ext4_check_descriptors: bitmaps and inode tables must lie inside the
+    /// volume. A bad descriptor makes the volume read-only (what is reachable stays readable).
+    fn check_descriptors(&mut self) {
+        let inside = |b: u64, n: u64| b >= self.fdb && b.checked_add(n).map_or(false, |e| e <= self.blocks_count);
+        for g in 0..self.ngroups {
+            let ok = inside(self.gd_block_bitmap(g), 1) && inside(self.gd_inode_bitmap(g), 1) && inside(self.gd_inode_table(g), self.itb);
+            if !ok {
+                let why = format!("il descrittore del gruppo {g} punta fuori dal volume (group descriptor {g} is corrupt)");
+                self.ro = true;
+                if self.ro_reason.is_none() {
+                    self.ro_reason = Some(why.clone());
+                }
+                self.bad_gd = Some(why);
+                return;
+            }
+        }
     }
 
     // group descriptor accessors
@@ -797,7 +842,7 @@ impl Ext4Fs {
             set(self.gd_inode_bitmap(h));
             let it = self.gd_inode_table(h);
             for k in 0..self.itb {
-                set(it + k);
+                set(it.saturating_add(k));
             }
         }
         for i in n as usize..(self.bs as usize * 8) {
@@ -920,7 +965,7 @@ impl Ext4Fs {
                 }
             }
             if got_here > 0 {
-                let fb = self.gd_free_blocks(g) - got_here as u32;
+                let fb = self.gd_free_blocks(g).saturating_sub(got_here as u32);
                 self.set_gd_u32(g, 0xC, 0x2C, fb);
                 touched.push((g, got_here as u32));
             }
@@ -931,7 +976,7 @@ impl Ext4Fs {
                 self.mark_blocks(s, l, false, false)?;
             }
             for (g, got) in touched {
-                let fb = self.gd_free_blocks(g) + got;
+                let fb = self.gd_free_blocks(g).saturating_add(got);
                 self.set_gd_u32(g, 0xC, 0x2C, fb);
                 self.flush_block_bitmap(g)?;
                 self.write_gd(g)?;
@@ -1065,12 +1110,12 @@ impl Ext4Fs {
             let fi = self.gd_free_inodes(g) - 1;
             self.set_gd_u32(g, 0xE, 0x2E, fi);
             if is_dir {
-                let d = self.gd_used_dirs(g) + 1;
+                let d = self.gd_used_dirs(g).saturating_add(1);
                 self.set_gd_u32(g, 0x10, 0x30, d);
             }
             if self.uninit_bg() {
                 let unused = self.gd_itable_unused(g);
-                let used_hw = self.ipg - unused;
+                let used_hw = self.ipg.saturating_sub(unused);
                 if was_uninit || (i as u32) >= used_hw {
                     let nu = self.ipg - (i as u32 + 1);
                     // Inodes between the old high watermark and i may contain garbage if the
@@ -1103,14 +1148,14 @@ impl Ext4Fs {
             bm[i / 8] &= !(1 << (i % 8));
         }
         self.flush_inode_bitmap(g)?;
-        let fi = self.gd_free_inodes(g) + 1;
+        let fi = self.gd_free_inodes(g).saturating_add(1);
         self.set_gd_u32(g, 0xE, 0x2E, fi);
         if is_dir {
             let d = self.gd_used_dirs(g).saturating_sub(1);
             self.set_gd_u32(g, 0x10, 0x30, d);
         }
         self.write_gd(g)?;
-        let f = r32(&self.sb, S_FREE_INODES) + 1;
+        let f = r32(&self.sb, S_FREE_INODES).saturating_add(1);
         w32(&mut self.sb, S_FREE_INODES, f);
         self.write_sb()?;
         Ok(())
@@ -1124,7 +1169,11 @@ impl Ext4Fs {
         }
         let g = (ino - 1) / self.ipg;
         let i = (ino - 1) % self.ipg;
-        Ok(self.gd_inode_table(g) * self.bs + i as u64 * self.inode_size as u64)
+        let it = self.gd_inode_table(g);
+        if it < self.fdb || it.checked_add(self.itb).map_or(true, |e| e > self.blocks_count) {
+            return corrupt(format!("inode table of group {g} is outside the volume"));
+        }
+        Ok(it * self.bs + i as u64 * self.inode_size as u64)
     }
 
     fn read_inode(&self, ino: u32) -> FsResult<Inode> {
@@ -1211,7 +1260,7 @@ impl Ext4Fs {
         if self.ro_compat & RO_HUGE_FILE != 0 {
             v |= (r16(&inode.raw, I_BLOCKS_HI) as u64) << 32;
         }
-        v * self.blocks_unit(inode)
+        v.saturating_mul(self.blocks_unit(inode))
     }
 
     /// Set i_blocks from a count of filesystem blocks (data + metadata + xattr block).
@@ -1265,57 +1314,67 @@ impl Ext4Fs {
     // ─────────────── block mapping (extents + block maps) ───────────────
 
     /// Return the mapping and the list of metadata (tree / indirect) blocks.
+    ///
+    /// Corrupt mappings fail with `Corrupt` instead of looping or exhausting memory: every
+    /// tree / indirect block is visited at most once (cycles and cross-links are errors), the
+    /// number of mapped blocks can't exceed the volume, and the result is sorted,
+    /// non-overlapping and inside the volume (`read_data` / `ensure_blocks` rely on that).
     fn get_mapping(&self, inode: &Inode) -> FsResult<(Vec<Ext>, Vec<u64>)> {
         let mut exts = vec![];
         let mut meta = vec![];
         if inode.flags() & FL_INLINE_DATA != 0 {
             return Err(FsError::Unsupported("inline_data files".into()));
         }
+        let mut seen = HashSet::new();
         if inode.uses_extents() {
-            self.walk_extents(inode.i_block(), true, &mut exts, &mut meta, 0)?;
+            self.walk_extents(inode.i_block(), None, &mut exts, &mut meta, &mut seen)?;
         } else {
             if inode.kind() == FileKind::Symlink && self.is_fast_symlink(inode) {
                 return Ok((exts, meta));
             }
             let ib = inode.i_block();
-            let per = (self.bs / 4) as u64;
-            let mut push = |l: u64, p: u64, exts: &mut Vec<Ext>| {
-                if p == 0 {
-                    return;
-                }
-                if let Some(last) = exts.last_mut() {
-                    if last.lblk as u64 + last.len as u64 == l && last.pblk + last.len as u64 == p && last.len < u32::MAX {
-                        last.len += 1;
-                        return;
-                    }
-                }
-                exts.push(Ext { lblk: l as u32, pblk: p, len: 1, uninit: false });
-            };
-            for k in 0..12 {
-                push(k as u64, r32(ib, k * 4) as u64, &mut exts);
+            let per = self.bs / 4;
+            let mut budget = self.blocks_count;
+            for k in 0..12u64 {
+                self.map_push(&mut exts, k, r32(ib, k as usize * 4) as u64, &mut budget)?;
             }
             let roots = [(r32(ib, 48) as u64, 1u32, 12u64), (r32(ib, 52) as u64, 2, 12 + per), (r32(ib, 56) as u64, 3, 12 + per + per * per)];
             for (blk, level, base) in roots {
                 if blk != 0 {
-                    self.walk_indirect(blk, level, base, &mut exts, &mut meta, &mut push)?;
+                    self.walk_indirect(blk, level, base, &mut exts, &mut meta, &mut seen, &mut budget)?;
                 }
             }
         }
+        self.check_mapping(&exts)?;
         Ok((exts, meta))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn walk_indirect(
-        &self,
-        blk: u64,
-        level: u32,
-        base: u64,
-        exts: &mut Vec<Ext>,
-        meta: &mut Vec<u64>,
-        push: &mut dyn FnMut(u64, u64, &mut Vec<Ext>),
-    ) -> FsResult<()> {
-        meta.push(blk);
+    /// Append logical block `l` -> physical `p` of a block-mapped file (0 = hole).
+    fn map_push(&self, exts: &mut Vec<Ext>, l: u64, p: u64, budget: &mut u64) -> FsResult<()> {
+        if p == 0 {
+            return Ok(());
+        }
+        if l > u32::MAX as u64 {
+            return corrupt("block map beyond the maximum file size");
+        }
+        *budget = budget.checked_sub(1).ok_or_else(|| FsError::Corrupt("block map references more blocks than the volume holds".into()))?;
+        if let Some(last) = exts.last_mut() {
+            if last.lblk as u64 + last.len as u64 == l && last.pblk + last.len as u64 == p && last.len < u32::MAX {
+                last.len += 1;
+                return Ok(());
+            }
+        }
+        exts.push(Ext { lblk: l as u32, pblk: p, len: 1, uninit: false });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_indirect(&self, blk: u64, level: u32, base: u64, exts: &mut Vec<Ext>, meta: &mut Vec<u64>, seen: &mut HashSet<u64>, budget: &mut u64) -> FsResult<()> {
+        if !seen.insert(blk) {
+            return corrupt(format!("indirect block {blk} referenced twice"));
+        }
         let data = self.read_block(blk)?;
+        meta.push(blk);
         let per = self.bs / 4;
         let span = per.pow(level - 1);
         for k in 0..per {
@@ -1324,26 +1383,27 @@ impl Ext4Fs {
                 continue;
             }
             if level == 1 {
-                push(base + k, p, exts);
+                self.map_push(exts, base + k, p, budget)?;
             } else {
-                self.walk_indirect(p, level - 1, base + k * span, exts, meta, push)?;
+                self.walk_indirect(p, level - 1, base + k * span, exts, meta, seen, budget)?;
             }
         }
         Ok(())
     }
 
-    fn walk_extents(&self, node: &[u8], _root: bool, exts: &mut Vec<Ext>, meta: &mut Vec<u64>, depth_guard: u32) -> FsResult<()> {
-        if depth_guard > 6 {
-            return corrupt("extent tree too deep");
-        }
+    /// `want_depth`: the depth the parent index node implies (None for the root in the inode).
+    fn walk_extents(&self, node: &[u8], want_depth: Option<u16>, exts: &mut Vec<Ext>, meta: &mut Vec<u64>, seen: &mut HashSet<u64>) -> FsResult<()> {
         if r16(node, 0) != EXT_MAGIC {
             return corrupt("bad extent header magic");
         }
         let entries = r16(node, 2) as usize;
         let max = r16(node, 4) as usize;
         let depth = r16(node, 6);
-        if entries > max || 12 + entries * 12 > node.len() {
+        if entries > max || 12 + max * 12 > node.len() {
             return corrupt("bad extent header");
+        }
+        if depth > 5 || want_depth.map_or(false, |d| d != depth) {
+            return corrupt("bad extent tree depth");
         }
         for k in 0..entries {
             let e = &node[12 + k * 12..24 + k * 12];
@@ -1357,13 +1417,38 @@ impl Ext4Fs {
                 }
                 let pblk = (r16(e, 6) as u64) << 32 | r32(e, 8) as u64;
                 if len > 0 {
+                    if exts.len() as u64 >= self.blocks_count {
+                        return corrupt("extent tree maps more blocks than the volume holds");
+                    }
                     exts.push(Ext { lblk, pblk, len, uninit });
                 }
             } else {
                 let leaf = (r16(e, 8) as u64) << 32 | r32(e, 4) as u64;
-                meta.push(leaf);
+                if !seen.insert(leaf) {
+                    return corrupt(format!("extent tree block {leaf} referenced twice"));
+                }
                 let child = self.read_block(leaf)?;
-                self.walk_extents(&child, false, exts, meta, depth_guard + 1)?;
+                meta.push(leaf);
+                self.walk_extents(&child, Some(depth - 1), exts, meta, seen)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Extents must be sorted, non-overlapping, below 2^32 logical blocks and inside the volume.
+    fn check_mapping(&self, exts: &[Ext]) -> FsResult<()> {
+        let mut end = 0u64;
+        for e in exts {
+            let s = e.lblk as u64;
+            if s < end {
+                return corrupt("unsorted or overlapping extents");
+            }
+            end = s + e.len as u64;
+            if end > 1 << 32 {
+                return corrupt("extent beyond the maximum file size");
+            }
+            if e.pblk == 0 || e.pblk.checked_add(e.len as u64).map_or(true, |x| x > self.blocks_count) {
+                return corrupt(format!("extent at block {} points outside the volume", e.pblk));
             }
         }
         Ok(())
@@ -1606,7 +1691,10 @@ impl Ext4Fs {
         let mut out = vec![0u8; len];
         let bs = self.bs;
         let mut pos = offset;
-        let end = offset + len as u64;
+        // Logical blocks are u32: bytes at or beyond 2^32 blocks can only be a hole (a corrupt
+        // i_size can claim them). Without the clamp `pos / bs` would wrap and map them onto
+        // the first blocks of the file.
+        let end = (offset + len as u64).min((1u64 << 32) * bs);
         while pos < end {
             let lblk = (pos / bs) as u32;
             let in_blk = pos % bs;
@@ -1679,7 +1767,11 @@ impl Ext4Fs {
         while l <= last {
             if let Some((idx, _, _)) = Self::lookup_block(exts, l) {
                 let e = exts[idx];
-                l = (e.lblk + e.len).max(l + 1);
+                let next = (e.lblk as u64 + e.len as u64).max(l as u64 + 1);
+                if next > last as u64 {
+                    break;
+                }
+                l = next as u32;
                 continue;
             }
             // hole from l to min(last, next extent start - 1)
@@ -1725,7 +1817,7 @@ impl Ext4Fs {
         for e in exts.drain(..) {
             if let Some(last) = out.last_mut() {
                 if last.uninit == e.uninit
-                    && last.lblk + last.len == e.lblk
+                    && last.lblk as u64 + last.len as u64 == e.lblk as u64
                     && last.pblk + last.len as u64 == e.pblk
                     && (last.len as u64 + e.len as u64) < (u32::MAX as u64)
                 {
@@ -1743,8 +1835,8 @@ impl Ext4Fs {
             return Ok(());
         }
         let bs = self.bs;
-        let end = offset + data.len() as u64;
-        let max_blocks = if inode.uses_extents() { 1u64 << 32 } else { 12 + (bs / 4) + (bs / 4).pow(2) + (bs / 4).pow(3) };
+        let end = offset.checked_add(data.len() as u64).ok_or_else(|| FsError::Invalid("file too large".into()))?;
+        let max_blocks = if inode.uses_extents() { u32::MAX as u64 } else { (12 + (bs / 4) + (bs / 4).pow(2) + (bs / 4).pow(3)).min(u32::MAX as u64) };
         if end.div_ceil(bs) > max_blocks {
             return Err(FsError::Invalid("file too large".into()));
         }
@@ -1794,13 +1886,13 @@ impl Ext4Fs {
         }
         let bs = self.bs;
         let (mut exts, meta) = self.get_mapping(inode)?;
-        let keep_blocks = new_size.div_ceil(bs) as u32;
+        let keep_blocks = new_size.div_ceil(bs).min(u32::MAX as u64) as u32;
         let mut to_free = vec![];
         let mut out = vec![];
         for e in exts.drain(..) {
             if e.lblk >= keep_blocks {
                 to_free.push((e.pblk, e.len as u64));
-            } else if e.lblk + e.len > keep_blocks {
+            } else if e.lblk as u64 + e.len as u64 > keep_blocks as u64 {
                 let keep = keep_blocks - e.lblk;
                 to_free.push((e.pblk + keep as u64, (e.len - keep) as u64));
                 out.push(Ext { len: keep, ..e });
@@ -1809,7 +1901,7 @@ impl Ext4Fs {
             }
         }
         // zero the tail of the new last block
-        if new_size % bs != 0 {
+        if new_size % bs != 0 && new_size / bs <= u32::MAX as u64 {
             let lblk = (new_size / bs) as u32;
             if let Some((_, pblk, uninit)) = Self::lookup_block(&out, lblk) {
                 if !uninit {
@@ -1890,13 +1982,16 @@ impl Ext4Fs {
 
     fn dir_blocks(&self, dir: &Inode) -> FsResult<Vec<(u32, u64)>> {
         let (exts, _) = self.get_mapping(dir)?;
-        let n = dir.size().div_ceil(self.bs) as u32;
+        // A directory can't be larger than the volume (nor than 2^32 blocks).
+        let n = dir.size().div_ceil(self.bs).min(self.blocks_count).min(u32::MAX as u64);
         let mut v = vec![];
         for e in &exts {
-            for k in 0..e.len {
-                if e.lblk + k < n {
-                    v.push((e.lblk + k, e.pblk + k as u64));
+            for k in 0..e.len as u64 {
+                let l = e.lblk as u64 + k;
+                if l >= n {
+                    break;
                 }
+                v.push((l as u32, e.pblk + k));
             }
         }
         Ok(v)
@@ -1916,11 +2011,21 @@ impl Ext4Fs {
         Ok(out)
     }
 
+    /// Inode numbers a directory entry may name (the kernel's ext4_valid_inum): the root or a
+    /// non-reserved inode that exists. Anything else (journal, resize inode, out of range) is
+    /// corruption and must never be unlinked or followed.
+    fn valid_dirent_ino(&self, ino: u32) -> bool {
+        ino == ROOT_INO || (ino >= self.first_ino && ino as u64 <= self.ipg as u64 * self.ngroups as u64)
+    }
+
     fn find_entry(&self, dir: &Inode, name: &[u8]) -> FsResult<Option<(u32, u8)>> {
         for (_, pblk) in self.dir_blocks(dir)? {
             let b = self.read_block(pblk)?;
             for d in self.parse_dir_block(&b) {
                 if d.inode != 0 && d.name_len == name.len() && &b[d.off + 8..d.off + 8 + d.name_len] == name {
+                    if !self.valid_dirent_ino(d.inode) {
+                        return corrupt(format!("directory entry names invalid inode {}", d.inode));
+                    }
                     return Ok(Some((d.inode, d.ftype)));
                 }
             }
@@ -1994,19 +2099,24 @@ impl Ext4Fs {
         let mut nodes: HashSet<u32> = HashSet::new();
         if let Some(&p0) = map.get(&0) {
             let root = self.read_block(p0)?;
-            let levels = root[0x1E] as u32;
-            let count = r16(&root, 0x22) as usize;
+            // dx_root: at most 3 index levels (largedir), entries bounded by the block.
+            let levels = (root[0x1E] as u32).min(3);
+            let count = (r16(&root, 0x22) as usize).min((bs - 0x20) / 8);
             let mut frontier: Vec<u32> = (0..count).map(|i| r32(&root, 0x20 + 8 * i + 4) & 0x0FFF_FFFF).collect();
             for _ in 0..levels {
                 let mut next = vec![];
                 for l in frontier {
-                    if nodes.insert(l) {
-                        if let Some(&p) = map.get(&l) {
-                            let nb = self.read_block(p)?;
-                            let c = r16(&nb, 0x0A) as usize;
-                            for i in 0..c.min((bs - 8) / 8) {
-                                next.push(r32(&nb, 0x08 + 8 * i + 4) & 0x0FFF_FFFF);
-                            }
+                    let Some(&p) = map.get(&l) else { continue };
+                    let nb = self.read_block(p)?;
+                    // Only blocks that really look like dx nodes (one empty fake dirent
+                    // spanning the block) are wiped below: with a corrupt `levels` the
+                    // frontier may name leaf blocks, whose entries must survive.
+                    let rl = r16(&nb, 4) as usize;
+                    let fake = r32(&nb, 0) == 0 && (rl == bs || (rl == 0 && bs >= 65536));
+                    if l != 0 && fake && nodes.insert(l) {
+                        let c = r16(&nb, 0x0A) as usize;
+                        for i in 0..c.min((bs - 8) / 8) {
+                            next.push(r32(&nb, 0x08 + 8 * i + 4) & 0x0FFF_FFFF);
                         }
                     }
                 }
@@ -2083,9 +2193,15 @@ impl Ext4Fs {
                 }
             }
         }
-        // Need a new block.
-        let lblk = (dir.size() / self.bs) as u32;
+        // Need a new block, after both i_size and the last mapped block (a corrupt i_size can
+        // be anything; the new extent must keep the mapping sorted and below 2^32 blocks).
         let (mut exts, meta) = self.get_mapping(dir)?;
+        let mapped_end = exts.last().map_or(0, |e| e.lblk as u64 + e.len as u64);
+        let lblk = (dir.size() / self.bs).max(mapped_end);
+        if lblk >= self.blocks_count.min(u32::MAX as u64) {
+            return corrupt("directory larger than the volume");
+        }
+        let lblk = lblk as u32;
         let goal = exts.last().map(|e| e.pblk + e.len as u64).unwrap_or_else(|| self.inode_goal(dir.ino));
         let r = self.alloc_blocks(goal, 1)?;
         let pblk = r[0].0;
@@ -2096,7 +2212,7 @@ impl Ext4Fs {
         exts.push(Ext { lblk, pblk, len: 1, uninit: false });
         Self::merge_exts(&mut exts);
         self.set_mapping(dir, &exts, meta)?;
-        dir.set_size(dir.size() + self.bs);
+        dir.set_size((lblk as u64 + 1) * self.bs);
         self.write_inode(dir)?;
         Ok(())
     }
@@ -2146,7 +2262,7 @@ impl Ext4Fs {
         if i.kind() == FileKind::Dir && (l >= 64999 || l == 1) && self.ro_compat & RO_DIR_NLINK != 0 {
             i.set_links(1);
         } else {
-            i.set_links(l + 1);
+            i.set_links(l.saturating_add(1));
         }
     }
 
@@ -2250,7 +2366,9 @@ impl Ext4Fs {
         if jbs != self.bs {
             return Err(FsError::Unsupported("journal block size differs from fs".into()));
         }
-        let maxlen = rbe32(&jsb, 0x10) as u64;
+        // The log can't be longer than the journal inode actually maps.
+        let mapped = exts.last().map_or(0, |e| e.lblk as u64 + e.len as u64).min(ji.size() / self.bs);
+        let maxlen = (rbe32(&jsb, 0x10) as u64).min(mapped);
         let first = rbe32(&jsb, 0x14) as u64;
         let mut seq = rbe32(&jsb, 0x18);
         let start = rbe32(&jsb, 0x1C) as u64;
@@ -2258,6 +2376,9 @@ impl Ext4Fs {
         let incompat = if v2 { rbe32(&jsb, 0x28) } else { 0 };
         if start == 0 {
             return Ok((0, 0, 0));
+        }
+        if first == 0 || first >= maxlen || start < first || start >= maxlen {
+            return corrupt("journal superblock: log bounds outside the journal");
         }
         let is64 = incompat & 0x2 != 0;
         let csum_v2 = incompat & 0x8 != 0;
@@ -2320,6 +2441,9 @@ impl Ext4Fs {
                                 (f, if is64 { rbe32(&b, off + 8) as u64 } else { 0 })
                             };
                             pending.push(Logged { seq, target: hi << 32 | lo, jblk: dpos, escape: flags & 1 != 0 });
+                            if (pending.len() + logged.len()) as u64 > maxlen {
+                                return corrupt("journal logs more blocks than it holds");
+                            }
                             dpos = next(dpos);
                             off += tag_bytes;
                             if flags & 2 == 0 {
@@ -2364,6 +2488,13 @@ impl Ext4Fs {
                 }
             }
         }
+        // Validate everything before the first write: a malformed log must not be half-applied.
+        for l in &logged {
+            if l.target >= self.blocks_count || l.target == 0 && self.fdb == 1 {
+                return corrupt(format!("journal block target {} out of range", l.target));
+            }
+            jmap(l.jblk)?;
+        }
         // Pass 2: replay.
         let mut replayed = 0u32;
         let mut skipped = 0u32;
@@ -2377,9 +2508,6 @@ impl Ext4Fs {
             let mut data = self.read_block(jmap(l.jblk)?)?;
             if l.escape {
                 wbe32(&mut data, 0, 0xC03B_3998);
-            }
-            if l.target >= self.blocks_count {
-                return corrupt("journal block target out of range");
             }
             self.dev.write_at(l.target * self.bs, &data)?;
             replayed += 1;
@@ -2435,9 +2563,12 @@ impl Ext4Fs {
     fn process_orphans(&mut self) -> FsResult<u32> {
         let mut n = 0;
         let mut ino = r32(&self.sb, S_LAST_ORPHAN);
-        let mut guard = 0;
-        while ino != 0 && guard < 100_000 {
-            guard += 1;
+        // A cyclic chain must not free the same inode twice (or spin).
+        let mut seen = HashSet::new();
+        while ino != 0 && seen.insert(ino) {
+            if ino < self.first_ino {
+                return corrupt(format!("orphan list names reserved inode {ino}"));
+            }
             let mut i = self.read_inode(ino)?;
             let next = r32(&i.raw, I_DTIME);
             if i.links() == 0 {
@@ -2465,6 +2596,174 @@ impl Ext4Fs {
     }
 }
 
+// ─────────────── test hooks (seed images for fuzzkit.rs; not a stable API) ───────────────
+
+#[doc(hidden)]
+impl Ext4Fs {
+    /// Byte offset of an inode in the volume.
+    pub fn debug_inode_offset(&self, ino: Ino) -> FsResult<u64> {
+        self.inode_loc(self.ino32(ino)?)
+    }
+
+    /// Physical blocks of a file, in logical order.
+    pub fn debug_file_blocks(&mut self, ino: Ino) -> FsResult<Vec<u64>> {
+        let i = self.live_inode(ino)?;
+        let (exts, _) = self.get_mapping(&i)?;
+        Ok(exts.iter().flat_map(|e| (0..e.len as u64).map(move |k| e.pblk + k)).collect())
+    }
+
+    /// Turn a linear directory into a one-level htree (dx_root in block 0, every other block a
+    /// leaf), the layout `e2fsck -D` produces. Hashes are synthetic: the driver reads htree
+    /// directories linearly and linearizes them before modifying them.
+    pub fn debug_make_htree(&mut self, dir: Ino) -> FsResult<()> {
+        self.check_rw()?;
+        let mut d = self.live_inode(dir)?;
+        let bs = self.bs as usize;
+        let tail = if self.csum { 12 } else { 0 };
+        let blocks = self.dir_blocks(&d)?;
+        let Some(&(_, p0)) = blocks.iter().find(|(l, _)| *l == 0) else { return corrupt("directory without blocks") };
+        let b0 = self.read_block(p0)?;
+        let ents = self.parse_dir_block(&b0);
+        // Block 0 may only hold '.' and '..': move the rest to a new leaf.
+        let mut leaf = self.empty_dir_block();
+        let mut off = 0usize;
+        let mut last = None;
+        for e in ents.iter().skip(2).filter(|e| e.inode != 0 && !Self::is_tail(e, bs)) {
+            let name = b0[e.off + 8..e.off + 8 + e.name_len].to_vec();
+            let rl = rec_len_for(e.name_len);
+            self.put_dirent(&mut leaf, off, e.inode, rl, &name, e.ftype);
+            last = Some(off);
+            off += rl;
+        }
+        if let Some(l) = last {
+            w16(&mut leaf, l + 4, (bs - tail - l) as u16);
+        }
+        let lblk = (d.size() / self.bs) as u32;
+        let (mut exts, meta) = self.get_mapping(&d)?;
+        let goal = exts.last().map(|e| e.pblk + e.len as u64).unwrap_or_else(|| self.inode_goal(d.ino));
+        let pnew = self.alloc_blocks(goal, 1)?[0].0;
+        self.write_dir_block(&d, pnew, &mut leaf)?;
+        exts.push(Ext { lblk, pblk: pnew, len: 1, uninit: false });
+        Self::merge_exts(&mut exts);
+        self.set_mapping(&mut d, &exts, meta)?;
+        d.set_size(d.size() + self.bs);
+        let parent = ents.get(1).map(|e| e.inode).unwrap_or(ROOT_INO);
+        let mut root = vec![0u8; bs];
+        self.put_dirent(&mut root, 0, d.ino, 12, b".", 2);
+        self.put_dirent(&mut root, 12, parent, bs - 12, b"..", 2);
+        root[0x1C] = 1; // hash version: half_md4
+        root[0x1D] = 8; // info length
+        let limit = (bs - 0x20 - if self.csum { 8 } else { 0 }) / 8;
+        let leaves: Vec<u32> = (1..=lblk).collect();
+        w16(&mut root, 0x20, limit as u16);
+        w16(&mut root, 0x22, leaves.len() as u16);
+        w32(&mut root, 0x24, leaves[0]);
+        for (i, &l) in leaves.iter().enumerate().skip(1) {
+            w32(&mut root, 0x20 + 8 * i, (i as u32) << 24);
+            w32(&mut root, 0x24 + 8 * i, l);
+        }
+        self.write_block(p0, &root)?;
+        d.set_flags(d.flags() | FL_INDEX);
+        self.write_inode(&mut d)
+    }
+
+    /// Log `blocks` (target block, new content) as one committed jbd2 transaction that has not
+    /// been checkpointed yet, and flag the volume `needs_recovery` (what a crash leaves behind).
+    pub fn debug_journal_transaction(&mut self, blocks: &[(u64, Vec<u8>)]) -> FsResult<()> {
+        self.check_rw()?;
+        let jino = self.journal_inode().ok_or_else(|| FsError::Unsupported("no journal".into()))?;
+        let ji = self.read_inode(jino)?;
+        let (exts, _) = self.get_mapping(&ji)?;
+        let jmap = |l: u64| Self::lookup_block(&exts, l as u32).map(|(_, p, _)| p).ok_or_else(|| FsError::Corrupt("journal hole".into()));
+        let bs = self.bs as usize;
+        let jsb_blk = jmap(0)?;
+        let mut jsb = self.read_block(jsb_blk)?;
+        if rbe32(&jsb, 0x28) & (0x2 | 0x8 | 0x10) != 0 || blocks.is_empty() {
+            return Err(FsError::Unsupported("only classic 32-bit journal tags".into()));
+        }
+        let first = rbe32(&jsb, 0x14) as u64;
+        let seq = rbe32(&jsb, 0x18);
+        let header = |t: u32| {
+            let mut b = vec![0u8; bs];
+            wbe32(&mut b, 0, 0xC03B_3998);
+            wbe32(&mut b, 4, t);
+            wbe32(&mut b, 8, seq);
+            b
+        };
+        let mut desc = header(1);
+        let mut off = 12;
+        for (k, (target, data)) in blocks.iter().enumerate() {
+            wbe32(&mut desc, off, *target as u32);
+            let flags: u16 = if k > 0 { 2 } else { 0 } | if k + 1 == blocks.len() { 8 } else { 0 };
+            desc[off + 6..off + 8].copy_from_slice(&flags.to_be_bytes());
+            off += 8;
+            if k == 0 {
+                desc[off..off + 16].copy_from_slice(&self.sb[S_UUID..S_UUID + 16]);
+                off += 16;
+            }
+            self.dev.write_at(jmap(first + 1 + k as u64)? * self.bs, data)?;
+        }
+        self.dev.write_at(jmap(first)? * self.bs, &desc)?;
+        self.dev.write_at(jmap(first + 1 + blocks.len() as u64)? * self.bs, &header(2))?;
+        wbe32(&mut jsb, 0x1C, first as u32);
+        self.dev.write_at(jsb_blk * self.bs, &jsb)?;
+        self.incompat |= INCOMPAT_RECOVER;
+        w32(&mut self.sb, S_INCOMPAT, self.incompat);
+        self.write_sb()
+    }
+}
+
+impl Ext4Fs {
+    fn repair_steps(&mut self) -> FsResult<String> {
+        let mut report = vec![];
+        if self.incompat & INCOMPAT_RECOVER != 0 {
+            let (t, b, r) = self.replay_journal()?;
+            report.push(format!("Journal replayed: {t} transactions, {b} blocks written, {r} revoked blocks skipped."));
+            // The replay may have rewritten the superblock and descriptors: reload.
+            let dev = self.dev.clone();
+            let fresh = Ext4Fs::open_raw(dev, false)?;
+            let keep_reason = self.ro_reason.clone();
+            *self = fresh;
+            self.ro_reason = keep_reason;
+            if let Some(why) = self.bad_gd.clone() {
+                return Err(FsError::Corrupt(why));
+            }
+            self.ro = false;
+            self.incompat &= !INCOMPAT_RECOVER;
+            w32(&mut self.sb, S_INCOMPAT, self.incompat);
+            self.write_sb()?;
+        }
+        if r32(&self.sb, S_LAST_ORPHAN) != 0 {
+            let n = self.process_orphans()?;
+            report.push(format!("Processed {n} orphan inode(s)."));
+        }
+        if self.ro_compat & RO_ORPHAN_PRESENT != 0 {
+            report.push("Orphan file entries present: cleared the flag (orphans will be reclaimed by e2fsck).".into());
+            self.ro_compat &= !RO_ORPHAN_PRESENT;
+            w32(&mut self.sb, S_RO_COMPAT, self.ro_compat);
+        }
+        let state = r16(&self.sb, S_STATE);
+        if state & 2 != 0 {
+            report.push("Cleared the EXT4_ERROR_FS flag (a full e2fsck is still recommended).".into());
+            w32(&mut self.sb, S_ERROR_COUNT, 0);
+        }
+        if state & 1 == 0 {
+            report.push("Marked the volume as cleanly unmounted.".into());
+        }
+        w16(&mut self.sb, S_STATE, 1);
+        self.write_sb()?;
+        let (db, di) = self.reconcile_counts()?;
+        if db != 0 || di != 0 {
+            report.push(format!("Reconciled free counters (blocks {db:+}, inodes {di:+})."));
+        }
+        self.dev.flush()?;
+        if report.is_empty() {
+            report.push("Volume was already clean.".into());
+        }
+        Ok(report.join(" "))
+    }
+}
+
 impl FileSystem for Ext4Fs {
     fn volume_info(&self) -> VolumeInfo {
         VolumeInfo { fs_type: self.fs_type, label: self.label(), uuid: self.uuid_string(), read_only: self.ro }
@@ -2475,7 +2774,7 @@ impl FileSystem for Ext4Fs {
         Ok(FsStat {
             block_size: self.bs as u32,
             total_bytes: total * self.bs,
-            free_bytes: self.sb_free_blocks() * self.bs,
+            free_bytes: self.sb_free_blocks().min(total).saturating_mul(self.bs),
             total_inodes: r32(&self.sb, S_INODES_COUNT) as u64,
             free_inodes: r32(&self.sb, S_FREE_INODES) as u64,
         })
@@ -2569,7 +2868,7 @@ impl FileSystem for Ext4Fs {
         }
         let mut out = vec![];
         for (name, ino, ft) in self.dir_entries(&d)? {
-            if name == b"." || name == b".." {
+            if name == b"." || name == b".." || !self.valid_dirent_ino(ino) {
                 continue;
             }
             let kind = match ft {
@@ -2677,8 +2976,13 @@ impl FileSystem for Ext4Fs {
         if i.kind() != FileKind::Symlink {
             return Err(FsError::Invalid("not a symlink".into()));
         }
+        // A target is shorter than a block (and than PATH_MAX): anything else is corruption,
+        // not a reason to allocate i_size bytes.
+        if i.size() >= self.bs.max(4096) {
+            return corrupt(format!("symlink inode {ino} has an impossible size {}", i.size()));
+        }
         let data = if self.is_fast_symlink(&i) {
-            i.i_block()[..i.size() as usize].to_vec()
+            i.i_block()[..(i.size() as usize).min(60)].to_vec()
         } else {
             let (exts, _) = self.get_mapping(&i)?;
             self.read_data(&i, &exts, 0, i.size() as usize)?
@@ -2835,51 +3139,15 @@ impl FileSystem for Ext4Fs {
         if self.dev.read_only() {
             return Err(FsError::ReadOnly);
         }
+        if let Some(why) = &self.bad_gd {
+            return Err(FsError::Corrupt(format!("{why}: the Doctor can't fix this, run e2fsck")));
+        }
         let saved_ro = self.ro;
         self.ro = false;
-        let mut report = vec![];
-        if self.incompat & INCOMPAT_RECOVER != 0 {
-            let (t, b, r) = self.replay_journal()?;
-            report.push(format!("Journal replayed: {t} transactions, {b} blocks written, {r} revoked blocks skipped."));
-            // The replay may have rewritten the superblock and descriptors: reload.
-            let dev = self.dev.clone();
-            let fresh = Ext4Fs::open_raw(dev, false)?;
-            let keep_reason = self.ro_reason.clone();
-            *self = fresh;
-            self.ro_reason = keep_reason;
-            self.incompat &= !INCOMPAT_RECOVER;
-            w32(&mut self.sb, S_INCOMPAT, self.incompat);
-            self.write_sb()?;
-        }
-        if r32(&self.sb, S_LAST_ORPHAN) != 0 {
-            let n = self.process_orphans()?;
-            report.push(format!("Processed {n} orphan inode(s)."));
-        }
-        if self.ro_compat & RO_ORPHAN_PRESENT != 0 {
-            report.push("Orphan file entries present: cleared the flag (orphans will be reclaimed by e2fsck).".into());
-            self.ro_compat &= !RO_ORPHAN_PRESENT;
-            w32(&mut self.sb, S_RO_COMPAT, self.ro_compat);
-        }
-        let state = r16(&self.sb, S_STATE);
-        if state & 2 != 0 {
-            report.push("Cleared the EXT4_ERROR_FS flag (a full e2fsck is still recommended).".into());
-            w32(&mut self.sb, S_ERROR_COUNT, 0);
-        }
-        if state & 1 == 0 {
-            report.push("Marked the volume as cleanly unmounted.".into());
-        }
-        w16(&mut self.sb, S_STATE, 1);
-        self.write_sb()?;
-        let (db, di) = self.reconcile_counts()?;
-        if db != 0 || di != 0 {
-            report.push(format!("Reconciled free counters (blocks {db:+}, inodes {di:+})."));
-        }
-        self.dev.flush()?;
-        self.ro = saved_ro || self.ro_reason.is_some();
-        if report.is_empty() {
-            report.push("Volume was already clean.".into());
-        }
-        Ok(report.join(" "))
+        let r = self.repair_steps();
+        // Also on failure: never leave a read-only volume writable.
+        self.ro = saved_ro || self.ro_reason.is_some() || self.bad_gd.is_some();
+        r
     }
 }
 
@@ -2942,9 +3210,9 @@ pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
     let inodes_count = ipg * ngroups;
 
     let mut uuid = [0u8; 16];
-    uuid.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    uuid.copy_from_slice(&super::random_id());
     let mut hash_seed = [0u8; 16];
-    hash_seed.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    hash_seed.copy_from_slice(&super::random_id());
     let now = Timestamp::now().secs as u32;
 
     // Layout per group.

@@ -161,7 +161,7 @@ impl NtfsFs {
                 let bs = d.hdr.block_size as u64;
                 let s = self.stream(&d.ino, AT_INDEX_ALLOCATION, &d.name)?.ok_or_else(|| FsError::Corrupt("index points to missing $INDEX_ALLOCATION".into()))?;
                 let off = v.checked_mul(d.vcn_unit).ok_or_else(|| FsError::Corrupt("vcn".into()))?;
-                if off + bs > s.size() {
+                if off.checked_add(bs).map_or(true, |e| e > s.size()) {
                     return corrupt("index block beyond $INDEX_ALLOCATION");
                 }
                 let mut b = self.read_stream(&s, off, bs)?;
@@ -553,7 +553,7 @@ impl NtfsFs {
 
     fn free_block(&mut self, d: &mut DirIndex, vcn: u64) -> FsResult<()> {
         self.load_bitmap(d)?;
-        let bit = (vcn * d.vcn_unit / d.hdr.block_size as u64) as usize;
+        let bit = (vcn.saturating_mul(d.vcn_unit) / d.hdr.block_size as u64).min(usize::MAX as u64) as usize;
         let bm = d.bitmap.as_mut().unwrap();
         if bit / 8 < bm.len() {
             bm[bit / 8] &= !(1 << (bit % 8));

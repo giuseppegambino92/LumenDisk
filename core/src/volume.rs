@@ -1016,8 +1016,9 @@ impl Runtime {
             mode: v.req.mode,
             mountpoint: v.mountpoint.to_string_lossy().into_owned(),
             port: v.server.port,
-            read_only: v.nfs_read_only,
-            forced_read_only_reason: v.forced_ro.clone(),
+            // After an internal error the server answers EIO to everything (nfs_loopback).
+            read_only: v.nfs_read_only || v.tracker.failure().is_some(),
+            forced_read_only_reason: v.tracker.failure().map(|w| format!("internal error, volume disabled until unmounted: {w}")).or_else(|| v.forced_ro.clone()),
             dirty,
             total_bytes: st.total_bytes,
             free_bytes: st.free_bytes,

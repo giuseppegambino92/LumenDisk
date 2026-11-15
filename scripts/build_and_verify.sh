@@ -6,6 +6,8 @@
 #   FULL=1 scripts/build_and_verify.sh      also the long driver suites (ntfs-3g / kernel ntfs3 / vfat / exfat)
 #   SKIP_UI=1 scripts/build_and_verify.sh     skip the real-core UI screenshot pass (it opens app windows)
 #   INSTALL=1 scripts/build_and_verify.sh     also copy this development build to /Applications and launch it
+#   SKIP_FUZZ=1 scripts/build_and_verify.sh   skip the 30 s-per-target libFuzzer pass (runs only if cargo-fuzz + nightly exist)
+#   LUMENDISK_CORRUPT_CASES=50000 ...         more mutants in the corrupted-image suite (default 16000)
 #
 # The bundle built here is ad-hoc signed. macOS hides the system socket table from such builds,
 # so they can't verify loopback NFS clients and refuse to mount unless
@@ -94,6 +96,27 @@ ok "all $NSYM C ABI functions from core/include/lumendisk_ffi.h exported"
 bold "Unit tests (drivers, WAL, Ghost Shield, Shadow, UID bridge, remote cache, lock inspector)"
 OUT=$(cargo test -q --release -p lumendisk-core --lib 2>&1) || { echo "$OUT" | tail -30; die "unit tests failed"; }
 ok "$(summary_of "$OUT")"; record "Unit tests" "$(summary_of "$OUT")"
+
+bold "Corrupted images: mutated ext4 / NTFS / FAT / exFAT volumes and partition tables (no panic, hang or runaway allocation)"
+OUT=$(cargo test --profile robust -p lumendisk-core --test corrupted_images -- --nocapture 2>&1) || { echo "$OUT" | grep -E '✗|panicked|FAILED|HANG' | head -40; die "corrupted-image suite failed"; }
+LINE=$(grep -E '^corrupted images:' <<<"$OUT" | head -1)
+NCASES=$(sed -E 's/^corrupted images: ([0-9]+) cases.*/\1/' <<<"$LINE")
+NFS=$(sed -E 's/.* ([0-9]+) filesystems.*/\1/' <<<"$LINE")
+grep -E '^corrupted images:|^  mutants mounted|fuzz regression inputs|^partition tables:' <<<"$OUT" | sed 's/^ */    · /'
+ok "$(summary_of "$OUT")"; record "Corrupted images ($NCASES cases, $NFS filesystems)" "$(summary_of "$OUT")"
+
+if [ -z "${SKIP_FUZZ:-}" ]; then
+  bold "Fuzzing (libFuzzer, 30 s per target)"
+  if cargo +nightly --version >/dev/null 2>&1 && cargo +nightly fuzz --version >/dev/null 2>&1; then
+    OUT=$(FUZZ_CORPUS="$ROOT/target/fuzz-corpus-verify" scripts/fuzz.sh 30 2>&1) || { echo "$OUT" | tail -25; die "fuzzing found a crash (see core/fuzz/artifacts)"; }
+    rm -rf "$ROOT/target/fuzz-corpus-verify"
+    echo "$OUT" | grep -E 'execs' | sed 's/^ */    · /'
+    EXECS=$(grep -Eo '[0-9]+ execs' <<<"$OUT" | awk '{s+=$1} END {print s+0}')
+    ok "$EXECS executions, no crash"; record "Fuzzing (30 s × 5 targets)" "$EXECS execs, 0 crashes"
+  else
+    printf '  (nightly Rust / cargo-fuzz not installed: skipped; see scripts/fuzz.sh)\n'
+  fi
+fi
 
 bold "LAN share / Wi-Fi portal server (real HTTP)"
 OUT=$(cargo test -q --release -p lumendisk-core --test lan_server 2>&1) || { echo "$OUT" | tail -30; die "LAN server tests failed"; }

@@ -44,7 +44,7 @@ fn corrupt(s: impl Into<String>) -> FsError {
 
 // ───────────────────────────── checksums ─────────────────────────────
 
-fn boot_checksum(region: &[u8]) -> u32 {
+pub(crate) fn boot_checksum(region: &[u8]) -> u32 {
     let mut c: u32 = 0;
     for (i, &b) in region.iter().enumerate() {
         if i == 106 || i == 107 || i == 112 {
@@ -55,7 +55,7 @@ fn boot_checksum(region: &[u8]) -> u32 {
     c
 }
 
-fn set_checksum(set: &[u8]) -> u16 {
+pub(crate) fn set_checksum(set: &[u8]) -> u16 {
     let mut c: u16 = 0;
     for (i, &b) in set.iter().enumerate() {
         if i == 2 || i == 3 {
@@ -66,7 +66,7 @@ fn set_checksum(set: &[u8]) -> u16 {
     c
 }
 
-fn table_checksum(t: &[u8]) -> u32 {
+pub(crate) fn table_checksum(t: &[u8]) -> u32 {
     let mut c: u32 = 0;
     for &b in t {
         c = c.rotate_right(1).wrapping_add(b as u32);
@@ -747,7 +747,11 @@ impl ExFatFs {
         if len == 0 {
             return Ok(vec![]);
         }
-        if off + len > alloc * cs {
+        // A stream can't own more clusters than the heap has (sizes come from the entry set).
+        if alloc > self.b.clusters as u64 {
+            return Err(corrupt("stream larger than the volume"));
+        }
+        if off.checked_add(len).map_or(true, |e| e > alloc * cs) {
             return Err(corrupt("access beyond allocated clusters"));
         }
         if x.nofat {
@@ -775,9 +779,12 @@ impl ExFatFs {
         Ok(out)
     }
     fn read_ext(&mut self, x: Ext, alloc: u64, off: u64, len: u64) -> FsResult<Vec<u8>> {
+        // Map first: the runs prove the clusters exist on this volume, so a length taken
+        // from a corrupt entry can't size the buffer beyond what is really there.
+        let runs = self.runs(x, alloc, off, len)?;
         let mut out = vec![0u8; len as usize];
         let mut p = 0usize;
-        for (d, n) in self.runs(x, alloc, off, len)? {
+        for (d, n) in runs {
             self.dev.read_at(d, &mut out[p..p + n as usize])?;
             p += n as usize;
         }
@@ -845,6 +852,12 @@ impl ExFatFs {
     fn realloc(&mut self, x: &mut Ext, have: u64, need: u64) -> FsResult<()> {
         if need == have {
             return Ok(());
+        }
+        if have > self.b.clusters as u64 || need > self.b.clusters as u64 {
+            return Err(corrupt("stream larger than the volume"));
+        }
+        if x.nofat && have > 0 && (!self.valid(x.first) || x.first as u64 + have > self.b.clusters as u64 + 2) {
+            return Err(corrupt("contiguous stream outside the cluster heap"));
         }
         if need < have {
             if x.nofat {
@@ -970,7 +983,7 @@ impl ExFatFs {
         if first == 0 || len == 0 {
             return Err(corrupt("directory without clusters"));
         }
-        if len > MAX_DIR_BYTES {
+        if len > MAX_DIR_BYTES || len > self.b.clusters as u64 * self.b.cs {
             return Err(corrupt("directory too large"));
         }
         Ok((
@@ -1200,7 +1213,7 @@ impl ExFatFs {
             atime,
             mtime,
             ctime: mtime,
-            used_bytes: size.div_ceil(self.b.cs) * self.b.cs,
+            used_bytes: size.div_ceil(self.b.cs).saturating_mul(self.b.cs),
         })
     }
 
@@ -1456,6 +1469,10 @@ impl ExFatFs {
         }
         let mut queue: VecDeque<(Ext, u64, String)> = VecDeque::new();
         queue.push_back((root, rn, "/".into()));
+        // A directory whose clusters are reached twice (e.g. a subdirectory pointing back at
+        // the root) is a loop: walk it once.
+        let mut seen_dirs = std::collections::HashSet::new();
+        seen_dirs.insert(self.b.root);
         let mut dirs = 0usize;
         while let Some((x, n, path)) = queue.pop_front() {
             dirs += 1;
@@ -1493,7 +1510,11 @@ impl ExFatFs {
                             mark(c, &mut used);
                         }
                         if s_attr(&e.set) & A_DIR != 0 && len <= MAX_DIR_BYTES {
-                            queue.push_back((Ext { first, nofat }, alloc, format!("{p}/")));
+                            if seen_dirs.insert(first) {
+                                queue.push_back((Ext { first, nofat }, alloc, format!("{p}/")));
+                            } else {
+                                problems.push(format!("directory {p} shares its clusters with another directory (loop)"));
+                            }
                         }
                     }
                     Err(err) => {

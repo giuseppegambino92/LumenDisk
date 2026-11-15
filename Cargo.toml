@@ -9,3 +9,11 @@ lto = false  # staticlib is linked by Apple's toolchain: ship native objects, no
 codegen-units = 4
 debug = false
 panic = "unwind"
+
+# Corrupted-image suite (tests/corrupted_images.rs): release speed, but integer overflow checks
+# and debug assertions stay on, so arithmetic on hostile on-disk values fails loudly instead of
+# silently wrapping.
+[profile.robust]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
