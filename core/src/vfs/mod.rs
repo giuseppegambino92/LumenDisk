@@ -25,6 +25,7 @@ pub mod fat_fs;
 pub mod ghost;
 pub mod ntfs_fs;
 pub mod shadow;
+pub mod shadow_store;
 pub mod uidmap;
 
 /// Inode / file identifier. Must be stable for the lifetime of a mount and never 0.
@@ -257,6 +258,14 @@ pub trait FileSystem: Send {
     fn read_only_reason(&self) -> Option<String> {
         None
     }
+
+    /// Fingerprint of the on-disk state, used by persistent Shadow sessions to notice that the
+    /// volume was modified elsewhere (e.g. by Linux or Windows) between two LumenDisk mounts.
+    /// It must not change when LumenDisk itself only mounts / reads / unmounts the volume, and
+    /// should change when another OS writes to it. Default: none (no global check).
+    fn fingerprint(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Defaults applied by drivers that have no on-disk ownership (FAT, exFAT, NTFS).
@@ -378,6 +387,37 @@ impl FileSystem for ReadOnlyGuard {
     fn repair(&mut self) -> FsResult<String> {
         Err(FsError::ReadOnly)
     }
+    fn fingerprint(&mut self) -> Option<String> {
+        self.inner.fingerprint()
+    }
+}
+
+/// Hex digest of byte slices (volume fingerprints).
+pub fn digest_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for p in parts {
+        h.update((p.len() as u64).to_le_bytes());
+        h.update(p);
+    }
+    h.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Names, kinds, sizes and mtimes of a directory's entries (volume fingerprints).
+pub fn listing_bytes(fs: &mut dyn FileSystem, dir: Ino) -> Vec<u8> {
+    let Ok(mut v) = fs.readdir(dir) else { return b"!".to_vec() };
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = vec![];
+    for e in v {
+        out.extend_from_slice(e.name.as_bytes());
+        out.extend_from_slice(&[0, e.kind as u8]);
+        if let Ok(a) = fs.getattr(e.ino) {
+            out.extend_from_slice(&a.size.to_le_bytes());
+            out.extend_from_slice(&a.mtime.secs.to_le_bytes());
+            out.extend_from_slice(&a.mtime.nsecs.to_le_bytes());
+        }
+    }
+    out
 }
 
 /// Shared helper: validate a single path component.

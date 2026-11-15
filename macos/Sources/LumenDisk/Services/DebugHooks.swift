@@ -16,6 +16,7 @@ import SwiftUI
 ///   LUMENDISK_WINDOW=<w>x<h>        main window size
 ///   LUMENDISK_POPOVER_WINDOW=1      menu bar popover in a panel
 ///   LUMENDISK_NO_BONJOUR=1          disables Bonjour browsing and publishing
+///   LUMENDISK_NO_SHADOW_PROMPT=1    never show the saved-Shadow-session recovery prompt
 ///   LUMENDISK_MOUNT_ROOT=<dir>      parent folder for every mountpoint (see AppPaths)
 ///   LUMENDISK_MOUNT="<path>|<mode>|<partition>[|<name>];…"   mount real images at launch
 ///   LUMENDISK_IMAGEURL="<url>|<partition>[|<mode>]"         mount a real remote image (HTTP Range)

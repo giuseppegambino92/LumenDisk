@@ -550,6 +550,9 @@ impl FileSystem for Journaled {
     fn read_only_reason(&self) -> Option<String> {
         self.inner.read_only_reason()
     }
+    fn fingerprint(&mut self) -> Option<String> {
+        self.inner.fingerprint()
+    }
 }
 
 /// Stable WAL file name for a volume.

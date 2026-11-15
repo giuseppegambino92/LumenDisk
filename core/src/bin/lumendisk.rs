@@ -7,6 +7,10 @@
 //!   lumendisk ctl <SOCKET> <status|changes|commit|rollback|ghost|unmount>
 //!   lumendisk repair <image> [--partition N]
 //!   lumendisk locks <mountpoint>
+//!   lumendisk shadow-sessions                 saved Shadow sessions (pending changes per volume)
+//!   lumendisk shadow-discard <KEY>            delete a saved Shadow session
+//!
+//! State lives in ~/Library/Application Support/LumenDisk, or in $LUMENDISK_SUPPORT_DIR.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -25,7 +29,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  lumendisk inspect <path>\n  lumendisk mkfs <fs> <path> <MiB> [label]\n  lumendisk mount <path> [--partition N] [--mode readWrite|shadow|readOnly] [--no-ghost] [--root DIR] [--name NAME] [--control SOCK]\n  lumendisk ctl <SOCK> <status|changes|commit|rollback|ghost|unmount>\n  lumendisk repair <path> [--partition N]\n  lumendisk locks <mountpoint>"
+        "usage:\n  lumendisk inspect <path>\n  lumendisk mkfs <fs> <path> <MiB> [label]\n  lumendisk mount <path> [--partition N] [--mode readWrite|shadow|readOnly] [--no-ghost] [--root DIR] [--name NAME] [--control SOCK]\n  lumendisk ctl <SOCK> <status|changes|commit|rollback|ghost|unmount>\n  lumendisk repair <path> [--partition N]\n  lumendisk locks <mountpoint>\n  lumendisk shadow-sessions\n  lumendisk shadow-discard <KEY>"
     );
     std::process::exit(2)
 }
@@ -70,7 +74,11 @@ fn main() {
         let _ = tracing_subscriber::fmt().with_ansi(false).with_env_filter("nfsserve=debug").with_writer(std::io::stderr).try_init();
     }
     let rt = runtime();
-    rt.set_support_dir(&lumendisk_core::volume::default_support_dir());
+    let support = std::env::var_os("LUMENDISK_SUPPORT_DIR")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(lumendisk_core::volume::default_support_dir);
+    rt.set_support_dir(&support);
     match cmd {
         "inspect" => {
             let p = args.get(1).unwrap_or_else(|| usage());
@@ -92,6 +100,14 @@ fn main() {
             let part = opt(&args, "--partition").and_then(|s| s.parse().ok()).unwrap_or(0);
             match rt.repair_source(p, part, None) {
                 Ok(r) => print(json!({"report": r})),
+                Err(e) => fail(e),
+            }
+        }
+        "shadow-sessions" => print(json!(rt.shadow_sessions())),
+        "shadow-discard" => {
+            let k = args.get(1).unwrap_or_else(|| usage());
+            match rt.shadow_discard_session(k) {
+                Ok(n) => print(json!({"discarded": n})),
                 Err(e) => fail(e),
             }
         }
@@ -131,6 +147,8 @@ fn main() {
                 name: opt(&args, "--name"),
                 fd: None,
                 volume_icon: None,
+                media_uuid: None,
+                expect_session: None,
             };
             // Bind the control socket first so a bad path can't leave an orphaned mount.
             let listener = opt(&args, "--control").map(|sock| {

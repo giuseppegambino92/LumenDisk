@@ -1,24 +1,60 @@
 //! Feature 2 — Shadow Mount: Copy-on-Write write-back overlay (dry-run mode).
 //!
-//! Every mutation is kept on the Mac: file contents in a chunked staging file
-//! (`~/Library/Application Support/LumenDisk/Shadow/<volume>.stage`), metadata and the
-//! directory tree in memory, plus an ordered log of structural operations. Nothing touches
+//! Every mutation is kept on the Mac: file contents in a chunked staging file, metadata and
+//! the directory tree in memory, plus an ordered log of structural operations. Nothing touches
 //! the physical volume until `commit()`, which replays the structural log in order and then
 //! writes the final content of every modified file. `rollback()` discards everything.
 //!
 //! Inode identity: objects that exist on the lower volume keep their inode number; objects
 //! created in the overlay get ids ≥ `SHADOW_BASE`. After a commit those ids keep resolving
 //! (alias table) so open Finder windows and NFS file handles stay valid.
+//!
+//! ## Persistent sessions (local volumes and disk images)
+//!
+//! With [`ShadowOverlay::open_session`] the overlay survives crashes, force-quit and power loss
+//! (on-disk layout in `shadow_store.rs`):
+//!
+//! * **Event sourcing.** Every mutating call appends a record to an operation journal: its
+//!   arguments (lower objects by their path on the untouched lower volume, overlay objects by
+//!   id), the clock value it used and the stage-file chunks it filled. Recovery reopens the
+//!   lower volume and re-executes the records through the same code paths in replay mode
+//!   (no re-logging, no data copies: chunk assignments point at the existing stage bytes).
+//!   Overlay ids are allocated by a deterministic counter, so they come out identical.
+//! * **Group commit.** Records are buffered and written as one CRC-protected frame at most
+//!   every 100 ms (and on `sync()`): stage file `F_FULLFSYNC` first, then the frame, then the
+//!   journal `F_FULLFSYNC`. Chunks referenced by a durable frame are never overwritten in place
+//!   (copy-on-write), so after a crash the recovered state is always a consistent prefix of
+//!   the operations.
+//! * **Drift detection.** The session stores a fingerprint of the lower volume
+//!   ([`FileSystem::fingerprint`]) and every record notes the attributes of the lower objects
+//!   it read. If the disk was modified elsewhere, recovery refuses and only Discard remains.
+//! * **Resumable commit (roll-forward).** A commit first writes its plan, then applies it in
+//!   windows; after each window the lower volume is synced and a checkpoint appended. Each
+//!   window is built so that re-applying it after a crash is unambiguous (no two operations on
+//!   the same name or object, renames alone), and every step tolerates having already been
+//!   applied. After an error or a crash, `commit()` continues from the last checkpoint —
+//!   re-finding objects by path, so it also works on filesystems whose inode numbers are not
+//!   stable across mounts (FAT, exFAT).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+use super::shadow_store::{self as store, Counts, Identity, Manifest, RecordLog};
 use super::*;
 
 pub const SHADOW_BASE: Ino = 1 << 61;
 const CHUNK: u64 = 64 * 1024;
+/// Group-commit interval of the operation journal.
+pub const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const FLUSH_RECORDS: usize = 2048;
+const MANIFEST_INTERVAL: Duration = Duration::from_secs(1);
+/// Max structural operations between two commit checkpoints.
+const WINDOW_OPS: usize = 512;
+const CONTENT_FILES_PER_CKPT: usize = 64;
+const CONTENT_BYTES_PER_CKPT: u64 = 64 << 20;
 
 #[derive(Clone, Debug)]
 struct FileData {
@@ -42,15 +78,16 @@ struct SNode {
     attr_dirty: bool,
 }
 
-#[derive(Clone, Debug)]
+/// Structural operation, in the order the commit has to apply it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Op {
     Create { parent: Ino, name: String, ino: Ino, perm: u16, uid: u32, gid: u32 },
     Mkdir { parent: Ino, name: String, ino: Ino, perm: u16, uid: u32, gid: u32 },
     Symlink { parent: Ino, name: String, target: String, ino: Ino, uid: u32, gid: u32 },
     SetAttr { ino: Ino, set: SetAttr },
-    Unlink { parent: Ino, name: String },
-    Rmdir { parent: Ino, name: String },
-    Rename { fp: Ino, fname: String, tp: Ino, tname: String },
+    Unlink { parent: Ino, name: String, ino: Ino },
+    Rmdir { parent: Ino, name: String, ino: Ino },
+    Rename { fp: Ino, fname: String, tp: Ino, tname: String, ino: Ino, over: Option<Ino> },
 }
 
 #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
@@ -69,6 +106,291 @@ pub struct ShadowSummary {
     pub modified: u64,
     pub deleted: u64,
     pub pending_bytes: i64,
+    /// Changes are journaled on disk and survive a crash / restart.
+    pub persistent: bool,
+    pub session_key: Option<String>,
+    /// The changes were restored from a previous run when the volume was mounted.
+    pub restored: bool,
+    /// "pending" or "committing" (a commit started and has not finished).
+    pub state: &'static str,
+    pub commit_applied: u64,
+    pub commit_total: u64,
+    pub commit_error: Option<String>,
+}
+
+// ───────────────────────────── journal records ─────────────────────────────
+
+/// Reference to an object in a journal record.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+enum JRef {
+    /// Overlay object (id ≥ SHADOW_BASE, deterministic across replays).
+    O(Ino),
+    /// Lower object, by its path on the (unchanged) lower volume.
+    P(String),
+    /// Lower object by inode number (filesystems with stable inode numbers only).
+    I(Ino),
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+enum JOp {
+    Create { p: JRef, n: String, perm: u16, uid: u32, gid: u32 },
+    Mkdir { p: JRef, n: String, perm: u16, uid: u32, gid: u32 },
+    Symlink { p: JRef, n: String, target: String, uid: u32, gid: u32 },
+    Unlink { p: JRef, n: String },
+    Rmdir { p: JRef, n: String },
+    Rename { fp: JRef, fname: String, tp: JRef, tname: String },
+    SetAttr { i: JRef, set: SetAttr },
+    Write { i: JRef, off: u64, len: u64 },
+}
+
+/// What a record read from the lower volume (drift detection on replay).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum Seen {
+    Attr { r: JRef, kind: FileKind, size: u64, mtime: Timestamp },
+    Dir { r: JRef, digest: String },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct JRec {
+    op: JOp,
+    now: Timestamp,
+    ok: bool,
+    /// Stage chunks assigned by the operation, in order: (chunk index, stage offset).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    a: Vec<(u64, u64)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    seen: Vec<Seen>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum Frame {
+    Header { v: u32, next: u64 },
+    Batch(Vec<JRec>),
+}
+
+#[derive(Default)]
+struct RecCtx {
+    assign: Vec<(u64, u64)>,
+    seen: Vec<Seen>,
+}
+
+// ───────────────────────────── commit plan ─────────────────────────────
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct FileItem {
+    ino: Ino,
+    size: u64,
+    base_limit: u64,
+    chunks: Vec<(u64, u64)>,
+    atime: Timestamp,
+    mtime: Timestamp,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Plan {
+    format: u32,
+    root: Ino,
+    ops: Vec<Op>,
+    files: Vec<FileItem>,
+    /// Number of user-visible changes (for the "applied" count).
+    changes: u64,
+    /// Lower parent / name of every lower object the plan references (and their ancestors)
+    /// when the commit started: a resume re-finds objects by path after a remount.
+    tree: Vec<(Ino, Ino, String)>,
+}
+
+impl Plan {
+    fn total(&self) -> usize {
+        self.ops.len() + self.files.len()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Checkpoint {
+    step: u64,
+}
+
+struct CommitRun {
+    plan: Plan,
+    /// Steps durably applied (structural operations first, then files).
+    done: usize,
+    /// plan object → lower inode, valid for the current mount.
+    map: HashMap<Ino, Ino>,
+    /// Re-find objects and re-apply the last window idempotently before continuing.
+    stale: bool,
+    error: Option<String>,
+    progress: Option<RecordLog>,
+    /// The in-memory overlay describes this plan (false when resumed from disk).
+    overlay_valid: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Key {
+    N(Ino, String),
+    I(Ino),
+}
+
+fn op_keys(op: &Op) -> Vec<Key> {
+    let n = |p: &Ino, s: &str| Key::N(*p, s.to_lowercase());
+    match op {
+        Op::Create { parent, name, ino, .. } | Op::Mkdir { parent, name, ino, .. } | Op::Symlink { parent, name, ino, .. } => {
+            vec![n(parent, name), Key::I(*ino)]
+        }
+        Op::Unlink { parent, name, ino } | Op::Rmdir { parent, name, ino } => vec![n(parent, name), Key::I(*ino)],
+        Op::Rename { fp, fname, tp, tname, ino, over } => {
+            let mut v = vec![n(fp, fname), n(tp, tname), Key::I(*ino)];
+            if let Some(o) = over {
+                v.push(Key::I(*o));
+            }
+            v
+        }
+        Op::SetAttr { ino, .. } => vec![Key::I(*ino)],
+    }
+}
+
+/// End (exclusive) of the commit window starting at `s`: no two operations of a window touch
+/// the same name or object, renames are alone, at most WINDOW_OPS operations. Deterministic.
+fn window_end(ops: &[Op], s: usize) -> usize {
+    let mut keys: HashSet<Key> = HashSet::new();
+    let mut k = s;
+    while k < ops.len() && k - s < WINDOW_OPS {
+        if matches!(ops[k], Op::Rename { .. }) {
+            return if k == s { s + 1 } else { k };
+        }
+        let ok = op_keys(&ops[k]);
+        if ok.iter().any(|x| keys.contains(x)) {
+            return k;
+        }
+        keys.extend(ok);
+        k += 1;
+    }
+    k
+}
+
+/// Parent/name of every object after applying `ops[..upto]` to the starting tree.
+fn sim_tree(plan: &Plan, upto: usize) -> HashMap<Ino, (Ino, String)> {
+    let mut t: HashMap<Ino, (Ino, String)> = plan.tree.iter().map(|(i, p, n)| (*i, (*p, n.clone()))).collect();
+    for op in &plan.ops[..upto] {
+        match op {
+            Op::Create { parent, name, ino, .. } | Op::Mkdir { parent, name, ino, .. } | Op::Symlink { parent, name, ino, .. } => {
+                t.insert(*ino, (*parent, name.clone()));
+            }
+            Op::Rename { tp, tname, ino, over, .. } => {
+                if let Some(o) = over {
+                    t.remove(o);
+                }
+                t.insert(*ino, (*tp, tname.clone()));
+            }
+            Op::Unlink { ino, .. } | Op::Rmdir { ino, .. } => {
+                t.remove(ino);
+            }
+            Op::SetAttr { .. } => {}
+        }
+    }
+    t
+}
+
+fn tree_path(t: &HashMap<Ino, (Ino, String)>, root: Ino, obj: Ino) -> Option<Vec<String>> {
+    let mut parts = vec![];
+    let mut cur = obj;
+    for _ in 0..4096 {
+        if cur == root {
+            parts.reverse();
+            return Some(parts);
+        }
+        let (p, n) = t.get(&cur)?;
+        parts.push(n.clone());
+        cur = *p;
+    }
+    None
+}
+
+// ───────────────────────────── session ─────────────────────────────
+
+struct Session {
+    dir: PathBuf,
+    manifest: Manifest,
+    /// Created at the first flush (after the manifest).
+    journal: Option<RecordLog>,
+    pending: Vec<JRec>,
+    /// Sequence number of `pending[0]` (records are numbered from 0 in each session).
+    pending_base: u64,
+    /// Distinguishes sessions (a background flush must not complete into a newer one).
+    epoch: u64,
+    next_start: u64,
+    last_flush: Instant,
+    stage_dirty: bool,
+    counts_dirty: bool,
+    last_manifest: Instant,
+    /// Drop may delete / update the session only when armed (false while recovering).
+    armed: bool,
+}
+
+impl Session {
+    fn fresh(dir: PathBuf, identity: Identity, fingerprint: Option<String>, next: u64) -> Session {
+        let now = Timestamp::now().secs;
+        let key = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        Session {
+            dir,
+            manifest: Manifest {
+                format: store::FORMAT_VERSION,
+                key,
+                identity,
+                created: now,
+                updated: now,
+                state: "pending".into(),
+                fingerprint,
+                ..Default::default()
+            },
+            journal: None,
+            pending: vec![],
+            pending_base: 0,
+            epoch: SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            next_start: next,
+            last_flush: Instant::now(),
+            stage_dirty: false,
+            counts_dirty: false,
+            last_manifest: Instant::now(),
+            armed: true,
+        }
+    }
+}
+
+static SESSION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A group commit whose expensive part (making the stage file durable) runs without the
+/// volume lock: see [`ShadowOverlay::begin_background_flush`].
+pub struct FlushJob {
+    stage: File,
+    target: u64,
+    epoch: u64,
+    dirty: bool,
+}
+
+impl FlushJob {
+    /// `F_FULLFSYNC` the stage file (call it without holding the volume lock).
+    pub fn sync_stage(&self) -> std::io::Result<()> {
+        if self.dirty {
+            store::full_sync(&self.stage)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn drift_message(detail: &str) -> String {
+    crate::i18n::t(
+        &format!("Il disco è stato modificato altrove (per esempio su Linux o Windows) dopo l'inizio della sessione Shadow: le modifiche salvate non possono più essere applicate in sicurezza e si possono solo scartare. ({detail})"),
+        &format!("The disk was modified elsewhere (for example on Linux or Windows) after the Shadow session started: the saved changes can no longer be applied safely and can only be discarded. ({detail})"),
+    )
+}
+
+fn io(e: std::io::Error) -> FsError {
+    FsError::Io(e.to_string())
+}
+
+fn json_err(e: serde_json::Error) -> FsError {
+    FsError::Io(format!("shadow journal: {e}"))
 }
 
 pub struct ShadowOverlay {
@@ -83,15 +405,39 @@ pub struct ShadowOverlay {
     stage_path: PathBuf,
     stage_len: u64,
     alias: HashMap<Ino, Ino>,
+    /// Lower inode numbers survive a remount (not on FAT / exFAT).
+    stable_inos: bool,
+    // chunk allocation
+    free: Vec<u64>,
+    /// (sequence number of the releasing record, stage offset)
+    pending_free: Vec<(u64, u64)>,
+    /// Chunks not yet referenced by a durable journal frame: may be overwritten in place.
+    unsealed: HashSet<u64>,
+    // recording / replay
+    sess: Option<Session>,
+    rec: Option<RecCtx>,
+    op_now: Option<Timestamp>,
+    replay_assign: Option<VecDeque<(u64, u64)>>,
+    path_cache: HashMap<String, Ino>,
+    restored: bool,
+    commit: Option<CommitRun>,
+    /// Group-commit interval (tests raise it to control when frames are written).
+    flush_interval: Duration,
 }
 
 impl ShadowOverlay {
+    /// In-memory overlay (changes are lost when it is dropped). Used for remote volumes.
     pub fn new(lower: Box<dyn FileSystem>, stage_path: PathBuf) -> FsResult<Self> {
         if let Some(d) = stage_path.parent() {
             std::fs::create_dir_all(d)?;
         }
         let stage = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&stage_path)?;
-        Ok(ShadowOverlay {
+        Ok(Self::build(lower, stage, stage_path, None))
+    }
+
+    fn build(lower: Box<dyn FileSystem>, stage: File, stage_path: PathBuf, sess: Option<Session>) -> Self {
+        let stable_inos = !matches!(lower.volume_info().fs_type, FsType::Fat12 | FsType::Fat16 | FsType::Fat32 | FsType::ExFat);
+        ShadowOverlay {
             lower,
             nodes: HashMap::new(),
             deleted: HashMap::new(),
@@ -103,11 +449,167 @@ impl ShadowOverlay {
             stage_path,
             stage_len: 0,
             alias: HashMap::new(),
-        })
+            stable_inos,
+            free: vec![],
+            pending_free: vec![],
+            unsealed: HashSet::new(),
+            sess,
+            rec: None,
+            op_now: None,
+            replay_assign: None,
+            path_cache: HashMap::new(),
+            restored: false,
+            commit: None,
+            flush_interval: FLUSH_INTERVAL,
+        }
+    }
+
+    /// Persistent overlay for the volume whose session lives in `dir`: restores the pending
+    /// changes found there (or loads an interrupted commit, which the caller resumes with
+    /// [`ShadowOverlay::commit`]). Fails — leaving the session untouched — if the lower volume
+    /// was modified since the session started.
+    pub fn open_session(lower: Box<dyn FileSystem>, dir: PathBuf, identity: Identity) -> Result<Self, String> {
+        let e = |x: &dyn std::fmt::Display| crate::i18n::t(&format!("sessione Shadow: {x}"), &format!("Shadow session: {x}"));
+        std::fs::create_dir_all(&dir).map_err(|x| e(&x))?;
+        let stage_path = dir.join(store::STAGE);
+        let manifest = Manifest::load(&dir);
+        let mut lower = lower;
+        let fingerprint = lower.fingerprint();
+        let Some(mut manifest) = manifest else {
+            // New session. Anything left here without a valid manifest never held a durable
+            // change (the manifest is written before the first journal frame): set it aside.
+            // A stage file alone is just a session that never recorded anything; a journal
+            // without a manifest shouldn't exist, but is kept for inspection, not deleted.
+            let journal = dir.join(store::JOURNAL);
+            if journal.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                let aside = dir.with_file_name(format!(".orphan-{}-{}", dir.file_name().unwrap_or_default().to_string_lossy(), Timestamp::now().secs));
+                std::fs::rename(&dir, &aside).map_err(|x| e(&x))?;
+                std::fs::create_dir_all(&dir).map_err(|x| e(&x))?;
+            }
+            let stage = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&stage_path).map_err(|x| e(&x))?;
+            let sess = Session::fresh(dir, identity, fingerprint, 1);
+            return Ok(Self::build(lower, stage, stage_path, Some(sess)));
+        };
+        if let Some(d) = &manifest.drift {
+            return Err(drift_message(d));
+        }
+        // Keep what the app knows about the device up to date.
+        if identity.media_uuid.is_some() {
+            manifest.identity.media_uuid = identity.media_uuid.clone();
+        }
+        manifest.identity.source_path = identity.source_path.clone();
+        let stage = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&stage_path).map_err(|x| e(&x))?;
+        let mut sess = Session::fresh(dir.clone(), manifest.identity.clone(), manifest.fingerprint.clone(), 1);
+        sess.manifest = manifest.clone();
+        sess.armed = false;
+        let mut ov = Self::build(lower, stage, stage_path, Some(sess));
+
+        if manifest.state == "committing" {
+            let plan: Plan = std::fs::read(dir.join(store::PLAN))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .ok_or_else(|| e(&crate::i18n::t("piano di applicazione illeggibile", "unreadable commit plan")))?;
+            let (progress, frames) = RecordLog::open(&dir.join(store::PROGRESS)).map_err(|x| e(&x))?;
+            let done = frames.iter().filter_map(|f| serde_json::from_slice::<Checkpoint>(f).ok()).map(|c| c.step as usize).max().unwrap_or(0);
+            ov.commit = Some(CommitRun {
+                done: done.min(plan.total()),
+                plan,
+                map: HashMap::new(),
+                stale: true,
+                error: manifest.commit_error.clone(),
+                progress: Some(progress),
+                overlay_valid: false,
+            });
+            ov.restored = true;
+            if let Some(s) = &mut ov.sess {
+                s.armed = true;
+            }
+            return Ok(ov);
+        }
+
+        // A plan without "committing" never reached the disk: forget it.
+        let _ = std::fs::remove_file(dir.join(store::PLAN));
+        let _ = std::fs::remove_file(dir.join(store::PROGRESS));
+        if manifest.fingerprint.is_some() && fingerprint != manifest.fingerprint {
+            return Err(ov.mark_drift(crate::i18n::t("impronta del volume diversa", "volume fingerprint changed")));
+        }
+        let (journal, frames) = RecordLog::open(&dir.join(store::JOURNAL)).map_err(|x| e(&x))?;
+        let mut records = 0usize;
+        for (i, f) in frames.iter().enumerate() {
+            let frame: Frame = serde_json::from_slice(f).map_err(|x| e(&x))?;
+            match frame {
+                Frame::Header { next, .. } if i == 0 => {
+                    ov.next = next;
+                    if let Some(s) = &mut ov.sess {
+                        s.next_start = next;
+                    }
+                }
+                Frame::Header { .. } => return Err(e(&"unexpected header")),
+                Frame::Batch(recs) => {
+                    for r in recs {
+                        if let Err(d) = ov.replay_record(r) {
+                            return Err(ov.mark_drift(d));
+                        }
+                        records += 1;
+                    }
+                }
+            }
+        }
+        ov.path_cache.clear();
+        ov.rebuild_free_list();
+        ov.restored = records > 0;
+        if let Some(s) = &mut ov.sess {
+            s.journal = if frames.is_empty() { None } else { Some(journal) };
+            s.armed = true;
+        }
+        Ok(ov)
+    }
+
+    fn mark_drift(&mut self, detail: String) -> String {
+        if let Some(s) = &mut self.sess {
+            s.armed = false;
+            s.manifest.drift = Some(detail.clone());
+            let _ = s.manifest.save(&s.dir, true);
+        }
+        drift_message(&detail)
+    }
+
+    /// Persistent session key, if this overlay is journaled on disk.
+    pub fn session_key(&self) -> Option<String> {
+        self.sess.as_ref().map(|s| s.manifest.key.clone())
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.sess.is_some()
+    }
+
+    /// A commit started and has not finished (new writes are refused until it does or the
+    /// rest is abandoned with `rollback`).
+    pub fn commit_pending(&self) -> bool {
+        self.commit.is_some()
     }
 
     fn r(&self, ino: Ino) -> Ino {
         *self.alias.get(&ino).unwrap_or(&ino)
+    }
+
+    fn now(&self) -> Timestamp {
+        self.op_now.unwrap_or_else(Timestamp::now)
+    }
+
+    fn replaying(&self) -> bool {
+        self.replay_assign.is_some()
+    }
+
+    fn recording(&self) -> bool {
+        self.sess.is_some() && !self.replaying()
+    }
+
+    fn check_mutable(&self) -> FsResult<()> {
+        if self.commit.is_some() {
+            return Err(FsError::ReadOnly);
+        }
+        Ok(())
     }
 
     fn live_node(&self, ino: Ino) -> FsResult<Option<&SNode>> {
@@ -142,6 +644,72 @@ impl ShadowOverlay {
         format!("/{}", parts.join("/"))
     }
 
+    /// Path of a lower object on the lower volume as it is (not as the overlay shows it).
+    fn orig_path(&self, ino: Ino) -> Option<String> {
+        let root = self.lower.root_ino();
+        let mut parts = vec![];
+        let mut cur = ino;
+        for _ in 0..4096 {
+            if cur == root {
+                parts.reverse();
+                return Some(format!("/{}", parts.join("/")));
+            }
+            let (p, n) = self.known_parent.get(&cur)?;
+            parts.push(n.as_str());
+            cur = *p;
+        }
+        None
+    }
+
+    fn jref(&self, ino: Ino) -> FsResult<JRef> {
+        if ino >= SHADOW_BASE {
+            return Ok(JRef::O(ino));
+        }
+        match self.orig_path(ino) {
+            Some(p) => Ok(JRef::P(p)),
+            None if self.stable_inos => Ok(JRef::I(ino)),
+            // No durable way to name it: let the NFS client look it up again.
+            None => Err(FsError::Stale),
+        }
+    }
+
+    fn jref_or_ino(&self, ino: Ino) -> JRef {
+        self.jref(ino).unwrap_or(JRef::I(ino))
+    }
+
+    /// Resolve a journal reference against the lower volume (replay).
+    fn resolve_ref(&mut self, r: &JRef) -> FsResult<Ino> {
+        let p = match r {
+            JRef::O(i) | JRef::I(i) => return Ok(*i),
+            JRef::P(p) => p,
+        };
+        if let Some(&i) = self.path_cache.get(p) {
+            return Ok(i);
+        }
+        let mut cur = self.lower.root_ino();
+        let mut acc = String::new();
+        for comp in p.split('/').filter(|c| !c.is_empty()) {
+            acc.push('/');
+            acc.push_str(comp);
+            if let Some(&i) = self.path_cache.get(&acc) {
+                cur = i;
+                continue;
+            }
+            let child = self.lower.lookup(cur, comp)?;
+            self.known_parent.insert(child, (cur, comp.to_string()));
+            self.path_cache.insert(acc.clone(), child);
+            cur = child;
+        }
+        Ok(cur)
+    }
+
+    fn note_seen(&mut self, s: impl FnOnce(&Self) -> Seen) {
+        if self.rec.is_some() && self.recording() {
+            let v = s(self);
+            self.rec.as_mut().unwrap().seen.push(v);
+        }
+    }
+
     fn ensure_node(&mut self, ino: Ino) -> FsResult<()> {
         if self.live_node(ino)?.is_some() {
             return Ok(());
@@ -149,11 +717,25 @@ impl ShadowOverlay {
         let attr = self.lower.getattr(ino)?;
         let (parent, name) = self.known_parent.get(&ino).cloned().unwrap_or((self.lower.root_ino(), String::new()));
         let target = if attr.kind == FileKind::Symlink { self.lower.readlink(ino).ok() } else { None };
+        let (kind, size, mtime) = (attr.kind, attr.size, attr.mtime);
         self.nodes.insert(
             ino,
             SNode { attr, lower: Some(ino), data: None, children: None, target, parent, name, alive: true, attr_dirty: false },
         );
+        self.note_seen(|s| Seen::Attr { r: s.jref_or_ino(ino), kind, size, mtime });
         Ok(())
+    }
+
+    fn dir_digest(entries: &[DirEntry]) -> String {
+        use sha2::Digest;
+        let mut v: Vec<(String, u8)> = entries.iter().map(|e| (e.name.clone(), e.kind as u8)).collect();
+        v.sort();
+        let mut h = sha2::Sha256::new();
+        for (n, k) in v {
+            h.update(n.as_bytes());
+            h.update([0, k, b'\n']);
+        }
+        h.finalize()[..12].iter().map(|b| format!("{b:02x}")).collect()
     }
 
     fn materialize_dir(&mut self, ino: Ino) -> FsResult<()> {
@@ -164,12 +746,14 @@ impl ShadowOverlay {
         }
         if n.children.is_none() {
             let entries = self.lower.readdir(ino)?;
+            let digest = Self::dir_digest(&entries);
             let mut m = BTreeMap::new();
             for e in entries {
                 self.known_parent.insert(e.ino, (ino, e.name.clone()));
                 m.insert(e.name, (e.ino, e.kind));
             }
             self.nodes.get_mut(&ino).unwrap().children = Some(m);
+            self.note_seen(|s| Seen::Dir { r: s.jref_or_ino(ino), digest });
         }
         Ok(())
     }
@@ -187,19 +771,23 @@ impl ShadowOverlay {
     }
 
     fn read_chunk(&mut self, ino: Ino, idx: u64) -> FsResult<Vec<u8>> {
-        let (lower, fd) = {
-            let n = &self.nodes[&ino];
-            (n.lower, n.data.clone().unwrap())
-        };
         let mut buf = vec![0u8; CHUNK as usize];
-        if let Some(&off) = fd.chunks.get(&idx) {
+        if self.replaying() {
+            return Ok(buf); // the bytes are never used: write_chunk takes the recorded chunk
+        }
+        let (lower, base_limit, staged) = {
+            let n = &self.nodes[&ino];
+            let fd = n.data.as_ref().unwrap();
+            (n.lower, fd.base_limit, fd.chunks.get(&idx).copied())
+        };
+        if let Some(off) = staged {
             self.stage.read_exact_at(&mut buf, off)?;
             return Ok(buf);
         }
         let start = idx * CHUNK;
         if let Some(l) = lower {
-            if start < fd.base_limit {
-                let want = (fd.base_limit - start).min(CHUNK) as u32;
+            if start < base_limit {
+                let want = (base_limit - start).min(CHUNK) as u32;
                 let d = self.lower.read(l, start, want)?;
                 buf[..d.len()].copy_from_slice(&d);
             }
@@ -207,19 +795,83 @@ impl ShadowOverlay {
         Ok(buf)
     }
 
-    fn write_chunk(&mut self, ino: Ino, idx: u64, buf: &[u8]) -> FsResult<()> {
-        let existing = self.nodes[&ino].data.as_ref().unwrap().chunks.get(&idx).copied();
-        let off = match existing {
-            Some(o) => o,
+    fn alloc_chunk(&mut self) -> u64 {
+        if let Some(o) = self.free.pop() {
+            return o;
+        }
+        let o = self.stage_len;
+        self.stage_len += CHUNK;
+        o
+    }
+
+    fn release_chunk(&mut self, off: u64) {
+        if self.replaying() {
+            return; // the free list is rebuilt after a replay
+        }
+        let seq = match &self.sess {
             None => {
-                let o = self.stage_len;
-                self.stage_len += CHUNK;
-                self.nodes.get_mut(&ino).unwrap().data.as_mut().unwrap().chunks.insert(idx, o);
-                o
+                self.free.push(off);
+                return;
             }
+            Some(s) => s.pending_base + s.pending.len() as u64,
         };
-        self.stage.write_all_at(buf, off)?;
+        if self.unsealed.remove(&off) {
+            self.free.push(off);
+        } else {
+            // Still referenced by a durable frame until the record releasing it is durable.
+            self.pending_free.push((seq, off));
+        }
+    }
+
+    /// Store chunk `idx` of `ino`. `buf` is None in replay mode, where the recorded stage
+    /// chunk is taken instead.
+    fn write_chunk(&mut self, ino: Ino, idx: u64, buf: Option<&[u8]>) -> FsResult<()> {
+        if let Some(q) = &mut self.replay_assign {
+            let (i, off) = q.pop_front().ok_or_else(|| FsError::Io("replay: no more recorded chunks".into()))?;
+            if i != idx {
+                return Err(FsError::Corrupt(format!("replay: chunk {i} recorded, {idx} expected")));
+            }
+            self.nodes.get_mut(&ino).unwrap().data.as_mut().unwrap().chunks.insert(idx, off);
+            self.stage_len = self.stage_len.max(off + CHUNK);
+            return Ok(());
+        }
+        let buf = buf.expect("chunk data");
+        let existing = self.nodes[&ino].data.as_ref().unwrap().chunks.get(&idx).copied();
+        let (off, fresh) = match existing {
+            Some(o) if self.sess.is_none() || self.unsealed.contains(&o) => (o, false),
+            _ => (self.alloc_chunk(), true),
+        };
+        if let Err(e) = self.stage.write_all_at(buf, off) {
+            if fresh {
+                self.free.push(off);
+            }
+            return Err(e.into());
+        }
+        if fresh {
+            if self.sess.is_some() {
+                self.unsealed.insert(off);
+            }
+            if let Some(old) = self.nodes.get_mut(&ino).unwrap().data.as_mut().unwrap().chunks.insert(idx, off) {
+                self.release_chunk(old);
+            }
+        }
+        if let Some(s) = &mut self.sess {
+            s.stage_dirty = true;
+        }
+        if let Some(r) = &mut self.rec {
+            r.assign.push((idx, off));
+        }
         Ok(())
+    }
+
+    fn rebuild_free_list(&mut self) {
+        let used: HashSet<u64> = self.nodes.values().filter(|n| n.alive).filter_map(|n| n.data.as_ref()).flat_map(|d| d.chunks.values().copied()).collect();
+        let file_len = self.stage.metadata().map(|m| m.len()).unwrap_or(0).div_ceil(CHUNK) * CHUNK;
+        let max_used = used.iter().max().map(|m| m + CHUNK).unwrap_or(0);
+        self.stage_len = file_len.max(max_used);
+        self.free = (0..self.stage_len / CHUNK).map(|i| i * CHUNK).filter(|o| !used.contains(o)).rev().collect();
+        self.pending_free.clear();
+        self.unsealed.clear();
     }
 
     fn new_id(&mut self) -> Ino {
@@ -228,6 +880,7 @@ impl ShadowOverlay {
         i
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_node(&mut self, parent: Ino, name: &str, kind: FileKind, perm: u16, uid: u32, gid: u32, target: Option<String>) -> FsResult<Ino> {
         check_name(name, 255)?;
         self.materialize_dir(parent)?;
@@ -235,7 +888,7 @@ impl ShadowOverlay {
             return Err(FsError::Exists);
         }
         let ino = self.new_id();
-        let now = Timestamp::now();
+        let now = self.now();
         let size = target.as_ref().map(|t| t.len() as u64).unwrap_or(0);
         let attr = Attr {
             ino,
@@ -281,22 +934,337 @@ impl ShadowOverlay {
             return Err(FsError::NotEmpty);
         }
         let path = self.lower_path(ino);
-        self.nodes.get_mut(&parent).unwrap().children.as_mut().unwrap().remove(name);
-        self.nodes.get_mut(&parent).unwrap().attr.mtime = Timestamp::now();
         let is_lower = self.nodes.get(&ino).map(|n| n.lower.is_some()).unwrap_or(true);
-        if is_lower {
-            let size = match self.nodes.get(&ino) {
+        let size = if is_lower {
+            match self.nodes.get(&ino) {
                 Some(n) => self.lower.getattr(n.lower.unwrap()).map(|a| a.size).unwrap_or(n.attr.size),
                 None => self.lower.getattr(ino).map(|a| a.size).unwrap_or(0),
-            };
+            }
+        } else {
+            0
+        };
+        let now = self.now();
+        self.nodes.get_mut(&parent).unwrap().children.as_mut().unwrap().remove(name);
+        self.nodes.get_mut(&parent).unwrap().attr.mtime = now;
+        if is_lower {
             let orig = self.original_path.remove(&ino).unwrap_or(path);
             self.deleted.insert(ino, (orig, size, kind == FileKind::Dir));
         }
+        let mut dropped = vec![];
         if let Some(n) = self.nodes.get_mut(&ino) {
             n.alive = false;
-            n.data = None;
+            if let Some(d) = n.data.take() {
+                dropped.extend(d.chunks.into_values());
+            }
+        }
+        for off in dropped {
+            self.release_chunk(off);
         }
         Ok(ino)
+    }
+
+    // ── recording ──
+
+    /// Compute the journal form of an operation (only when recording).
+    fn jop(&self, f: impl FnOnce(&Self) -> FsResult<JOp>) -> FsResult<Option<JOp>> {
+        if self.recording() {
+            Ok(Some(f(self)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn begin_op(&mut self) {
+        if self.sess.is_some() {
+            self.rec = Some(RecCtx::default());
+            if !self.replaying() {
+                self.op_now = Some(Timestamp::now());
+            }
+        }
+    }
+
+    fn end_op<T>(&mut self, op: Option<JOp>, r: FsResult<T>) -> FsResult<T> {
+        let rc = self.rec.take();
+        let now = if self.replaying() { self.op_now } else { self.op_now.take() };
+        if let (Some(op), Some(rc), Some(now)) = (op, rc, now) {
+            if r.is_ok() || !rc.assign.is_empty() {
+                let s = self.sess.as_mut().unwrap();
+                s.pending.push(JRec { op, now, ok: r.is_ok(), a: rc.assign, seen: rc.seen });
+                s.counts_dirty = true;
+                let due = s.pending.len() >= FLUSH_RECORDS || s.last_flush.elapsed() >= self.flush_interval * 10;
+                if due {
+                    if let Err(e) = self.flush() {
+                        eprintln!("lumendisk: shadow journal: {e}");
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    /// Re-execute one journal record (recovery). Errors mean the lower volume no longer
+    /// matches what the session saw.
+    fn replay_record(&mut self, rec: JRec) -> Result<(), String> {
+        self.op_now = Some(rec.now);
+        self.replay_assign = Some(rec.a.iter().copied().collect());
+        let res = self.replay_op(&rec.op);
+        let left = self.replay_assign.take().map(|q| q.len()).unwrap_or(0);
+        self.op_now = None;
+        self.rec = None;
+        for s in &rec.seen {
+            if let Err(d) = self.verify_seen(s) {
+                return Err(d);
+            }
+        }
+        match (&res, rec.ok) {
+            (Ok(()), true) if left == 0 => Ok(()),
+            (Err(_), false) => Ok(()),
+            (Ok(()), _) => Err(format!("replay diverged on {:?}", rec.op)),
+            (Err(e), _) => Err(format!("{e} ({})", Self::describe(&rec.op))),
+        }
+    }
+
+    fn describe(op: &JOp) -> String {
+        let p = |r: &JRef, n: &str| match r {
+            JRef::P(p) => format!("{}/{n}", p.trim_end_matches('/')),
+            _ => n.to_string(),
+        };
+        match op {
+            JOp::Create { p: r, n, .. } | JOp::Mkdir { p: r, n, .. } | JOp::Symlink { p: r, n, .. } | JOp::Unlink { p: r, n } | JOp::Rmdir { p: r, n } => p(r, n),
+            JOp::Rename { fp, fname, .. } => p(fp, fname),
+            JOp::SetAttr { i, .. } | JOp::Write { i, .. } => p(i, ""),
+        }
+    }
+
+    fn replay_op(&mut self, op: &JOp) -> FsResult<()> {
+        match op {
+            JOp::Create { p, n, perm, uid, gid } => {
+                let p = self.resolve_ref(p)?;
+                self.create(p, n, *perm, *uid, *gid).map(|_| ())
+            }
+            JOp::Mkdir { p, n, perm, uid, gid } => {
+                let p = self.resolve_ref(p)?;
+                self.mkdir(p, n, *perm, *uid, *gid).map(|_| ())
+            }
+            JOp::Symlink { p, n, target, uid, gid } => {
+                let p = self.resolve_ref(p)?;
+                self.symlink(p, n, target, *uid, *gid).map(|_| ())
+            }
+            JOp::Unlink { p, n } => {
+                let p = self.resolve_ref(p)?;
+                self.unlink(p, n)
+            }
+            JOp::Rmdir { p, n } => {
+                let p = self.resolve_ref(p)?;
+                self.rmdir(p, n)
+            }
+            JOp::Rename { fp, fname, tp, tname } => {
+                let fp = self.resolve_ref(fp)?;
+                let tp = self.resolve_ref(tp)?;
+                self.rename(fp, fname, tp, tname)
+            }
+            JOp::SetAttr { i, set } => {
+                let i = self.resolve_ref(i)?;
+                self.setattr(i, set).map(|_| ())
+            }
+            JOp::Write { i, off, len } => {
+                let i = self.resolve_ref(i)?;
+                self.begin_op();
+                let r = self.write_inner(i, *off, *len, None);
+                self.end_op(None, r)
+            }
+        }
+    }
+
+    fn verify_seen(&mut self, s: &Seen) -> Result<(), String> {
+        let what = |r: &JRef| match r {
+            JRef::P(p) => format!("'{p}'"),
+            JRef::O(i) | JRef::I(i) => format!("inode {i}"),
+        };
+        match s {
+            Seen::Attr { r, kind, size, mtime } => {
+                let i = self.resolve_ref(r).map_err(|_| crate::i18n::t(&format!("{} non c'è più", what(r)), &format!("{} is gone", what(r))))?;
+                let a = self.lower.getattr(i).map_err(|e| e.to_string())?;
+                if a.kind != *kind || a.size != *size || a.mtime != *mtime {
+                    return Err(crate::i18n::t(&format!("{} è cambiato", what(r)), &format!("{} changed", what(r))));
+                }
+            }
+            Seen::Dir { r, digest } => {
+                let i = self.resolve_ref(r).map_err(|_| crate::i18n::t(&format!("{} non c'è più", what(r)), &format!("{} is gone", what(r))))?;
+                let entries = self.lower.readdir(i).map_err(|e| e.to_string())?;
+                if Self::dir_digest(&entries) != *digest {
+                    return Err(crate::i18n::t(&format!("il contenuto di {} è cambiato", what(r)), &format!("the content of {} changed", what(r))));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ── durability ──
+
+    /// Group commit: make every buffered record durable (stage chunks first).
+    fn flush(&mut self) -> FsResult<()> {
+        self.flush_upto(None, false)
+    }
+
+    /// Write records with sequence number < `target` (all if None) as one frame. With
+    /// `stage_synced` the caller already made the stage durable and sealed those chunks.
+    fn flush_upto(&mut self, target: Option<u64>, stage_synced: bool) -> FsResult<()> {
+        let (first, k) = match &self.sess {
+            Some(s) => {
+                let end = s.pending_base + s.pending.len() as u64;
+                let t = target.unwrap_or(end).min(end);
+                (s.journal.is_none(), t.saturating_sub(s.pending_base) as usize)
+            }
+            None => return Ok(()),
+        };
+        if k == 0 {
+            return Ok(());
+        }
+        let counts = if first { Some(self.counts()) } else { None };
+        let s = self.sess.as_mut().unwrap();
+        if let Some(c) = counts {
+            // The manifest goes first: a journal is only ever found next to its manifest.
+            s.manifest.counts = c;
+            s.last_manifest = Instant::now();
+            s.manifest.updated = Timestamp::now().secs;
+            s.manifest.save(&s.dir, true).map_err(io)?;
+            let (mut j, frames) = RecordLog::open(&s.dir.join(store::JOURNAL)).map_err(io)?;
+            if !frames.is_empty() {
+                return Err(FsError::Io("shadow journal: unexpected existing journal".into()));
+            }
+            let h = serde_json::to_vec(&Frame::Header { v: store::FORMAT_VERSION, next: s.next_start }).map_err(json_err)?;
+            j.append(&h).map_err(io)?;
+            s.journal = Some(j);
+        }
+        if !stage_synced {
+            if s.stage_dirty {
+                store::full_sync(&self.stage).map_err(io)?;
+                s.stage_dirty = false;
+            }
+            // Everything written so far is durable now: never overwrite it in place again.
+            self.unsealed.clear();
+        }
+        let recs: Vec<JRec> = s.pending.drain(..k).collect();
+        let batch = Frame::Batch(recs);
+        let payload = serde_json::to_vec(&batch).map_err(json_err);
+        let Frame::Batch(recs) = batch else { unreachable!() };
+        let j = s.journal.as_mut().unwrap();
+        if let Err(e) = payload.and_then(|p| j.append(&p).and_then(|_| j.sync()).map_err(io)) {
+            s.pending.splice(0..0, recs);
+            return Err(e);
+        }
+        s.pending_base += k as u64;
+        s.last_flush = Instant::now();
+        let durable = s.pending_base;
+        let (now_free, still): (Vec<_>, Vec<_>) = self.pending_free.drain(..).partition(|(seq, _)| *seq < durable);
+        self.pending_free = still;
+        self.free.extend(now_free.into_iter().map(|x| x.1));
+        Ok(())
+    }
+
+    /// First half of a timer group commit (under the volume lock): seal the chunks of the
+    /// buffered records. Then call [`FlushJob::sync_stage`] without the lock, and
+    /// [`ShadowOverlay::finish_background_flush`] with it.
+    pub fn begin_background_flush(&mut self) -> Option<FlushJob> {
+        let s = self.sess.as_mut()?;
+        if s.pending.is_empty() || !s.armed || s.last_flush.elapsed() < self.flush_interval {
+            return None;
+        }
+        let stage = self.stage.try_clone().ok()?;
+        let job = FlushJob { stage, target: s.pending_base + s.pending.len() as u64, epoch: s.epoch, dirty: s.stage_dirty };
+        s.stage_dirty = false;
+        self.unsealed.clear();
+        Some(job)
+    }
+
+    pub fn finish_background_flush(&mut self, job: FlushJob, synced: std::io::Result<()>) {
+        let Some(s) = &mut self.sess else { return };
+        if s.epoch != job.epoch {
+            return;
+        }
+        if let Err(e) = synced {
+            s.stage_dirty = true;
+            eprintln!("lumendisk: shadow stage: {e}");
+            return;
+        }
+        if let Err(e) = self.flush_upto(Some(job.target), true) {
+            eprintln!("lumendisk: shadow journal: {e}");
+        }
+        let _ = self.update_manifest(false);
+    }
+
+    /// Timer hook doing a whole group commit under the caller's lock.
+    pub fn tick(&mut self) {
+        if let Some(job) = self.begin_background_flush() {
+            let r = job.sync_stage();
+            self.finish_background_flush(job, r);
+        }
+        let _ = self.update_manifest(false);
+    }
+
+    fn counts(&mut self) -> Counts {
+        let s = self.summary_counts();
+        Counts { changes: s.added + s.modified + s.deleted, added: s.added, modified: s.modified, deleted: s.deleted, pending_bytes: s.pending_bytes }
+    }
+
+    /// Refresh the manifest (counters, commit progress). Rate-limited unless `force`.
+    fn update_manifest(&mut self, force: bool) -> FsResult<()> {
+        let Some(s) = &self.sess else { return Ok(()) };
+        if !s.armed || s.journal.is_none() && self.commit.is_none() {
+            return Ok(());
+        }
+        if !force && (!s.counts_dirty || s.last_manifest.elapsed() < MANIFEST_INTERVAL) {
+            return Ok(());
+        }
+        let counts = self.counts();
+        let (applied, total, err) = match &self.commit {
+            Some(c) => (c.done as u64, c.plan.total() as u64, c.error.clone()),
+            None => (0, 0, None),
+        };
+        let s = self.sess.as_mut().unwrap();
+        if self.commit.is_none() || self.commit.as_ref().map(|c| c.overlay_valid).unwrap_or(false) {
+            s.manifest.counts = counts;
+        }
+        s.manifest.commit_applied = applied;
+        s.manifest.commit_total = total;
+        s.manifest.commit_error = err;
+        s.manifest.updated = Timestamp::now().secs;
+        s.manifest.save(&s.dir, true).map_err(io)?;
+        s.counts_dirty = false;
+        s.last_manifest = Instant::now();
+        Ok(())
+    }
+
+    /// Start over with an empty session (after a commit or a discard).
+    fn restart_session(&mut self) {
+        let Some(old) = self.sess.take() else { return };
+        if let Err(e) = store::remove_session_dir(&old.dir) {
+            eprintln!("lumendisk: removing Shadow session: {e}");
+        }
+        let fp = self.lower.fingerprint();
+        let stage_path = old.dir.join(store::STAGE);
+        let opened = std::fs::create_dir_all(&old.dir)
+            .and_then(|_| std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&stage_path));
+        match opened {
+            Ok(f) => {
+                self.stage = f;
+                self.stage_path = stage_path;
+                let mut identity = old.manifest.identity.clone();
+                identity.size = self.lower.statfs().map(|s| s.total_bytes).unwrap_or(identity.size);
+                let mut s = Session::fresh(old.dir, identity, fp, self.next);
+                s.manifest.key = old.manifest.key;
+                self.sess = Some(s);
+            }
+            Err(e) => {
+                // Keep working in memory rather than failing the volume.
+                eprintln!("lumendisk: new Shadow session: {e}");
+                if let Ok(f) = tempfile_stage() {
+                    self.stage = f.0;
+                    self.stage_path = f.1;
+                }
+            }
+        }
     }
 
     // ── public API for the UI ──
@@ -334,7 +1302,7 @@ impl ShadowOverlay {
         out
     }
 
-    pub fn summary(&mut self) -> ShadowSummary {
+    fn summary_counts(&mut self) -> ShadowSummary {
         let mut s = ShadowSummary::default();
         for c in self.changes() {
             match c.kind.as_str() {
@@ -347,8 +1315,24 @@ impl ShadowOverlay {
         s
     }
 
+    pub fn summary(&mut self) -> ShadowSummary {
+        let mut s = self.summary_counts();
+        s.persistent = self.sess.is_some();
+        s.session_key = self.session_key();
+        s.restored = self.restored;
+        s.state = if self.commit.is_some() { "committing" } else { "pending" };
+        if let Some(c) = &self.commit {
+            s.commit_applied = c.done as u64;
+            s.commit_total = c.plan.total() as u64;
+            s.commit_error = c.error.clone();
+        }
+        s
+    }
+
     pub fn has_changes(&self) -> bool {
-        !self.log.is_empty() || self.nodes.values().any(|n| n.data.as_ref().map(|d| !d.chunks.is_empty() || d.base_limit < d.size || n.lower.is_some() && d.base_limit != d.size).unwrap_or(false) || n.attr_dirty)
+        self.commit.is_some()
+            || !self.log.is_empty()
+            || self.nodes.values().any(|n| n.data.as_ref().map(|d| !d.chunks.is_empty() || d.base_limit < d.size || n.lower.is_some() && d.base_limit != d.size).unwrap_or(false) || n.attr_dirty)
     }
 
     fn clear(&mut self) {
@@ -357,101 +1341,604 @@ impl ShadowOverlay {
         self.original_path.clear();
         self.log.clear();
         self.stage_len = 0;
+        self.free.clear();
+        self.pending_free.clear();
+        self.unsealed.clear();
+        if let Some(s) = &mut self.sess {
+            s.pending.clear();
+        }
         let _ = self.stage.set_len(0);
     }
 
-    /// Discard every pending change. Returns the number of discarded changes.
+    /// Discard every pending change. Returns the number of discarded changes. While a commit
+    /// is interrupted this abandons the steps not applied yet (applied ones stay on the disk)
+    /// and returns how many were abandoned.
     pub fn rollback(&mut self) -> u64 {
-        let n = self.changes().len() as u64;
+        let n = match self.commit.take() {
+            Some(run) => {
+                // The lower volume changed under the overlay's feet: forget what we knew.
+                self.known_parent.clear();
+                (run.plan.total() - run.done) as u64
+            }
+            None => self.changes().len() as u64,
+        };
         // Overlay-only ids become stale; that's what a rollback means.
         self.clear();
+        self.restored = false;
+        self.restart_session();
         n
     }
 
-    /// Apply all pending changes to the lower volume. Returns the number of applied changes.
-    pub fn commit(&mut self) -> FsResult<u64> {
-        let applied = self.changes().len() as u64;
-        let mut map: HashMap<Ino, Ino> = HashMap::new();
-        let m = |map: &HashMap<Ino, Ino>, alias: &HashMap<Ino, Ino>, i: Ino| -> Ino {
-            *map.get(&i).or_else(|| alias.get(&i)).unwrap_or(&i)
-        };
-        let log = std::mem::take(&mut self.log);
-        for (k, op) in log.iter().enumerate() {
-            let res = match op {
-                Op::Create { parent, name, ino, perm, uid, gid } => {
-                    self.lower.create(m(&map, &self.alias, *parent), name, *perm, *uid, *gid).map(|li| {
-                        map.insert(*ino, li);
-                    })
-                }
-                Op::Mkdir { parent, name, ino, perm, uid, gid } => {
-                    self.lower.mkdir(m(&map, &self.alias, *parent), name, *perm, *uid, *gid).map(|li| {
-                        map.insert(*ino, li);
-                    })
-                }
-                Op::Symlink { parent, name, target, ino, uid, gid } => {
-                    self.lower.symlink(m(&map, &self.alias, *parent), name, target, *uid, *gid).map(|li| {
-                        map.insert(*ino, li);
-                    })
-                }
-                Op::SetAttr { ino, set } => self.lower.setattr(m(&map, &self.alias, *ino), set).map(|_| ()),
-                Op::Unlink { parent, name } => self.lower.unlink(m(&map, &self.alias, *parent), name),
-                Op::Rmdir { parent, name } => self.lower.rmdir(m(&map, &self.alias, *parent), name),
-                Op::Rename { fp, fname, tp, tname } => {
-                    self.lower.rename(m(&map, &self.alias, *fp), fname, m(&map, &self.alias, *tp), tname)
-                }
-            };
-            if let Err(e) = res {
-                // Keep the unapplied tail so the user can retry after fixing the cause.
-                self.log = log[k..].to_vec();
-                for (o, l) in &map {
-                    self.alias.insert(*o, *l);
-                }
-                return Err(FsError::Io(format!("commit stopped at operation {} of {}: {e}", k + 1, log.len())));
-            }
-        }
-        // File contents.
-        let ids: Vec<Ino> = self.nodes.keys().copied().collect();
+    // ── commit ──
+
+    fn build_plan(&mut self, changes: u64) -> FsResult<Plan> {
+        let root = self.lower.root_ino();
+        let mut ids: Vec<Ino> = self.nodes.keys().copied().collect();
+        ids.sort_unstable();
+        let mut files = vec![];
         for ino in ids {
-            let n = self.nodes[&ino].clone();
+            let n = &self.nodes[&ino];
             if !n.alive {
                 continue;
             }
-            let Some(fd) = n.data else { continue };
-            let li = m(&map, &self.alias, ino);
-            let cur = self.lower.getattr(li)?.size;
-            if n.lower.is_some() && fd.chunks.is_empty() && fd.size == cur && fd.base_limit >= cur {
-                continue;
-            }
-            if fd.base_limit < cur {
-                self.lower.setattr(li, &SetAttr { size: Some(fd.base_limit), ..Default::default() })?;
-            }
-            if fd.size != fd.base_limit.min(cur) || fd.size != cur {
-                self.lower.setattr(li, &SetAttr { size: Some(fd.size), ..Default::default() })?;
-            }
-            for (&idx, &off) in &fd.chunks {
-                let start = idx * CHUNK;
-                if start >= fd.size {
+            let Some(fd) = &n.data else { continue };
+            if let Some(l) = n.lower {
+                let cur = self.lower.getattr(l)?.size;
+                if fd.chunks.is_empty() && fd.size == cur && fd.base_limit >= cur {
                     continue;
                 }
-                let len = (fd.size - start).min(CHUNK) as usize;
-                let mut buf = vec![0u8; len];
-                self.stage.read_exact_at(&mut buf, off)?;
-                self.lower.write(li, start, &buf)?;
             }
-            self.lower.setattr(li, &SetAttr { mtime: Some(n.attr.mtime), atime: Some(n.attr.atime), ..Default::default() })?;
+            files.push(FileItem {
+                ino,
+                size: fd.size,
+                base_limit: if n.lower.is_some() { fd.base_limit } else { 0 },
+                chunks: fd.chunks.iter().map(|(k, v)| (*k, *v)).collect(),
+                atime: n.attr.atime,
+                mtime: n.attr.mtime,
+            });
         }
+        // Lower objects referenced by the plan, with their ancestors.
+        let mut refs: Vec<Ino> = vec![];
+        for op in &self.log {
+            match op {
+                Op::Create { parent, ino, .. } | Op::Mkdir { parent, ino, .. } | Op::Symlink { parent, ino, .. } | Op::Unlink { parent, ino, .. } | Op::Rmdir { parent, ino, .. } => {
+                    refs.extend([*parent, *ino])
+                }
+                Op::Rename { fp, tp, ino, over, .. } => refs.extend([*fp, *tp, *ino].into_iter().chain(*over)),
+                Op::SetAttr { ino, .. } => refs.push(*ino),
+            }
+        }
+        refs.extend(files.iter().map(|f| f.ino));
+        let mut tree: BTreeMap<Ino, (Ino, String)> = BTreeMap::new();
+        for r in refs {
+            let mut cur = r;
+            for _ in 0..4096 {
+                if cur >= SHADOW_BASE || cur == root || tree.contains_key(&cur) {
+                    break;
+                }
+                let Some((p, n)) = self.known_parent.get(&cur) else { break };
+                tree.insert(cur, (*p, n.clone()));
+                cur = *p;
+            }
+        }
+        Ok(Plan {
+            format: store::FORMAT_VERSION,
+            root,
+            ops: self.log.clone(),
+            files,
+            changes,
+            tree: tree.into_iter().map(|(i, (p, n))| (i, p, n)).collect(),
+        })
+    }
+
+    /// Apply all pending changes to the lower volume. Returns the number of applied changes.
+    ///
+    /// If it fails (or the process dies) half-way, calling it again — in this process or after
+    /// the volume is mounted again in Shadow mode — continues from the last checkpoint.
+    pub fn commit(&mut self) -> FsResult<u64> {
+        if self.commit.is_none() {
+            self.flush()?;
+            let changes = self.changes().len() as u64;
+            let plan = self.build_plan(changes)?;
+            if plan.total() == 0 {
+                self.clear();
+                self.restart_session();
+                return Ok(0);
+            }
+            let mut progress = None;
+            if let Some(s) = &mut self.sess {
+                // Plan first, then the state change: "committing" always finds its plan.
+                if s.journal.is_none() {
+                    s.manifest.save(&s.dir, true).map_err(io)?;
+                }
+                let bytes = serde_json::to_vec(&plan).map_err(json_err)?;
+                store::write_atomic(&s.dir.join(store::PLAN), &bytes, true).map_err(io)?;
+                let _ = std::fs::remove_file(s.dir.join(store::PROGRESS));
+                progress = Some(RecordLog::open(&s.dir.join(store::PROGRESS)).map_err(io)?.0);
+                s.manifest.state = "committing".into();
+                s.manifest.commit_total = plan.total() as u64;
+                s.manifest.commit_applied = 0;
+                s.manifest.commit_error = None;
+                s.manifest.counts.changes = plan.changes;
+                s.manifest.updated = Timestamp::now().secs;
+                s.manifest.save(&s.dir, true).map_err(io)?;
+            }
+            self.commit = Some(CommitRun { plan, done: 0, map: HashMap::new(), stale: false, error: None, progress, overlay_valid: true });
+        }
+        let mut run = self.commit.take().unwrap();
+        let res = self.run_commit(&mut run);
+        match res {
+            Ok(()) => {
+                let applied = run.plan.changes;
+                self.finish_commit(run);
+                Ok(applied)
+            }
+            Err(e) => {
+                run.stale = true;
+                let msg = crate::i18n::t(
+                    &format!("applicazione interrotta dopo {} passi su {}: {e}", run.done, run.plan.total()),
+                    &format!("commit stopped after {} of {} steps: {e}", run.done, run.plan.total()),
+                );
+                run.error = Some(msg.clone());
+                self.commit = Some(run);
+                if let Some(s) = &mut self.sess {
+                    s.counts_dirty = true;
+                }
+                let _ = self.update_manifest(true);
+                Err(FsError::Io(msg))
+            }
+        }
+    }
+
+    fn lo(run: &CommitRun, alias: &HashMap<Ino, Ino>, x: Ino) -> Ino {
+        *run.map.get(&x).or_else(|| alias.get(&x)).unwrap_or(&x)
+    }
+
+    /// Re-find, by path, every object alive after `ops[..upto]` that the rest of the plan
+    /// refers to. Objects that can't be found keep their previous mapping.
+    fn resolve_at(&mut self, run: &mut CommitRun, upto: usize) {
+        let t = sim_tree(&run.plan, upto);
+        let root = run.plan.root;
+        let mut wanted: Vec<Ino> = vec![];
+        for op in &run.plan.ops[upto..] {
+            match op {
+                Op::Create { parent, .. } | Op::Mkdir { parent, .. } | Op::Symlink { parent, .. } => wanted.push(*parent),
+                Op::Unlink { parent, ino, .. } | Op::Rmdir { parent, ino, .. } => wanted.extend([*parent, *ino]),
+                Op::Rename { fp, tp, ino, .. } => wanted.extend([*fp, *tp, *ino]),
+                Op::SetAttr { ino, .. } => wanted.push(*ino),
+            }
+        }
+        wanted.extend(run.plan.files.iter().map(|f| f.ino));
+        let mut cache: HashMap<Vec<String>, Ino> = HashMap::new();
+        cache.insert(vec![], self.lower.root_ino());
+        for obj in wanted {
+            if obj == root {
+                continue;
+            }
+            let Some(path) = tree_path(&t, root, obj) else { continue };
+            let mut cur = self.lower.root_ino();
+            let mut ok = true;
+            for i in 0..path.len() {
+                if let Some(&c) = cache.get(&path[..=i]) {
+                    cur = c;
+                    continue;
+                }
+                match self.lower.lookup(cur, &path[i]) {
+                    Ok(c) => {
+                        cache.insert(path[..=i].to_vec(), c);
+                        cur = c;
+                    }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                run.map.insert(obj, cur);
+            }
+        }
+    }
+
+    fn checkpoint(&mut self, run: &mut CommitRun, step: usize) -> FsResult<()> {
         self.lower.sync()?;
+        if let Some(p) = &mut run.progress {
+            let b = serde_json::to_vec(&Checkpoint { step: step as u64 }).map_err(json_err)?;
+            p.append(&b).map_err(io)?;
+            p.sync().map_err(io)?;
+        }
+        run.done = step;
+        if let Some(s) = &mut self.sess {
+            if s.last_manifest.elapsed() >= MANIFEST_INTERVAL {
+                s.manifest.commit_applied = step as u64;
+                s.manifest.updated = Timestamp::now().secs;
+                let _ = s.manifest.save(&s.dir, false);
+                s.last_manifest = Instant::now();
+            }
+        }
+        Ok(())
+    }
+
+    fn run_commit(&mut self, run: &mut CommitRun) -> FsResult<()> {
+        let n_ops = run.plan.ops.len();
+        let total = run.plan.total();
+        let mut step = run.done;
+        if run.stale {
+            self.resolve_at(run, step.min(n_ops));
+            if step < n_ops {
+                // The window after the last checkpoint may be partly applied already.
+                let w = window_end(&run.plan.ops, step);
+                for k in step..w {
+                    self.apply_op(run, k, true)?;
+                }
+                self.checkpoint(run, w)?;
+                step = w;
+                self.resolve_at(run, step.min(n_ops));
+            }
+            run.stale = false;
+        }
+        while step < n_ops {
+            let w = window_end(&run.plan.ops, step);
+            for k in step..w {
+                self.apply_op(run, k, false)?;
+            }
+            self.checkpoint(run, w)?;
+            step = w;
+        }
+        let (mut files, mut bytes) = (0usize, 0u64);
+        while step < total {
+            let i = step - n_ops;
+            self.apply_file(run, i)?;
+            files += 1;
+            bytes += run.plan.files[i].chunks.len() as u64 * CHUNK;
+            step += 1;
+            if files >= CONTENT_FILES_PER_CKPT || bytes >= CONTENT_BYTES_PER_CKPT || step == total {
+                self.checkpoint(run, step)?;
+                files = 0;
+                bytes = 0;
+            }
+        }
+        if run.done < total || total == 0 {
+            self.checkpoint(run, total)?;
+        }
+        Ok(())
+    }
+
+    /// Re-applied object (redo): the name exists already — accept it only if it looks like
+    /// what this very operation creates.
+    fn redo_existing(&mut self, parent: Ino, name: &str, kind: FileKind, target: Option<&str>) -> FsResult<Option<Ino>> {
+        match self.lower.lookup(parent, name) {
+            Ok(li) => {
+                let a = self.lower.getattr(li)?;
+                let same = a.kind == kind
+                    && (kind != FileKind::File || a.size == 0)
+                    && target.map(|t| self.lower.readlink(li).map(|x| x == t).unwrap_or(false)).unwrap_or(true);
+                if same {
+                    Ok(Some(li))
+                } else {
+                    Err(FsError::Io(format!("'{name}' already exists on the disk")))
+                }
+            }
+            Err(FsError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn apply_op(&mut self, run: &mut CommitRun, k: usize, redo: bool) -> FsResult<()> {
+        let op = run.plan.ops[k].clone();
+        let lo = |x: Ino| Self::lo(run, &self.alias, x);
+        let gone = |e: &FsError| matches!(e, FsError::NotFound | FsError::Stale | FsError::NotDir);
+        match op {
+            Op::Create { parent, name, ino, perm, uid, gid } => {
+                let p = lo(parent);
+                if redo {
+                    if let Some(li) = self.redo_existing(p, &name, FileKind::File, None)? {
+                        run.map.insert(ino, li);
+                        return Ok(());
+                    }
+                }
+                let li = self.lower.create(p, &name, perm, uid, gid)?;
+                run.map.insert(ino, li);
+            }
+            Op::Mkdir { parent, name, ino, perm, uid, gid } => {
+                let p = lo(parent);
+                if redo {
+                    if let Some(li) = self.redo_existing(p, &name, FileKind::Dir, None)? {
+                        run.map.insert(ino, li);
+                        return Ok(());
+                    }
+                }
+                let li = self.lower.mkdir(p, &name, perm, uid, gid)?;
+                run.map.insert(ino, li);
+            }
+            Op::Symlink { parent, name, target, ino, uid, gid } => {
+                let p = lo(parent);
+                if redo {
+                    if let Some(li) = self.redo_existing(p, &name, FileKind::Symlink, Some(&target))? {
+                        run.map.insert(ino, li);
+                        return Ok(());
+                    }
+                }
+                let li = self.lower.symlink(p, &name, &target, uid, gid)?;
+                run.map.insert(ino, li);
+            }
+            Op::SetAttr { ino, set } => {
+                self.lower.setattr(lo(ino), &set)?;
+            }
+            Op::Unlink { parent, name, .. } => match self.lower.unlink(lo(parent), &name) {
+                Err(e) if redo && gone(&e) => {}
+                r => r?,
+            },
+            Op::Rmdir { parent, name, .. } => match self.lower.rmdir(lo(parent), &name) {
+                Err(e) if redo && gone(&e) => {}
+                r => r?,
+            },
+            Op::Rename { fp, fname, tp, tname, .. } => {
+                let (f, t) = (lo(fp), lo(tp));
+                if redo && self.lower.lookup(f, &fname).is_err() && self.lower.lookup(t, &tname).is_ok() {
+                    return Ok(()); // already renamed
+                }
+                self.lower.rename(f, &fname, t, &tname)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the final content of one file. Safe to repeat.
+    fn apply_file(&mut self, run: &mut CommitRun, i: usize) -> FsResult<()> {
+        let it = run.plan.files[i].clone();
+        let li = Self::lo(run, &self.alias, it.ino);
+        let cur = self.lower.getattr(li)?.size;
+        if it.base_limit < cur {
+            self.lower.setattr(li, &SetAttr { size: Some(it.base_limit), ..Default::default() })?;
+        }
+        if it.size != cur.min(it.base_limit) {
+            self.lower.setattr(li, &SetAttr { size: Some(it.size), ..Default::default() })?;
+        }
+        let mut buf = vec![0u8; CHUNK as usize];
+        for (idx, off) in it.chunks {
+            let start = idx * CHUNK;
+            if start >= it.size {
+                continue;
+            }
+            let len = (it.size - start).min(CHUNK) as usize;
+            self.stage.read_exact_at(&mut buf[..len], off)?;
+            self.lower.write(li, start, &buf[..len])?;
+        }
+        self.lower.setattr(li, &SetAttr { mtime: Some(it.mtime), atime: Some(it.atime), ..Default::default() })?;
+        Ok(())
+    }
+
+    fn finish_commit(&mut self, run: CommitRun) {
+        let map = run.map;
+        if run.overlay_valid {
+            // The lower tree now matches the overlay: learn the new parent/name of everything
+            // the commit touched, so later journal records name them correctly.
+            let lower_of = |x: Ino| *map.get(&x).or_else(|| self.alias.get(&x)).unwrap_or(&x);
+            let root = self.lower.root_ino();
+            let mut updates = vec![];
+            for (ino, n) in &self.nodes {
+                if *ino == root {
+                    continue;
+                }
+                if n.alive {
+                    updates.push((lower_of(*ino), Some((lower_of(n.parent), n.name.clone()))));
+                } else {
+                    updates.push((lower_of(*ino), None));
+                }
+            }
+            for i in self.deleted.keys() {
+                updates.push((lower_of(*i), None));
+            }
+            for (l, v) in updates {
+                match v {
+                    Some(pn) => {
+                        self.known_parent.insert(l, pn);
+                    }
+                    None => {
+                        self.known_parent.remove(&l);
+                    }
+                }
+            }
+        } else {
+            self.known_parent.clear();
+        }
         for (o, l) in map {
-            self.alias.insert(o, l);
+            if o >= SHADOW_BASE {
+                self.alias.insert(o, l);
+            }
         }
         self.clear();
-        Ok(applied)
+        self.restored = false;
+        self.restart_session();
     }
+
+    #[cfg(test)]
+    fn simulate_crash(mut self) {
+        if let Some(s) = &mut self.sess {
+            s.armed = false;
+        }
+    }
+
+    #[cfg(test)]
+    fn force_flush(&mut self) {
+        self.flush().unwrap();
+    }
+
+    // ── FileSystem bodies ──
+
+    fn setattr_inner(&mut self, ino: Ino, set: &SetAttr) -> FsResult<()> {
+        self.ensure_node(ino)?;
+        if let Some(sz) = set.size {
+            self.copy_up(ino)?;
+            let (old, tail) = {
+                let fd = self.nodes[&ino].data.as_ref().unwrap();
+                (fd.size, sz % CHUNK != 0 && fd.chunks.contains_key(&(sz / CHUNK)))
+            };
+            // Zero the tail of the last partial chunk when shrinking (fallible I/O first).
+            if sz < old && tail {
+                let idx = sz / CHUNK;
+                let mut c = self.read_chunk(ino, idx)?;
+                c[(sz % CHUNK) as usize..].fill(0);
+                self.write_chunk(ino, idx, Some(&c))?;
+            }
+            let now = self.now();
+            let keep_chunks = sz.div_ceil(CHUNK);
+            let n = self.nodes.get_mut(&ino).unwrap();
+            let fd = n.data.as_mut().unwrap();
+            if sz < fd.base_limit {
+                fd.base_limit = sz;
+            }
+            let dropped: Vec<u64> = fd.chunks.split_off(&keep_chunks).into_values().collect();
+            fd.size = sz;
+            n.attr.mtime = now;
+            for off in dropped {
+                self.release_chunk(off);
+            }
+        }
+        let now = self.now();
+        let n = self.nodes.get_mut(&ino).unwrap();
+        let meta = SetAttr { size: None, ..set.clone() };
+        if let Some(p) = meta.perm {
+            n.attr.perm = p;
+        }
+        if let Some(u) = meta.uid {
+            n.attr.uid = u;
+        }
+        if let Some(g) = meta.gid {
+            n.attr.gid = g;
+        }
+        if let Some(t) = meta.atime {
+            n.attr.atime = t;
+        }
+        if let Some(t) = meta.mtime {
+            n.attr.mtime = t;
+        }
+        n.attr.ctime = now;
+        if meta.perm.is_some() || meta.uid.is_some() || meta.gid.is_some() {
+            n.attr_dirty = true;
+            self.log.push(Op::SetAttr { ino, set: SetAttr { perm: meta.perm, uid: meta.uid, gid: meta.gid, ..Default::default() } });
+        }
+        Ok(())
+    }
+
+    /// `data` is None in replay mode (chunk assignments come from the record).
+    fn write_inner(&mut self, ino: Ino, offset: u64, len: u64, data: Option<&[u8]>) -> FsResult<()> {
+        self.copy_up(ino)?;
+        let end = offset + len;
+        let mut pos = offset;
+        while pos < end {
+            let idx = pos / CHUNK;
+            let s = (pos % CHUNK) as usize;
+            let n = ((end - pos) as usize).min(CHUNK as usize - s);
+            match data {
+                Some(d) => {
+                    let o = (pos - offset) as usize;
+                    if n == CHUNK as usize {
+                        self.write_chunk(ino, idx, Some(&d[o..o + n]))?;
+                    } else {
+                        let mut c = self.read_chunk(ino, idx)?;
+                        c[s..s + n].copy_from_slice(&d[o..o + n]);
+                        self.write_chunk(ino, idx, Some(&c))?;
+                    }
+                }
+                None => self.write_chunk(ino, idx, None)?,
+            }
+            pos += n as u64;
+        }
+        let now = self.now();
+        let n = self.nodes.get_mut(&ino).unwrap();
+        let fd = n.data.as_mut().unwrap();
+        if end > fd.size {
+            fd.size = end;
+        }
+        n.attr.mtime = now;
+        n.attr.ctime = now;
+        Ok(())
+    }
+
+    fn rename_inner(&mut self, fp: Ino, fname: &str, tp: Ino, tname: &str) -> FsResult<()> {
+        check_name(tname, 255)?;
+        self.materialize_dir(fp)?;
+        self.materialize_dir(tp)?;
+        let (ino, kind) = *self.nodes[&fp].children.as_ref().unwrap().get(fname).ok_or(FsError::NotFound)?;
+        if kind == FileKind::Dir {
+            // refuse moving a directory below itself
+            let mut cur = tp;
+            for _ in 0..512 {
+                if cur == ino {
+                    return Err(FsError::Invalid("cannot move a directory inside itself".into()));
+                }
+                if cur == self.lower.root_ino() {
+                    break;
+                }
+                cur = match self.nodes.get(&cur) {
+                    Some(n) => n.parent,
+                    None => match self.known_parent.get(&cur) {
+                        Some((p, _)) => *p,
+                        None => break,
+                    },
+                };
+            }
+        }
+        // Fallible lookups before anything changes.
+        self.ensure_node(ino)?;
+        let mut over = None;
+        if let Some(&(dino, dkind)) = self.nodes[&tp].children.as_ref().unwrap().get(tname) {
+            if dino == ino {
+                return Ok(());
+            }
+            match (kind == FileKind::Dir, dkind == FileKind::Dir) {
+                (true, false) => return Err(FsError::NotDir),
+                (false, true) => return Err(FsError::IsDir),
+                _ => {}
+            }
+            over = Some(self.detach(tp, tname, Some(dkind == FileKind::Dir))?);
+        }
+        let lower_backed = self.nodes[&ino].lower.is_some();
+        if lower_backed && !self.original_path.contains_key(&ino) {
+            let p = self.lower_path(ino);
+            self.original_path.insert(ino, p);
+        }
+        let now = self.now();
+        self.nodes.get_mut(&fp).unwrap().children.as_mut().unwrap().remove(fname);
+        self.nodes.get_mut(&tp).unwrap().children.as_mut().unwrap().insert(tname.to_string(), (ino, kind));
+        let n = self.nodes.get_mut(&ino).unwrap();
+        n.parent = tp;
+        n.name = tname.to_string();
+        n.attr.ctime = now;
+        self.log.push(Op::Rename { fp, fname: fname.into(), tp, tname: tname.into(), ino, over });
+        Ok(())
+    }
+}
+
+/// Fallback stage file when the session directory can't be recreated.
+fn tempfile_stage() -> std::io::Result<(File, PathBuf)> {
+    let p = std::env::temp_dir().join(format!("lumendisk-shadow-{}.stage", uuid::Uuid::new_v4().simple()));
+    let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p)?;
+    Ok((f, p))
 }
 
 impl Drop for ShadowOverlay {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.stage_path);
+        match &self.sess {
+            None => {
+                let _ = std::fs::remove_file(&self.stage_path);
+            }
+            Some(s) if !s.armed => {}
+            Some(_) => {
+                if let Err(e) = self.flush() {
+                    eprintln!("lumendisk: shadow journal: {e}");
+                }
+                if self.commit.is_none() && self.changes().is_empty() {
+                    if let Some(s) = &self.sess {
+                        let _ = store::remove_session_dir(&s.dir);
+                    }
+                } else {
+                    let _ = self.update_manifest(true);
+                }
+            }
+        }
     }
 }
 
@@ -464,7 +1951,7 @@ impl FileSystem for ShadowOverlay {
 
     fn statfs(&mut self) -> FsResult<FsStat> {
         let mut s = self.lower.statfs()?;
-        let pending = self.summary().pending_bytes;
+        let pending = self.summary_counts().pending_bytes;
         s.free_bytes = (s.free_bytes as i64 - pending.max(0)).max(0) as u64;
         Ok(s)
     }
@@ -502,67 +1989,26 @@ impl FileSystem for ShadowOverlay {
 
     fn setattr(&mut self, ino: Ino, set: &SetAttr) -> FsResult<Attr> {
         let ino = self.r(ino);
-        self.ensure_node(ino)?;
-        if let Some(sz) = set.size {
-            self.copy_up(ino)?;
-            let n = self.nodes.get_mut(&ino).unwrap();
-            let fd = n.data.as_mut().unwrap();
-            if sz < fd.base_limit {
-                fd.base_limit = sz;
-            }
-            let keep_chunks = sz.div_ceil(CHUNK);
-            fd.chunks.retain(|&k, _| k < keep_chunks);
-            let old = fd.size;
-            fd.size = sz;
-            // zero the tail of the last partial chunk when shrinking
-            if sz < old && sz % CHUNK != 0 {
-                let idx = sz / CHUNK;
-                if fd.chunks.contains_key(&idx) {
-                    let mut c = self.read_chunk(ino, idx)?;
-                    c[(sz % CHUNK) as usize..].fill(0);
-                    self.write_chunk(ino, idx, &c)?;
-                }
-            }
-            let n = self.nodes.get_mut(&ino).unwrap();
-            n.attr.mtime = Timestamp::now();
-        }
-        let n = self.nodes.get_mut(&ino).unwrap();
-        let meta = SetAttr { size: None, ..set.clone() };
-        if let Some(p) = meta.perm {
-            n.attr.perm = p;
-        }
-        if let Some(u) = meta.uid {
-            n.attr.uid = u;
-        }
-        if let Some(g) = meta.gid {
-            n.attr.gid = g;
-        }
-        if let Some(t) = meta.atime {
-            n.attr.atime = t;
-        }
-        if let Some(t) = meta.mtime {
-            n.attr.mtime = t;
-        }
-        n.attr.ctime = Timestamp::now();
-        if meta.perm.is_some() || meta.uid.is_some() || meta.gid.is_some() {
-            n.attr_dirty = true;
-            self.log.push(Op::SetAttr { ino, set: SetAttr { perm: meta.perm, uid: meta.uid, gid: meta.gid, ..Default::default() } });
-        }
+        self.check_mutable()?;
+        let op = self.jop(|s| Ok(JOp::SetAttr { i: s.jref(ino)?, set: set.clone() }))?;
+        self.begin_op();
+        let r = self.setattr_inner(ino, set);
+        self.end_op(op, r)?;
         self.getattr(ino)
     }
 
     fn read(&mut self, ino: Ino, offset: u64, len: u32) -> FsResult<Vec<u8>> {
         let ino = self.r(ino);
-        let fd = match self.live_node(ino)? {
-            Some(n) if n.data.is_some() => n.data.clone().unwrap(),
+        let size = match self.live_node(ino)? {
+            Some(n) if n.data.is_some() => n.data.as_ref().unwrap().size,
             Some(n) if n.attr.kind == FileKind::Dir => return Err(FsError::IsDir),
             Some(n) if n.lower.is_none() => return Ok(vec![]),
             _ => return self.lower.read(ino, offset, len),
         };
-        if offset >= fd.size {
+        if offset >= size {
             return Ok(vec![]);
         }
-        let end = (offset + len as u64).min(fd.size);
+        let end = (offset + len as u64).min(size);
         let mut out = Vec::with_capacity((end - offset) as usize);
         let mut pos = offset;
         while pos < end {
@@ -578,26 +2024,11 @@ impl FileSystem for ShadowOverlay {
 
     fn write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> FsResult<u32> {
         let ino = self.r(ino);
-        self.copy_up(ino)?;
-        let end = offset + data.len() as u64;
-        let mut pos = offset;
-        while pos < end {
-            let idx = pos / CHUNK;
-            let mut c = self.read_chunk(ino, idx)?;
-            let s = (pos % CHUNK) as usize;
-            let n = ((end - pos) as usize).min(CHUNK as usize - s);
-            let o = (pos - offset) as usize;
-            c[s..s + n].copy_from_slice(&data[o..o + n]);
-            self.write_chunk(ino, idx, &c)?;
-            pos += n as u64;
-        }
-        let n = self.nodes.get_mut(&ino).unwrap();
-        let fd = n.data.as_mut().unwrap();
-        if end > fd.size {
-            fd.size = end;
-        }
-        n.attr.mtime = Timestamp::now();
-        n.attr.ctime = n.attr.mtime;
+        self.check_mutable()?;
+        let op = self.jop(|s| Ok(JOp::Write { i: s.jref(ino)?, off: offset, len: data.len() as u64 }))?;
+        self.begin_op();
+        let r = self.write_inner(ino, offset, data.len() as u64, Some(data));
+        self.end_op(op, r)?;
         Ok(data.len() as u32)
     }
 
@@ -620,23 +2051,35 @@ impl FileSystem for ShadowOverlay {
 
     fn create(&mut self, parent: Ino, name: &str, perm: u16, uid: u32, gid: u32) -> FsResult<Ino> {
         let parent = self.r(parent);
-        let ino = self.add_node(parent, name, FileKind::File, perm, uid, gid, None)?;
-        self.log.push(Op::Create { parent, name: name.into(), ino, perm, uid, gid });
-        Ok(ino)
+        self.check_mutable()?;
+        let op = self.jop(|s| Ok(JOp::Create { p: s.jref(parent)?, n: name.into(), perm, uid, gid }))?;
+        self.begin_op();
+        let r = self.add_node(parent, name, FileKind::File, perm, uid, gid, None).inspect(|&ino| {
+            self.log.push(Op::Create { parent, name: name.into(), ino, perm, uid, gid });
+        });
+        self.end_op(op, r)
     }
 
     fn mkdir(&mut self, parent: Ino, name: &str, perm: u16, uid: u32, gid: u32) -> FsResult<Ino> {
         let parent = self.r(parent);
-        let ino = self.add_node(parent, name, FileKind::Dir, perm, uid, gid, None)?;
-        self.log.push(Op::Mkdir { parent, name: name.into(), ino, perm, uid, gid });
-        Ok(ino)
+        self.check_mutable()?;
+        let op = self.jop(|s| Ok(JOp::Mkdir { p: s.jref(parent)?, n: name.into(), perm, uid, gid }))?;
+        self.begin_op();
+        let r = self.add_node(parent, name, FileKind::Dir, perm, uid, gid, None).inspect(|&ino| {
+            self.log.push(Op::Mkdir { parent, name: name.into(), ino, perm, uid, gid });
+        });
+        self.end_op(op, r)
     }
 
     fn symlink(&mut self, parent: Ino, name: &str, target: &str, uid: u32, gid: u32) -> FsResult<Ino> {
         let parent = self.r(parent);
-        let ino = self.add_node(parent, name, FileKind::Symlink, 0o777, uid, gid, Some(target.to_string()))?;
-        self.log.push(Op::Symlink { parent, name: name.into(), target: target.into(), ino, uid, gid });
-        Ok(ino)
+        self.check_mutable()?;
+        let op = self.jop(|s| Ok(JOp::Symlink { p: s.jref(parent)?, n: name.into(), target: target.into(), uid, gid }))?;
+        self.begin_op();
+        let r = self.add_node(parent, name, FileKind::Symlink, 0o777, uid, gid, Some(target.to_string())).inspect(|&ino| {
+            self.log.push(Op::Symlink { parent, name: name.into(), target: target.into(), ino, uid, gid });
+        });
+        self.end_op(op, r)
     }
 
     fn readlink(&mut self, ino: Ino) -> FsResult<String> {
@@ -651,73 +2094,39 @@ impl FileSystem for ShadowOverlay {
 
     fn unlink(&mut self, parent: Ino, name: &str) -> FsResult<()> {
         let parent = self.r(parent);
-        self.detach(parent, name, Some(false))?;
-        self.log.push(Op::Unlink { parent, name: name.into() });
-        Ok(())
+        self.check_mutable()?;
+        let op = self.jop(|s| Ok(JOp::Unlink { p: s.jref(parent)?, n: name.into() }))?;
+        self.begin_op();
+        let r = self.detach(parent, name, Some(false)).map(|ino| {
+            self.log.push(Op::Unlink { parent, name: name.into(), ino });
+        });
+        self.end_op(op, r)
     }
 
     fn rmdir(&mut self, parent: Ino, name: &str) -> FsResult<()> {
         let parent = self.r(parent);
-        self.detach(parent, name, Some(true))?;
-        self.log.push(Op::Rmdir { parent, name: name.into() });
-        Ok(())
+        self.check_mutable()?;
+        let op = self.jop(|s| Ok(JOp::Rmdir { p: s.jref(parent)?, n: name.into() }))?;
+        self.begin_op();
+        let r = self.detach(parent, name, Some(true)).map(|ino| {
+            self.log.push(Op::Rmdir { parent, name: name.into(), ino });
+        });
+        self.end_op(op, r)
     }
 
     fn rename(&mut self, fp: Ino, fname: &str, tp: Ino, tname: &str) -> FsResult<()> {
         let (fp, tp) = (self.r(fp), self.r(tp));
-        check_name(tname, 255)?;
-        self.materialize_dir(fp)?;
-        self.materialize_dir(tp)?;
-        let (ino, kind) = *self.nodes[&fp].children.as_ref().unwrap().get(fname).ok_or(FsError::NotFound)?;
-        if kind == FileKind::Dir {
-            // refuse moving a directory below itself
-            let mut cur = tp;
-            for _ in 0..512 {
-                if cur == ino {
-                    return Err(FsError::Invalid("cannot move a directory inside itself".into()));
-                }
-                if cur == self.lower.root_ino() {
-                    break;
-                }
-                cur = match self.nodes.get(&cur) {
-                    Some(n) => n.parent,
-                    None => match self.known_parent.get(&cur) {
-                        Some((p, _)) => *p,
-                        None => break,
-                    },
-                };
-            }
-        }
-        if let Some(&(dino, dkind)) = self.nodes[&tp].children.as_ref().unwrap().get(tname) {
-            if dino == ino {
-                return Ok(());
-            }
-            match (kind == FileKind::Dir, dkind == FileKind::Dir) {
-                (true, false) => return Err(FsError::NotDir),
-                (false, true) => return Err(FsError::IsDir),
-                _ => {}
-            }
-            self.detach(tp, tname, Some(dkind == FileKind::Dir))?;
-        }
-        self.ensure_node(ino)?;
-        let lower_backed = self.nodes[&ino].lower.is_some();
-        if lower_backed && !self.original_path.contains_key(&ino) {
-            let p = self.lower_path(ino);
-            self.original_path.insert(ino, p);
-        }
-        self.nodes.get_mut(&fp).unwrap().children.as_mut().unwrap().remove(fname);
-        self.nodes.get_mut(&tp).unwrap().children.as_mut().unwrap().insert(tname.to_string(), (ino, kind));
-        let n = self.nodes.get_mut(&ino).unwrap();
-        n.parent = tp;
-        n.name = tname.to_string();
-        n.attr.ctime = Timestamp::now();
-        self.log.push(Op::Rename { fp, fname: fname.into(), tp, tname: tname.into() });
-        Ok(())
+        self.check_mutable()?;
+        let op = self.jop(|s| Ok(JOp::Rename { fp: s.jref(fp)?, fname: fname.into(), tp: s.jref(tp)?, tname: tname.into() }))?;
+        self.begin_op();
+        let r = self.rename_inner(fp, fname, tp, tname);
+        self.end_op(op, r)
     }
 
     fn sync(&mut self) -> FsResult<()> {
-        // Nothing reaches the lower volume until commit.
-        Ok(())
+        // Nothing reaches the lower volume until commit; make the journal durable.
+        self.flush()?;
+        self.update_manifest(false)
     }
     fn dirty_state(&mut self) -> DirtyState {
         self.lower.dirty_state()
@@ -725,128 +2134,11 @@ impl FileSystem for ShadowOverlay {
     fn repair(&mut self) -> FsResult<String> {
         Err(FsError::Unsupported("repair is not available in Shadow mode".into()))
     }
+    fn fingerprint(&mut self) -> Option<String> {
+        self.lower.fingerprint()
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::block::{BlockDev, MemDev};
-    use crate::vfs::{ext4_fs, testutil};
-    use std::sync::Arc;
-
-    fn setup() -> (Arc<dyn BlockDev>, Vec<u8>) {
-        let dev: Arc<dyn BlockDev> = Arc::new(MemDev::new(48 << 20));
-        ext4_fs::format(dev.clone(), FsType::Ext4, "s").unwrap();
-        let mut fs = ext4_fs::Ext4Fs::open(dev.clone(), false).unwrap();
-        let root = fs.root_ino();
-        let d = fs.mkdir(root, "boot", 0o755, 0, 0).unwrap();
-        let c = fs.create(d, "config.txt", 0o644, 0, 0).unwrap();
-        fs.write(c, 0, b"arm_64bit=1\n").unwrap();
-        let big = fs.create(root, "big.bin", 0o644, 0, 0).unwrap();
-        fs.write(big, 0, &testutil::pattern(500_000, 9)).unwrap();
-        fs.create(root, "obsolete.log", 0o644, 0, 0).unwrap();
-        fs.sync().unwrap();
-        drop(fs);
-        let snap = (dev.as_ref() as &dyn BlockDev).read_vec(0, 48 << 20).unwrap();
-        (dev, snap)
-    }
-
-    fn stage() -> PathBuf {
-        std::env::temp_dir().join(format!("ld-shadow-{}-{:?}.stage", std::process::id(), std::thread::current().id()))
-    }
-
-    fn mutate(s: &mut ShadowOverlay) {
-        let root = s.root_ino();
-        let d = s.lookup(root, "boot").unwrap();
-        let c = s.lookup(d, "config.txt").unwrap();
-        s.write(c, 12, b"enable_uart=1\n").unwrap();
-        let big = s.lookup(root, "big.bin").unwrap();
-        s.write(big, 100_000, b"PATCHED").unwrap();
-        s.setattr(big, &SetAttr { size: Some(300_000), ..Default::default() }).unwrap();
-        s.unlink(root, "obsolete.log").unwrap();
-        let n = s.mkdir(root, "new", 0o755, 0, 0).unwrap();
-        let f = s.create(n, "ssh", 0o644, 0, 0).unwrap();
-        s.write(f, 0, b"").unwrap();
-        let w = s.create(n, "wpa.conf", 0o600, 0, 0).unwrap();
-        s.write(w, 0, b"network={ssid=\"x\"}\n").unwrap();
-        s.rename(n, "wpa.conf", d, "wpa_supplicant.conf").unwrap();
-    }
-
-    #[test]
-    fn overlay_view_and_rollback_leave_disk_untouched() {
-        let (dev, snap) = setup();
-        let lower = ext4_fs::Ext4Fs::open(dev.clone(), false).unwrap();
-        let mut s = ShadowOverlay::new(Box::new(lower), stage()).unwrap();
-        mutate(&mut s);
-        let root = s.root_ino();
-        let d = s.lookup(root, "boot").unwrap();
-        let c = s.lookup(d, "config.txt").unwrap();
-        assert_eq!(s.read(c, 0, 100).unwrap(), b"arm_64bit=1\nenable_uart=1\n");
-        let big = s.lookup(root, "big.bin").unwrap();
-        let b = s.read(big, 99_995, 20).unwrap();
-        assert_eq!(&b[5..12], b"PATCHED");
-        assert_eq!(s.getattr(big).unwrap().size, 300_000);
-        assert_eq!(s.lookup(root, "obsolete.log"), Err(FsError::NotFound));
-        let ch = s.changes();
-        let kinds: Vec<(String, String)> = ch.iter().map(|c| (c.path.clone(), c.kind.clone())).collect();
-        assert!(kinds.contains(&("/boot/config.txt".into(), "modified".into())), "{kinds:?}");
-        assert!(kinds.contains(&("/obsolete.log".into(), "deleted".into())), "{kinds:?}");
-        assert!(kinds.contains(&("/boot/wpa_supplicant.conf".into(), "added".into())), "{kinds:?}");
-        assert!(kinds.contains(&("/big.bin".into(), "modified".into())), "{kinds:?}");
-        let sm = s.summary();
-        assert_eq!(sm.deleted, 1);
-        // The physical device is bit-for-bit untouched.
-        assert!((dev.as_ref() as &dyn BlockDev).read_vec(0, 48 << 20).unwrap() == snap);
-        assert!(s.rollback() > 0);
-        assert!(s.lookup(root, "obsolete.log").is_ok());
-        assert_eq!(s.read(c, 0, 100).unwrap(), b"arm_64bit=1\n");
-        assert!(s.changes().is_empty());
-        assert!((dev.as_ref() as &dyn BlockDev).read_vec(0, 48 << 20).unwrap() == snap);
-    }
-
-    #[test]
-    fn commit_applies_everything() {
-        let (dev, _) = setup();
-        let lower = ext4_fs::Ext4Fs::open(dev.clone(), false).unwrap();
-        let mut s = ShadowOverlay::new(Box::new(lower), stage()).unwrap();
-        mutate(&mut s);
-        let root = s.root_ino();
-        let n = s.lookup(root, "new").unwrap();
-        let ssh = s.lookup(n, "ssh").unwrap();
-        assert!(s.commit().unwrap() >= 5);
-        // old overlay ids still resolve after commit
-        assert_eq!(s.getattr(ssh).unwrap().kind, FileKind::File);
-        drop(s);
-        let mut fs = ext4_fs::Ext4Fs::open(dev, false).unwrap();
-        let d = fs.lookup(root, "boot").unwrap();
-        let c = fs.lookup(d, "config.txt").unwrap();
-        assert_eq!(fs.read(c, 0, 100).unwrap(), b"arm_64bit=1\nenable_uart=1\n");
-        let w = fs.lookup(d, "wpa_supplicant.conf").unwrap();
-        assert_eq!(fs.read(w, 0, 100).unwrap(), b"network={ssid=\"x\"}\n");
-        assert_eq!(fs.getattr(w).unwrap().perm, 0o600);
-        let big = fs.lookup(root, "big.bin").unwrap();
-        assert_eq!(fs.getattr(big).unwrap().size, 300_000);
-        let mut want = testutil::pattern(500_000, 9);
-        want.truncate(300_000);
-        want[100_000..100_007].copy_from_slice(b"PATCHED");
-        assert!(fs.read(big, 0, 400_000).unwrap() == want);
-        assert_eq!(fs.lookup(root, "obsolete.log"), Err(FsError::NotFound));
-        let nd = fs.lookup(root, "new").unwrap();
-        assert!(fs.lookup(nd, "ssh").is_ok());
-        assert_eq!(fs.lookup(nd, "wpa.conf"), Err(FsError::NotFound));
-    }
-
-    #[test]
-    fn shadow_passes_conformance_then_commits() {
-        let (dev, _) = setup();
-        let lower = ext4_fs::Ext4Fs::open(dev.clone(), false).unwrap();
-        let mut s = ShadowOverlay::new(Box::new(lower), stage()).unwrap();
-        let root = s.root_ino();
-        s.unlink(root, "big.bin").unwrap(); // the suite creates its own big.bin
-        testutil::conformance(&mut s, true);
-        s.commit().unwrap();
-        drop(s);
-        let mut fs = ext4_fs::Ext4Fs::open(dev, false).unwrap();
-        testutil::check_persisted(&mut fs);
-    }
-}
+#[path = "shadow_tests.rs"]
+mod tests;

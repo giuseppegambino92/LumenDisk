@@ -273,6 +273,15 @@ private struct MenuPartitionRow: View {
             Spacer(minLength: 4)
             if model.isBusy(partition.bsdName) {
                 ProgressView().controlSize(.small)
+            } else if let session = model.shadowSession(for: partition), model.canResume(session) {
+                // Saved Shadow changes: a read/write mount would be refused, resume them instead.
+                Button(L("Riprendi", "Resume")) {
+                    Task { await model.resumeShadowSession(session) }
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .help(ShadowWording.promptTitle(for: session))
+                .accessibilityLabel(L("Riprendi le modifiche Shadow su \(partition.displayName)", "Resume the Shadow changes on \(partition.displayName)"))
             } else if supported {
                 Button(partition.isMountedByMacOS ? L("Monta", "Mount") : L("Monta Ora", "Mount Now")) {
                     let options = model.rule(for: partition).map(MountOptions.init(rule:)) ?? MountOptions()

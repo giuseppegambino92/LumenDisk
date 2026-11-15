@@ -129,9 +129,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : L("Espellere i \(count) volumi prima di uscire?", "Eject the \(count) volumes before quitting?")
         var info = L("I volumi di LumenDisk sono serviti dall'app stessa: uscendo verranno espulsi in sicurezza, così nessun dato resta in sospeso.",
                      "LumenDisk volumes are served by the app itself: quitting ejects them safely, so no data is left hanging.")
-        if !pending.isEmpty {
-            let changes = pending.reduce(UInt64(0)) { $0 + ($1.shadow?.totalChanges ?? 0) }
-            let names = pending.map(\.displayName).joined(separator: ", ")
+        // Persistent Shadow sessions survive the quit; only volumes whose changes aren't
+        // journaled on this Mac (network volumes, older engines) still lose them.
+        let kept = pending.filter(\.keepsShadowChanges)
+        let volatile = pending.filter { !$0.keepsShadowChanges }
+        if !kept.isEmpty {
+            let changes = kept.reduce(UInt64(0)) { $0 + ($1.shadow?.totalChanges ?? 0) }
+            let names = kept.map(\.displayName).joined(separator: ", ")
+            info += "\n\n" + L10n.plural(changes,
+                                         one: ("C'è %d modifica in Shadow Mode non ancora applicata su \(names). Resta salvata su questo Mac e ti verrà riproposta la prossima volta che monti il disco o apri LumenDisk.",
+                                               "There is %d Shadow Mode change not yet applied on \(names). It stays saved on this Mac and will be offered again the next time you mount the disk or open LumenDisk."),
+                                         other: ("Ci sono %d modifiche in Shadow Mode non ancora applicate su \(names). Restano salvate su questo Mac e ti verranno riproposte la prossima volta che monti il disco o apri LumenDisk.",
+                                                 "There are %d Shadow Mode changes not yet applied on \(names). They stay saved on this Mac and will be offered again the next time you mount the disk or open LumenDisk."))
+        }
+        if !volatile.isEmpty {
+            let changes = volatile.reduce(UInt64(0)) { $0 + ($1.shadow?.totalChanges ?? 0) }
+            let names = volatile.map(\.displayName).joined(separator: ", ")
             info += "\n\n" + L("Ci sono \(changes) modifiche in Shadow Mode non ancora applicate su \(names). Se non le applichi andranno perse.",
                                "There are \(changes) Shadow Mode changes not yet applied on \(names). If you don’t apply them they will be lost.")
         }

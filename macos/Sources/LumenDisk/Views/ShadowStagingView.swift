@@ -6,19 +6,30 @@ struct ShadowStagingView: View {
 
     var body: some View {
         let volumes = model.shadowVolumes
+        let saved = model.savedShadowSessions
         Group {
-            if volumes.isEmpty {
+            if !volumes.isEmpty {
+                ShadowStagingContent(volumes: volumes, savedSessions: saved)
+            } else if !saved.isEmpty {
+                DetailCanvas {
+                    PageHeader(title: L("Nessun volume in Shadow Mode", "No volumes in Shadow Mode"),
+                               subtitle: L("Le modifiche qui sotto sono conservate su questo Mac e aspettano che tu le riprenda o le scarti.",
+                                           "The changes below are kept on this Mac, waiting for you to resume or discard them."),
+                               systemImage: "square.stack.3d.forward.dottedline", tint: .ldShadowPending)
+                    SavedShadowSessionsCard(sessions: saved)
+                }
+            } else {
                 ContentUnavailableView {
                     Label(L("Nessun volume in Shadow Mode", "No volumes in Shadow Mode"), systemImage: "square.stack.3d.forward.dottedline")
                 } description: {
                     Text(L("In Shadow Mode le modifiche finiscono in un livello sicuro e nulla viene scritto sul disco finché non premi «Applica su Disco». Scegli Shadow Mode nella scheda di un volume per provarlo.",
                            "In Shadow Mode changes go to a safe layer and nothing is written to the disk until you click “Apply to Disk”. Choose Shadow Mode on a volume to try it."))
                 }
-            } else {
-                ShadowStagingContent(volumes: volumes)
             }
         }
         .navigationTitle("Shadow Staging")
+        // Connected / not connected and fingerprints may have moved since the last refresh.
+        .task { await model.refreshShadowSessions(prompt: false) }
     }
 }
 
@@ -46,6 +57,7 @@ private enum ChangeFilter: String, CaseIterable, Identifiable {
 private struct ShadowStagingContent: View {
     @Environment(AppModel.self) private var model
     var volumes: [VolumeStatus]
+    var savedSessions: [ShadowSession] = []
 
     @State private var changes: [ShadowChange] = []
     @State private var loadError: String?
@@ -71,13 +83,14 @@ private struct ShadowStagingContent: View {
     /// Reload whenever the counters reported by ld_list_volumes move.
     private var reloadKey: String {
         let s = volume.shadow ?? ShadowSummary()
-        return "\(volume.id)|\(s.added)|\(s.modified)|\(s.deleted)|\(s.pendingBytes)"
+        return "\(volume.id)|\(s.added)|\(s.modified)|\(s.deleted)|\(s.pendingBytes)|\(s.state)|\(s.commitApplied)"
     }
 
     var body: some View {
         @Bindable var model = model
         let summary = volume.shadow ?? ShadowSummary()
         let busy = model.activity(for: volume.id)
+        let interrupted = volume.isShadowCommitInterrupted
 
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 16) {
@@ -110,6 +123,12 @@ private struct ShadowStagingContent: View {
                     SummaryTile(title: L("Variazione spazio", "Space change"), value: ByteFormat.delta(summary.pendingBytes), symbol: "internaldrive", tint: .secondary)
                 }
 
+                if volume.isShadowCommitInterrupted {
+                    ShadowCommitInterruptedBanner(volume: volume)
+                } else if summary.restored {
+                    ShadowRestoredNote()
+                }
+
                 HStack {
                     Picker(L("Filtro", "Filter"), selection: $filter) {
                         ForEach(ChangeFilter.allCases) { Text($0.title).tag($0) }
@@ -138,6 +157,12 @@ private struct ShadowStagingContent: View {
                 .frame(minHeight: 160, maxHeight: .infinity)
                 .padding(.horizontal, 28)
                 .padding(.bottom, 16)
+
+            if !savedSessions.isEmpty {
+                SavedShadowSessionsCard(sessions: savedSessions)
+                    .padding(.horizontal, 28)
+                    .padding(.bottom, 16)
+            }
         }
         .frame(maxWidth: 980)
         .frame(maxWidth: .infinity)
@@ -147,6 +172,10 @@ private struct ShadowStagingContent: View {
                 if let busy {
                     ProgressView().controlSize(.small)
                     Text(busy).foregroundStyle(.secondary)
+                } else if interrupted {
+                    Label(ShadowWording.appliedProgress(applied: summary.commitApplied, total: summary.commitTotal),
+                          systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
                 } else {
                     Label(summary.hasChanges
                           ? L10n.plural(summary.totalChanges, one: ("%d modifica pronta", "%d change ready"), other: ("%d modifiche pronte", "%d changes ready"))
@@ -158,33 +187,41 @@ private struct ShadowStagingContent: View {
                 Button(role: .destructive) {
                     confirmRollback = true
                 } label: {
-                    Label(L("Scarta Modifiche (Rollback)", "Discard Changes (Rollback)"), systemImage: "arrow.uturn.backward")
+                    Label(interrupted ? L("Abbandona il Resto…", "Abandon the Rest…") : L("Scarta Modifiche (Rollback)", "Discard Changes (Rollback)"),
+                          systemImage: "arrow.uturn.backward")
                 }
-                .disabled(!summary.hasChanges || busy != nil)
+                .disabled(!(summary.hasChanges || interrupted) || busy != nil)
                 Button {
                     Task {
                         if await model.commitShadow(volume) { await load() }
                     }
                 } label: {
-                    Label(L("Applica su Disco (Commit)", "Apply to Disk (Commit)"), systemImage: "checkmark.circle.fill")
+                    Label(interrupted ? L("Riprova Applicazione", "Retry Applying") : L("Applica su Disco (Commit)", "Apply to Disk (Commit)"),
+                          systemImage: "checkmark.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!summary.hasChanges || busy != nil || volume.kind == .imageURL)
+                .disabled(!(summary.hasChanges || interrupted) || busy != nil || volume.kind == .imageURL)
                 .help(volume.kind == .imageURL ? L("Un'immagine su Internet non può essere modificata: le modifiche restano su questo Mac.",
                                                    "An image on the web can’t be modified: changes stay on this Mac.") : "")
             }
             .controlSize(.large)
         }
-        .confirmationDialog(L("Scartare tutte le modifiche su «\(volume.displayName)»?", "Discard all changes on “\(volume.displayName)”?"), isPresented: $confirmRollback, titleVisibility: .visible) {
-            Button(L10n.plural(summary.totalChanges, one: ("Scarta %d Modifica", "Discard %d Change"), other: ("Scarta %d Modifiche", "Discard %d Changes")), role: .destructive) {
+        .confirmationDialog(interrupted ? ShadowWording.abandonTitle(name: volume.displayName)
+                                        : L("Scartare tutte le modifiche su «\(volume.displayName)»?", "Discard all changes on “\(volume.displayName)”?"),
+                            isPresented: $confirmRollback, titleVisibility: .visible) {
+            Button(interrupted ? ShadowWording.abandonButton
+                               : L10n.plural(summary.totalChanges, one: ("Scarta %d Modifica", "Discard %d Change"), other: ("Scarta %d Modifiche", "Discard %d Changes")),
+                   role: .destructive) {
                 Task {
                     if await model.rollbackShadow(volume) { await load() }
                 }
             }
             Button(L("Annulla", "Cancel"), role: .cancel) {}
         } message: {
-            Text(L("I file aggiunti verranno rimossi e quelli modificati o eliminati torneranno com'erano. L'operazione non si può annullare.",
-                   "Added files will be removed and modified or deleted ones will go back to how they were. This can’t be undone."))
+            Text(interrupted
+                 ? ShadowWording.abandonMessage(applied: summary.commitApplied, total: summary.commitTotal)
+                 : L("I file aggiunti verranno rimossi e quelli modificati o eliminati torneranno com'erano. L'operazione non si può annullare.",
+                     "Added files will be removed and modified or deleted ones will go back to how they were. This can’t be undone."))
         }
         .task(id: reloadKey) { await load() }
     }

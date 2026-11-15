@@ -124,6 +124,46 @@
  *                "solid_state": bool|null, "smart_status": str|null,                  // "Verified" | "Failing" | "Not Supported" | null
  *                "size": u64|null, "removable": bool|null, "internal": bool|null,
  *                "location": str|null, "smartctl": object|null}                     // smartctl -j output when smartmontools is installed
+ *
+ * ── Persistent Shadow sessions ──────────────────────────────────────────────────────
+ *
+ *  Uncommitted Shadow changes survive crashes, force-quit, power loss and restarts. Each volume
+ *  has one session in <support>/Shadow/<key>/ (manifest.json, stage file, operation journal,
+ *  commit plan/progress while a commit runs). Mounting the same volume in Shadow mode restores
+ *  it (or finishes an interrupted commit); mounting it read/write while a session is pending is
+ *  refused.
+ *
+ *  MountRequest gains optional fields:
+ *    "media_uuid": str|null       // DiskArbitration media (partition) UUID, stored in the session
+ *                                 // so the app can recognise the disk when it reappears
+ *    "expect_session": str|null   // ShadowSession.key the caller wants to resume: the mount is
+ *                                 // refused if this source does not hold that session
+ *
+ *  VolumeStatus.shadow gains:
+ *    "persistent": bool,          // changes are journaled on disk (false for SFTP/WebDAV/LAN)
+ *    "session_key": str|null,
+ *    "restored": bool,            // changes were restored from a previous run at mount time
+ *    "state": "pending"|"committing",   // committing = a commit started and has not finished
+ *    "commit_applied": u64, "commit_total": u64,   // steps of the running/interrupted commit
+ *    "commit_error": str|null     // why the last commit attempt stopped (retry with ld_shadow_commit,
+ *                                 // or abandon the remaining steps with ld_shadow_rollback)
+ *
+ *  ShadowSession = {
+ *    "key": str, "name": str,                 // name = label, else "<FS> volume"
+ *    "label": str, "fs_type": str, "uuid": str,
+ *    "source_path": str, "partition": u32, "kind": "local"|"image_url",
+ *    "media_uuid": str|null, "size": u64,     // size of the partition / device in bytes
+ *    "created": i64, "updated": i64,          // unix seconds
+ *    "state": "pending"|"committing",
+ *    "changes": u64, "added": u64, "modified": u64, "deleted": u64, "pending_bytes": i64,
+ *    "commit_applied": u64, "commit_total": u64, "commit_error": str|null,
+ *    "connected": bool,                       // the source path exists right now (image file or
+ *                                             // device node; the app should also match media_uuid)
+ *    "mounted_volume_id": str|null,           // mounted right now by this process
+ *    "fingerprint_ok": bool|null,             // null = not verified (disk not readable / not connected);
+ *                                             // false = the disk was modified elsewhere: only Discard
+ *    "fingerprint_problem": str|null          // user-presentable reason when fingerprint_ok == false
+ *  }
  */
 #ifndef LUMENDISK_FFI_H
 #define LUMENDISK_FFI_H
@@ -227,6 +267,14 @@ char *ld_disk_health(const char *bsd_name);
 /* Language of user-visible core messages (errors, reasons): "it" (default) or "en".
  * {"ok":true,"language":"it"|"en"} */
 char *ld_set_language(const char *code);
+
+/* Persistent Shadow sessions (see "Persistent Shadow sessions" above).
+ * ld_shadow_sessions: every saved session, mounted or not: {"ok":true,"sessions":[ShadowSession]}
+ * ld_shadow_discard_session: delete a saved session and all its pending changes. If the volume
+ *   is mounted this is the same as ld_shadow_rollback. While a commit is interrupted it abandons
+ *   only the steps not yet applied (applied ones stay on the disk). {"ok":true,"discarded":u64} */
+char *ld_shadow_sessions(void);
+char *ld_shadow_discard_session(const char *key);
 
 void ld_free_string(char *s);
 

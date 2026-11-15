@@ -121,7 +121,8 @@ struct SidebarView: View {
 
             Section(L("Protezione", "Protection")) {
                 Label("Shadow Staging", systemImage: "square.stack.3d.forward.dottedline")
-                    .badge(Int(model.totalShadowChanges))
+                    // Includes changes saved for disks that aren't mounted right now.
+                    .badge(Int(model.totalPendingShadowChanges))
                     .tag(SidebarItem.shadow)
                 Label("Ghost Shield", systemImage: "shield.lefthalf.filled")
                     .tag(SidebarItem.ghost)

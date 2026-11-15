@@ -23,6 +23,7 @@ struct VolumeDetailView: View {
             if volume.isRemote { healthCard }
             if volume.totalBytes > 0 { capacityCard }
             DiskHealthCard(volume: volume, bsdName: volume.deviceBSDName)
+            if volume.isShadowCommitInterrupted { ShadowCommitInterruptedBanner(volume: volume) }
             if !volume.isRemote { modeCard }
             if volume.mode == .shadow { shadowCard }
             featuresCard
@@ -63,6 +64,13 @@ struct VolumeDetailView: View {
                     }
                 }
             }
+            if volume.keepsShadowChanges {
+                // The core keeps them on this Mac and offers them again on the next mount.
+                Button(volume.kind == .imageURL ? L("Scollega e Mantieni le Modifiche", "Disconnect and Keep Changes")
+                                                : L("Espelli e Mantieni le Modifiche", "Eject and Keep Changes")) {
+                    Task { await model.eject(volume) }
+                }
+            }
             Button(volume.kind == .imageURL ? L("Scarta e Scollega", "Discard and Disconnect") : L("Scarta ed Espelli", "Discard and Eject"), role: .destructive) {
                 Task {
                     if await model.rollbackShadow(volume) { await model.eject(volume) }
@@ -70,11 +78,7 @@ struct VolumeDetailView: View {
             }
             Button(L("Annulla", "Cancel"), role: .cancel) {}
         } message: {
-            Text(volume.kind == .imageURL
-                 ? L("Le \(volume.shadow?.totalChanges ?? 0) modifiche esistono solo su questo Mac: l'immagine remota non viene mai modificata.",
-                     "The \(volume.shadow?.totalChanges ?? 0) changes only exist on this Mac: the remote image is never modified.")
-                 : L("Ci sono \(volume.shadow?.totalChanges ?? 0) modifiche non ancora scritte sul disco.",
-                     "There are \(volume.shadow?.totalChanges ?? 0) changes not yet written to the disk."))
+            Text(ejectShadowMessage)
         }
         .alert(L("Il volume è protetto in sola lettura", "The volume is protected as read-only"), isPresented: $showForcedReadOnlyAlert) {
             Button(L("Ripara e Sblocca Scrittura", "Repair and Unlock Writing")) { Task { await model.repair(volume) } }
@@ -343,6 +347,19 @@ struct VolumeDetailView: View {
         .card()
     }
 
+    private var ejectShadowMessage: String {
+        let count = volume.shadow?.totalChanges ?? 0
+        var text = volume.kind == .imageURL
+            ? L("Le \(count) modifiche esistono solo su questo Mac: l'immagine remota non viene mai modificata.",
+                "The \(count) changes only exist on this Mac: the remote image is never modified.")
+            : L("Ci sono \(count) modifiche non ancora scritte sul disco.",
+                "There are \(count) changes not yet written to the disk.")
+        if volume.keepsShadowChanges {
+            text += " " + ShadowWording.keptOnEject
+        }
+        return text
+    }
+
     private var shadowDialogTitle: String {
         L10n.plural(volume.shadow?.totalChanges ?? 0,
                     one: ("C'è %d modifica in sospeso", "There is %d pending change"),
@@ -378,8 +395,13 @@ struct VolumeDetailView: View {
         if volume.kind == .imageURL {
             subtitle = L("Le modifiche restano su questo Mac: il file remoto non viene mai modificato.",
                          "Changes stay on this Mac: the remote file is never modified.")
+        } else if shadow.isCommitInterrupted {
+            subtitle = ShadowWording.appliedProgress(applied: shadow.commitApplied, total: shadow.commitTotal)
         } else if shadow.hasChanges {
-            subtitle = L("Nulla è ancora stato scritto sul disco fisico.", "Nothing has been written to the physical disk yet.")
+            subtitle = shadow.persistent
+                ? L("Nulla è ancora stato scritto sul disco fisico. Le modifiche sono salvate su questo Mac e sopravvivono a un'espulsione o alla chiusura di LumenDisk.",
+                    "Nothing has been written to the physical disk yet. The changes are saved on this Mac and survive an eject or quitting LumenDisk.")
+                : L("Nulla è ancora stato scritto sul disco fisico.", "Nothing has been written to the physical disk yet.")
         } else {
             subtitle = L("Nessuna modifica in sospeso: il disco è identico all'originale.", "No pending changes: the disk is identical to the original.")
         }
@@ -391,7 +413,7 @@ struct VolumeDetailView: View {
                     model.shadowFocusID = volume.id
                     model.selection = .shadow
                 }
-                .disabled(!shadow.hasChanges)
+                .disabled(!shadow.hasChanges && !shadow.isCommitInterrupted)
             }
             HStack(spacing: 10) {
                 ShadowStat(kind: .added, count: shadow.added)
@@ -406,6 +428,9 @@ struct VolumeDetailView: View {
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.ldWell, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            if shadow.restored && !shadow.isCommitInterrupted {
+                ShadowRestoredNote()
             }
         }
         .card()
@@ -880,6 +905,9 @@ struct PhysicalPartitionView: View {
                     }
                 }
             }
+            if let session = model.shadowSession(for: partition) {
+                savedSessionCard(session)
+            }
             if supported {
                 optionsCard
                 analysisCard
@@ -972,12 +1000,31 @@ struct PhysicalPartitionView: View {
                     in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
+    /// Shadow changes saved on this Mac for this disk: resume them or discard them.
+    private func savedSessionCard(_ session: ShadowSession) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            CardHeader(title: ShadowWording.promptTitle(for: session),
+                       subtitle: L("Sono salvate su questo Mac. Finché non le riprendi in Shadow Mode o le scarti, il disco non può essere montato in lettura/scrittura.",
+                                   "They are saved on this Mac. Until you resume them in Shadow Mode or discard them, the disk can’t be mounted read/write."),
+                       systemImage: "clock.arrow.circlepath")
+            ShadowSessionRow(session: session)
+        }
+        .card()
+    }
+
     private var mountButton: some View {
         Button {
             Task {
-                await model.mountPhysical(partition, options: MountOptions(
+                var options = MountOptions(
                     mode: mode, ghostShield: ghostShield,
-                    uidMap: model.rule(for: partition)?.uidMapRequest ?? UIDMapRequest(enabled: uidMap, linuxUid: nil, linuxGid: nil)))
+                    uidMap: model.rule(for: partition)?.uidMapRequest ?? UIDMapRequest(enabled: uidMap, linuxUid: nil, linuxGid: nil))
+                // Saved Shadow changes are restored by a Shadow mount (read/write is refused).
+                if let session = model.shadowSession(for: partition), options.mode == .readWrite, model.canResume(session) {
+                    options.mode = .shadow
+                    await model.mountPhysical(partition, options: options, expectSession: session.key)
+                } else {
+                    await model.mountPhysical(partition, options: options)
+                }
             }
         } label: {
             Label(partition.isMountedByMacOS ? L("Monta in Lettura/Scrittura con LumenDisk", "Mount Read/Write with LumenDisk")
@@ -1096,6 +1143,9 @@ struct PhysicalPartitionView: View {
             uidMap = rule.uidMapEnabled
         } else if partition.filesystemHint == .ntfs || partition.filesystemHint == .unknown {
             mode = .shadow   // unknown/Windows volumes: start in the safe mode
+        }
+        if model.shadowSession(for: partition) != nil, mode == .readWrite {
+            mode = .shadow   // saved Shadow changes: a read/write mount would be refused
         }
     }
 
