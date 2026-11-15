@@ -7,13 +7,16 @@
 #   FUZZ_FORK=4 scripts/fuzz.sh 3600   4 worker processes per target (crashes don't stop the run)
 #   FUZZ_PARALLEL=0 scripts/fuzz.sh    targets one after the other (default: all at once)
 #   SKIP_REAL_SEEDS=1 ...           don't build extra seeds with the Docker toolbox
+#   FUZZ_CORPUS=<dir> ...           where corpora grow (default core/fuzz/corpus; whole images,
+#                                   so a long run can reach a few GB: delete it when done)
 #
 # Each target mounts the input as a volume image (core/src/fuzzkit.rs: read-only and read-write,
 # full walk, writes, Doctor repair). Seeds: valid images from our own mkfs plus, when Docker and
 # the lumendisk-toolbox image are available, images made by mkfs.ext4 -d / mkfs.vfat + mcopy /
 # mkntfs + ntfscp / mkfs.exfat. Corpora grow in core/fuzz/corpus/<target> (not committed);
-# crashes land in core/fuzz/artifacts/<target>. A crash makes the script exit non-zero; add the
-# input to core/tests/corrupt_regressions/ (see README there) once fixed.
+# crashes land in core/fuzz/artifacts/<target>. A crash makes the script exit non-zero. Before
+# fixing it, turn it into a minimized regression case:
+#   cargo run --profile robust --example fuzz_seeds -- core/tests/corrupt_regressions --regression <target> <crash file>
 #
 # Needs a nightly toolchain and cargo-fuzz. Nothing is installed automatically: if they are
 # missing the script says how to get them and exits 0.
@@ -40,6 +43,7 @@ fi
 
 FUZZ="$ROOT/core/fuzz"
 SEEDS="$FUZZ/seeds"
+CORPUS="${FUZZ_CORPUS:-$FUZZ/corpus}"
 rm -rf "$SEEDS"
 mkdir -p "$SEEDS"
 ( cd "$ROOT/core" && cargo run -q --release --example fuzz_seeds -- "$SEEDS" >/dev/null )
@@ -84,12 +88,12 @@ LOGS="$ROOT/target/fuzz-logs"
 mkdir -p "$LOGS"
 run_target() {
   local t="$1"
-  mkdir -p "$FUZZ/corpus/$t" "$SEEDS/$t"
+  mkdir -p "$CORPUS/$t" "$SEEDS/$t"
   # Inputs are whole images: let mutants be as large as the largest seed.
   local maxlen
   maxlen=$(find "$SEEDS/$t" -type f -exec wc -c {} + | awk '$2 != "total" && $1 > m {m = $1} END {print m + 0}')
   [ "$maxlen" -gt 4096 ] || maxlen=1048576
-  ( cd "$ROOT/core" && cargo +nightly fuzz run "$t" "$FUZZ/corpus/$t" "$SEEDS/$t" -- \
+  ( cd "$ROOT/core" && cargo +nightly fuzz run "$t" "$CORPUS/$t" "$SEEDS/$t" -- \
       -max_len="$maxlen" -max_total_time="$SECS" -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=1024 \
       ${FORKARGS[@]+"${FORKARGS[@]}"} -print_final_stats=1 ) >"$LOGS/$t.log" 2>&1
 }
@@ -110,7 +114,7 @@ for t in "${TARGETS[@]}"; do
   EXECS=$(grep -Eo 'stat::number_of_executed_units: *[0-9]+' "$L" | awk '{s+=$2} END {print s+0}')
   if [ "$EXECS" = 0 ]; then EXECS=$(grep -Eo '#[0-9]+' "$L" | tail -1 | tr -d '#'); fi
   COV=$(grep -Eo 'cov: [0-9]+' "$L" | tail -1 | awk '{print $2}')
-  NCORP=$(ls "$FUZZ/corpus/$t" 2>/dev/null | wc -l | tr -d ' ')
+  NCORP=$(ls "$CORPUS/$t" 2>/dev/null | wc -l | tr -d ' ')
   CRASH=$(ls "$FUZZ/artifacts/$t" 2>/dev/null | { grep -E '^(crash|timeout|oom|leak)-' || true; } | wc -l | tr -d ' ')
   printf '  %-6s %4ss  %10s execs  cov %-6s corpus %-5s crashes %s\n' "$t" "$SECS" "${EXECS:-?}" "${COV:-?}" "$NCORP" "$CRASH"
   if [ "$CRASH" != 0 ]; then

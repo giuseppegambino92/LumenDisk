@@ -1767,7 +1767,11 @@ impl Ext4Fs {
         while l <= last {
             if let Some((idx, _, _)) = Self::lookup_block(exts, l) {
                 let e = exts[idx];
-                l = (e.lblk + e.len).max(l + 1);
+                let next = (e.lblk as u64 + e.len as u64).max(l as u64 + 1);
+                if next > last as u64 {
+                    break;
+                }
+                l = next as u32;
                 continue;
             }
             // hole from l to min(last, next extent start - 1)
@@ -1813,7 +1817,7 @@ impl Ext4Fs {
         for e in exts.drain(..) {
             if let Some(last) = out.last_mut() {
                 if last.uninit == e.uninit
-                    && last.lblk + last.len == e.lblk
+                    && last.lblk as u64 + last.len as u64 == e.lblk as u64
                     && last.pblk + last.len as u64 == e.pblk
                     && (last.len as u64 + e.len as u64) < (u32::MAX as u64)
                 {
@@ -1888,7 +1892,7 @@ impl Ext4Fs {
         for e in exts.drain(..) {
             if e.lblk >= keep_blocks {
                 to_free.push((e.pblk, e.len as u64));
-            } else if e.lblk + e.len > keep_blocks {
+            } else if e.lblk as u64 + e.len as u64 > keep_blocks as u64 {
                 let keep = keep_blocks - e.lblk;
                 to_free.push((e.pblk + keep as u64, (e.len - keep) as u64));
                 out.push(Ext { len: keep, ..e });
@@ -2189,9 +2193,15 @@ impl Ext4Fs {
                 }
             }
         }
-        // Need a new block.
-        let lblk = (dir.size() / self.bs) as u32;
+        // Need a new block, after both i_size and the last mapped block (a corrupt i_size can
+        // be anything; the new extent must keep the mapping sorted and below 2^32 blocks).
         let (mut exts, meta) = self.get_mapping(dir)?;
+        let mapped_end = exts.last().map_or(0, |e| e.lblk as u64 + e.len as u64);
+        let lblk = (dir.size() / self.bs).max(mapped_end);
+        if lblk >= self.blocks_count.min(u32::MAX as u64) {
+            return corrupt("directory larger than the volume");
+        }
+        let lblk = lblk as u32;
         let goal = exts.last().map(|e| e.pblk + e.len as u64).unwrap_or_else(|| self.inode_goal(dir.ino));
         let r = self.alloc_blocks(goal, 1)?;
         let pblk = r[0].0;
@@ -2202,7 +2212,7 @@ impl Ext4Fs {
         exts.push(Ext { lblk, pblk, len: 1, uninit: false });
         Self::merge_exts(&mut exts);
         self.set_mapping(dir, &exts, meta)?;
-        dir.set_size(dir.size() + self.bs);
+        dir.set_size((lblk as u64 + 1) * self.bs);
         self.write_inode(dir)?;
         Ok(())
     }

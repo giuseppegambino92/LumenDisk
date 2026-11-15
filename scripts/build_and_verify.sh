@@ -101,7 +101,8 @@ ok "$(summary_of "$OUT")"; record "Corrupted images ($NCASES cases, $NFS filesys
 if [ -z "${SKIP_FUZZ:-}" ]; then
   bold "Fuzzing (libFuzzer, 30 s per target)"
   if cargo +nightly --version >/dev/null 2>&1 && cargo +nightly fuzz --version >/dev/null 2>&1; then
-    OUT=$(scripts/fuzz.sh 30 2>&1) || { echo "$OUT" | tail -25; die "fuzzing found a crash (see core/fuzz/artifacts)"; }
+    OUT=$(FUZZ_CORPUS="$ROOT/target/fuzz-corpus-verify" scripts/fuzz.sh 30 2>&1) || { echo "$OUT" | tail -25; die "fuzzing found a crash (see core/fuzz/artifacts)"; }
+    rm -rf "$ROOT/target/fuzz-corpus-verify"
     echo "$OUT" | grep -E 'execs' | sed 's/^ */    · /'
     EXECS=$(grep -Eo '[0-9]+ execs' <<<"$OUT" | awk '{s+=$1} END {print s+0}')
     ok "$EXECS executions, no crash"; record "Fuzzing (30 s × 5 targets)" "$EXECS execs, 0 crashes"
