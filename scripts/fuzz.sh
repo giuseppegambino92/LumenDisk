@@ -111,9 +111,9 @@ for p in "${PIDS[@]}"; do wait "$p" || STATUS=1; done
 
 for t in "${TARGETS[@]}"; do
   L="$LOGS/$t.log"
-  EXECS=$(grep -Eo 'stat::number_of_executed_units: *[0-9]+' "$L" | awk '{s+=$2} END {print s+0}')
-  if [ "$EXECS" = 0 ]; then EXECS=$(grep -Eo '#[0-9]+' "$L" | tail -1 | tr -d '#'); fi
-  COV=$(grep -Eo 'cov: [0-9]+' "$L" | tail -1 | awk '{print $2}')
+  EXECS=$( { grep -Eo 'stat::number_of_executed_units: *[0-9]+' "$L" || true; } | awk '{s+=$2} END {print s+0}')
+  if [ "$EXECS" = 0 ]; then EXECS=$( { grep -Eo '^#[0-9]+' "$L" || true; } | tail -1 | tr -d '#'); fi
+  COV=$( { grep -Eo 'cov: [0-9]+' "$L" || true; } | tail -1 | awk '{print $2}')
   NCORP=$(ls "$CORPUS/$t" 2>/dev/null | wc -l | tr -d ' ')
   CRASH=$(ls "$FUZZ/artifacts/$t" 2>/dev/null | { grep -E '^(crash|timeout|oom|leak)-' || true; } | wc -l | tr -d ' ')
   printf '  %-6s %4ss  %10s execs  cov %-6s corpus %-5s crashes %s\n' "$t" "$SECS" "${EXECS:-?}" "${COV:-?}" "$NCORP" "$CRASH"
