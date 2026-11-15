@@ -29,7 +29,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  lumendisk inspect <path>\n  lumendisk mkfs <fs> <path> <MiB> [label]\n  lumendisk mount <path> [--partition N] [--mode readWrite|shadow|readOnly] [--no-ghost] [--root DIR] [--name NAME] [--control SOCK]\n  lumendisk ctl <SOCK> <status|changes|commit|rollback|ghost|unmount>\n  lumendisk repair <path> [--partition N]\n  lumendisk locks <mountpoint>\n  lumendisk shadow-sessions\n  lumendisk shadow-discard <KEY>"
+        "usage:\n  lumendisk inspect <path>\n  lumendisk mkfs <fs> <path> <MiB> [label]\n  lumendisk mount <path> [--partition N] [--mode readWrite|shadow|readOnly] [--no-ghost] [--root DIR] [--name NAME] [--control SOCK] [--media-uuid UUID] [--expect-session KEY]\n  lumendisk ctl <SOCK> <status|changes|commit|rollback|ghost|unmount>\n  lumendisk repair <path> [--partition N]\n  lumendisk locks <mountpoint>\n  lumendisk shadow-sessions\n  lumendisk shadow-discard <KEY>"
     );
     std::process::exit(2)
 }
@@ -147,8 +147,10 @@ fn main() {
                 name: opt(&args, "--name"),
                 fd: None,
                 volume_icon: None,
-                media_uuid: None,
-                expect_session: None,
+                // What the app passes from DiskArbitration (the partition's media UUID) and
+                // when resuming a saved Shadow session (refused if the disk doesn't hold it).
+                media_uuid: opt(&args, "--media-uuid"),
+                expect_session: opt(&args, "--expect-session"),
             };
             // Bind the control socket first so a bad path can't leave an orphaned mount.
             let listener = opt(&args, "--control").map(|sock| {
