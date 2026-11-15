@@ -102,15 +102,17 @@ ok "LumenDisk binary ($(lipo -archs "$BIN"))"
 bold "Bundling dist/LumenDisk.app"
 APP=dist/LumenDisk.app
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
 cp "$BIN" "$APP/Contents/MacOS/LumenDisk"
 cp macos/Resources/Info.plist "$APP/Contents/Info.plist"
 { [ -f macos/Resources/AppIcon.icns ] && [ -f macos/Resources/VolumeIcon.icns ]; } || ( cd macos/Resources && swift make_icon.swift . >/dev/null )
 cp macos/Resources/AppIcon.icns macos/Resources/VolumeIcon.icns "$APP/Contents/Resources/"
 for l in macos/Resources/*.lproj; do [ -d "$l" ] && cp -R "$l" "$APP/Contents/Resources/"; done
-cp build/bin/lumendisk "$APP/Contents/Resources/bin/lumendisk"
+cp build/bin/lumendisk "$APP/Contents/Helpers/lumendisk"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 && ok "ad-hoc signed"
+# Hardened runtime from the start, so scripts/release.sh can notarize this exact bundle.
+codesign --force --options runtime --sign - "$APP/Contents/Helpers/lumendisk" >/dev/null 2>&1
+codesign --force --options runtime --sign - "$APP" >/dev/null 2>&1 && ok "ad-hoc signed (hardened runtime)"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null && ok "Info.plist valid ($(ls -d "$APP"/Contents/Resources/*.lproj | xargs -n1 basename | tr '\n' ' '))"
 ok "$APP ($(du -sh "$APP" | cut -f1))"
 

@@ -8,6 +8,7 @@
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Universal](https://img.shields.io/badge/Universal-Apple%20Silicon%20%2B%20Intel-blue)
+![Notarizzata](https://img.shields.io/badge/notarizzata-Apple-brightgreen?logo=apple)
 ![Rust](https://img.shields.io/badge/core-Rust-orange?logo=rust)
 ![Swift 6](https://img.shields.io/badge/app-Swift%206-F05138?logo=swift)
 ![ext4 NTFS FAT32 exFAT](https://img.shields.io/badge/ext2%2F3%2F4%20·%20NTFS%20·%20FAT%20·%20exFAT-lettura%20%2B%20scrittura-success)
@@ -32,11 +33,7 @@ Scarica l'ultima versione da **[Releases](../../releases)**:
 | LumenDisk-1.0.0-universal.zip | l'app universale, in formato zip |
 | lumendisk-cli-1.0.0-macos-universal.tar.gz | lo strumento da riga di comando `lumendisk` |
 
-Apri il DMG e trascina **LumenDisk** su **Applicazioni**. L'app ha una firma ad-hoc e non è notarizzata: al primo avvio vai in **Impostazioni di Sistema → Privacy e sicurezza → Apri comunque**, oppure esegui una volta:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/LumenDisk.app
-```
+Apri il DMG e trascina **LumenDisk** su **Applicazioni**. L'app è firmata con un Developer ID e notarizzata da Apple, quindi si apre come qualsiasi altra app. I checksum sono in `SHA256SUMS.txt`.
 
 Richiede macOS 14 Sonoma o successivo.
 
@@ -93,6 +90,8 @@ SKIP_E2E=1 SKIP_UI=1 NO_INSTALL=1 scripts/build_and_verify.sh   # solo compilazi
 ```
 
 Lo script produce `dist/LumenDisk.app` (universale, firma ad-hoc) e `build/bin/lumendisk` (riga di comando). I test end-to-end richiedono Docker; la verifica dell'interfaccia apre finestre dell'app.
+
+Per pubblicare, `scripts/release.sh` firma quel pacchetto con un Developer ID, lo fa notarizzare e prepara in `dist/release/` i DMG, lo zip e l'archivio della riga di comando. Usa l'account Apple collegato a Xcode, quindi non serve configurare certificati o password.
 
 Lo strumento da riga di comando crea, esamina e monta immagini:
 

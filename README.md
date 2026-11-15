@@ -8,6 +8,7 @@
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Universal](https://img.shields.io/badge/Universal-Apple%20Silicon%20%2B%20Intel-blue)
+![Notarized](https://img.shields.io/badge/notarized-Apple-brightgreen?logo=apple)
 ![Rust](https://img.shields.io/badge/core-Rust-orange?logo=rust)
 ![Swift 6](https://img.shields.io/badge/app-Swift%206-F05138?logo=swift)
 ![ext4 NTFS FAT32 exFAT](https://img.shields.io/badge/ext2%2F3%2F4%20·%20NTFS%20·%20FAT%20·%20exFAT-read%20%2B%20write-success)
@@ -32,11 +33,7 @@ Get the latest version from **[Releases](../../releases)**:
 | LumenDisk-1.0.0-universal.zip | the universal app, as a zip |
 | lumendisk-cli-1.0.0-macos-universal.tar.gz | the `lumendisk` command-line tool |
 
-Open the DMG and drag **LumenDisk** onto **Applications**. The app is ad-hoc signed and not notarized, so on first launch go to **System Settings → Privacy & Security → Open Anyway**, or run once:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/LumenDisk.app
-```
+Open the DMG and drag **LumenDisk** onto **Applications**. The app is signed with a Developer ID and notarized by Apple, so it opens like any other app. Checksums are in `SHA256SUMS.txt`.
 
 Requires macOS 14 Sonoma or later.
 
@@ -93,6 +90,8 @@ SKIP_E2E=1 SKIP_UI=1 NO_INSTALL=1 scripts/build_and_verify.sh   # just build + u
 ```
 
 The script produces `dist/LumenDisk.app` (universal, ad-hoc signed) and `build/bin/lumendisk` (CLI). The end-to-end suites need Docker; the UI pass opens app windows.
+
+To publish, `scripts/release.sh` signs that bundle with a Developer ID, notarizes it and builds the DMGs, the zip and the CLI archive in `dist/release/`. It uses the Apple account logged into Xcode, so no certificate or password setup is needed.
 
 The command-line tool can create, inspect and mount images:
 
