@@ -147,6 +147,7 @@ fn docker_file_hash(dir: &Path, extract_cmd: &str) -> String {
 #[test]
 #[ignore]
 fn e2e_ext4_real_mkfs() {
+    let _cleanup = Cleanup;
     let dir = setup("e2e_ext4");
     make_sparse(&dir.join("disk.img"), 256);
     let (c, o) = docker(&dir, "mkdir -p src/home/pi && echo cfg > src/home/pi/.bashrc && chown -R 1000:1000 src/home && mkfs.ext4 -q -F -L rootfs -d src disk.img");
@@ -207,18 +208,21 @@ fn fat_like(name: &str, mkfs: &str, fsck: &str, expect: &str) {
 #[test]
 #[ignore]
 fn e2e_fat32_real_mkfs() {
+    let _cleanup = Cleanup;
     fat_like("e2e_fat32", "mkfs.fat -F 32 -n BOOTFS", "fsck.fat -n disk.img", "FAT32");
 }
 
 #[test]
 #[ignore]
 fn e2e_exfat_real_mkfs() {
+    let _cleanup = Cleanup;
     fat_like("e2e_exfat", "mkfs.exfat -L SDCARD", "fsck.exfat -n disk.img", "EXFAT");
 }
 
 #[test]
 #[ignore]
 fn e2e_own_images_all_filesystems() {
+    let _cleanup = Cleanup;
     for fs_name in ["EXT4", "FAT32", "EXFAT", "NTFS"] {
         let dir = setup(&format!("e2e_own_{fs_name}"));
         let img = dir.join("new.img");
@@ -242,6 +246,7 @@ fn e2e_own_images_all_filesystems() {
 #[test]
 #[ignore]
 fn e2e_shadow_mode_rollback_and_commit() {
+    let _cleanup = Cleanup;
     let dir = setup("e2e_shadow");
     let img = dir.join("disk.img");
     runtime().create_image(img.to_str().unwrap(), "EXT4", 64, "SHADOW").unwrap();
@@ -299,6 +304,7 @@ fn e2e_shadow_mode_rollback_and_commit() {
 #[test]
 #[ignore]
 fn e2e_read_only_mode() {
+    let _cleanup = Cleanup;
     let dir = setup("e2e_ro");
     let img = dir.join("disk.img");
     runtime().create_image(img.to_str().unwrap(), "FAT32", 64, "RO").unwrap();
@@ -315,6 +321,7 @@ fn e2e_read_only_mode() {
 #[test]
 #[ignore]
 fn e2e_dirty_volume_doctor() {
+    let _cleanup = Cleanup;
     let dir = setup("e2e_dirty");
     make_sparse(&dir.join("disk.img"), 128);
     // FAT32 with the "volume dirty" bit set exactly like Windows leaves it after a crash.
@@ -339,6 +346,7 @@ fn e2e_dirty_volume_doctor() {
 #[test]
 #[ignore]
 fn e2e_raspberry_pi_style_multi_partition_image() {
+    let _cleanup = Cleanup;
     let dir = setup("e2e_rpi");
     make_sparse(&dir.join("rpi.img"), 320);
     // MBR: p1 FAT32 "bootfs" 64 MiB at 4 MiB, p2 ext4 "rootfs" for the rest — like Raspberry Pi OS.
@@ -375,6 +383,7 @@ fn e2e_raspberry_pi_style_multi_partition_image() {
 #[test]
 #[ignore]
 fn e2e_lock_inspector_and_safe_eject() {
+    let _cleanup = Cleanup;
     let dir = setup("e2e_locks");
     let img = dir.join("disk.img");
     runtime().create_image(img.to_str().unwrap(), "EXT4", 64, "LOCKS").unwrap();
@@ -395,6 +404,7 @@ fn e2e_lock_inspector_and_safe_eject() {
 #[test]
 #[ignore]
 fn e2e_ntfs_real_mkntfs() {
+    let _cleanup = Cleanup;
     let dir = setup("e2e_ntfs");
     make_sparse(&dir.join("disk.img"), 256);
     let (c, o) = docker(&dir, "mkntfs -F -Q -L WINDATA disk.img");
@@ -416,6 +426,7 @@ fn e2e_ntfs_real_mkntfs() {
 #[test]
 #[ignore]
 fn workload_on_external_mount() {
+    let _cleanup = Cleanup;
     let Some(mp) = std::env::var_os("LD_MP") else { return };
     workload(Path::new(&mp), std::env::var_os("LD_POSIX").is_some());
 }

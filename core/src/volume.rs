@@ -691,7 +691,13 @@ impl Runtime {
                         // Group commit of the Shadow journal: the stage file is made durable
                         // without holding the volume lock, so NFS writes keep flowing.
                         let job = match &mut lock_stack(&fs3).inner {
-                            Lower::Shadow(s) => s.begin_background_flush(),
+                            Lower::Shadow(s) => {
+                                let job = s.begin_background_flush();
+                                if job.is_none() {
+                                    s.refresh_manifest();
+                                }
+                                job
+                            }
                             Lower::Direct(_) => None,
                         };
                         if let Some(job) = job {

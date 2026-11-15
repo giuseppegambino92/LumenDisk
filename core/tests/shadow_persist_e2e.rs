@@ -68,9 +68,14 @@ fn force_unmount(mp: &Path) {
 }
 
 fn mount(dir: &Path, img: &str, mode: &str) -> Result<Mounted, String> {
+    mount_env(dir, img, mode, &[])
+}
+
+fn mount_env(dir: &Path, img: &str, mode: &str, env: &[(&str, &str)]) -> Result<Mounted, String> {
     let mp = dir.join("mnt").join("Vol");
     let log = std::fs::File::create(dir.join(format!("mount-{}.log", Instant::now().elapsed().as_nanos()))).unwrap();
     let mut child = cli(dir)
+        .envs(env.iter().copied())
         .args(["mount", img, "--mode", mode, "--root"])
         .arg(dir.join("mnt"))
         .args(["--name", "Vol", "--control", "c.sock"])
@@ -251,7 +256,9 @@ fn e2e_kill9_during_commit_then_resume_is_fsck_clean() {
     let dir = workdir("shadow_kill9_commit");
     std::fs::create_dir_all(dir.join("mnt")).unwrap();
     let img = mkfs(&dir, "commit.img", 512);
-    let m = mount(&dir, &img, "shadow").unwrap();
+    // The server parks the commit after its 8th durable checkpoint (inside the content phase),
+    // so the SIGKILL below always lands half-way through, however loaded the machine is.
+    let m = mount_env(&dir, &img, "shadow", &[("LUMENDISK_TEST_STALL_COMMIT_AFTER", "8")]).unwrap();
     let mp = m.mp.clone();
     let mut want: Vec<(String, Vec<u8>)> = vec![];
     for d in 0..30 {

@@ -1194,6 +1194,14 @@ impl ShadowOverlay {
         let _ = self.update_manifest(false);
     }
 
+    /// Timer hook for when no group commit is due: keep the session manifest (the change
+    /// counts shown for sessions that aren't mounted, e.g. after a crash) up to date. Large
+    /// writes flush the journal inline, so the background flush may find nothing to do for a
+    /// long time while the counts keep changing. Rate-limited to once per `MANIFEST_INTERVAL`.
+    pub fn refresh_manifest(&mut self) {
+        let _ = self.update_manifest(false);
+    }
+
     /// Timer hook doing a whole group commit under the caller's lock.
     pub fn tick(&mut self) {
         if let Some(job) = self.begin_background_flush() {
@@ -1546,6 +1554,7 @@ impl ShadowOverlay {
             let b = serde_json::to_vec(&Checkpoint { step: step as u64 }).map_err(json_err)?;
             p.append(&b).map_err(io)?;
             p.sync().map_err(io)?;
+            stall_for_tests();
         }
         run.done = step;
         if let Some(s) = &mut self.sess {
@@ -2142,3 +2151,20 @@ impl FileSystem for ShadowOverlay {
 #[cfg(test)]
 #[path = "shadow_tests.rs"]
 mod tests;
+
+/// Crash tests only: `LUMENDISK_TEST_STALL_COMMIT_AFTER=N` parks the committing thread forever
+/// once the N-th checkpoint of this process is durable, so a test can SIGKILL the server at a
+/// known point of a commit instead of racing it. Unset in normal use (read once).
+fn stall_for_tests() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    let Some(n) = *AFTER.get_or_init(|| std::env::var("LUMENDISK_TEST_STALL_COMMIT_AFTER").ok().and_then(|v| v.parse().ok())) else {
+        return;
+    };
+    if DONE.fetch_add(1, Ordering::SeqCst) + 1 >= n {
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+}
