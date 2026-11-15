@@ -763,7 +763,7 @@ final class AppModel {
 
     /// The saved session of an image file partition, if any.
     func shadowSession(imagePath: String, partition: UInt32) -> ShadowSession? {
-        shadowSessions.first { !$0.isPhysical && !$0.isImageURL && $0.sourcePath == imagePath && $0.partition == partition }
+        shadowSessions.first { !$0.isPhysical && !$0.isImageURL && !$0.isRemote && $0.sourcePath == imagePath && $0.partition == partition }
     }
 
     /// The volume this session is mounted as right now.
@@ -774,6 +774,8 @@ final class AppModel {
     /// Whether the session's disk or image can be mounted right now.
     func isConnected(_ session: ShadowSession) -> Bool {
         if mountedVolume(for: session) != nil { return true }
+        // Servers: only a new Shadow connection (with its credentials) can check and resume them.
+        if session.isRemote { return false }
         if session.isPhysical { return partition(for: session) != nil }
         return session.connected
     }
@@ -785,7 +787,7 @@ final class AppModel {
     /// Activity key used while a session is being resumed or discarded.
     func activityKey(for session: ShadowSession) -> String {
         if let partition = partition(for: session) { return partition.bsdName }
-        return session.isPhysical || session.isImageURL ? "session:" + session.key : "\(session.sourcePath)#\(session.partition)"
+        return session.isPhysical || session.isImageURL || session.isRemote ? "session:" + session.key : "\(session.sourcePath)#\(session.partition)"
     }
 
     /// Mounts the session's source in Shadow mode: the core restores the saved changes, or
@@ -798,6 +800,11 @@ final class AppModel {
             return mounted
         }
         promptedSessions[session.key] = session.promptSignature
+        if session.isRemote {
+            present(L("Connettiti al server in Shadow Mode", "Connect to the server in Shadow Mode"),
+                    message: ShadowWording.remoteResumeHint(session))
+            return nil
+        }
         if session.isImageURL {
             let key = activityKey(for: session)
             setActivity(key, L("Montaggio…", "Mounting…"))

@@ -447,6 +447,12 @@ enum ShadowWording {
                  "The disk was modified elsewhere after the Shadow session started.")
     }
 
+    /// Server sessions can't be resumed from the list: the credentials aren't saved.
+    static func remoteResumeHint(_ session: ShadowSession) -> String {
+        L("Per riprendere le modifiche salvate connettiti di nuovo a «\(session.displayName)» in Shadow Mode: LumenDisk le ripristina e controlla che sul server non sia cambiato nulla.",
+          "To resume the saved changes, connect to “\(session.displayName)” again in Shadow Mode: LumenDisk restores them and checks that nothing changed on the server.")
+    }
+
     static func discardTitle(name: String) -> String {
         L("Scartare le modifiche Shadow su «\(name)»?", "Discard the Shadow changes on “\(name)”?")
     }
@@ -612,7 +618,7 @@ struct ShadowSessionRow: View {
             }
             return L("Disco esterno", "External disk") + (session.size > 0 ? " · " + ByteFormat.string(session.size) : "")
         }
-        if session.isImageURL { return session.sourcePath }
+        if session.isImageURL || session.isRemote { return session.sourcePath }
         let path = (session.sourcePath as NSString).abbreviatingWithTildeInPath
         return session.partition > 0 ? path + " · " + L("Partizione \(session.partition)", "Partition \(session.partition)") : path
     }
@@ -621,12 +627,16 @@ struct ShadowSessionRow: View {
         let connected = model.isConnected(session)
         let busy = model.activity(for: model.activityKey(for: session))
         HStack(alignment: .top, spacing: 12) {
-            IconBadge(systemImage: session.isPhysical ? "externaldrive.fill" : (session.isImageURL ? "globe" : "cylinder.split.1x2.fill"),
-                      tint: connected ? session.filesystem.tint : .gray, size: 34)
+            IconBadge(systemImage: session.remoteKind?.symbol ?? (session.isPhysical ? "externaldrive.fill" : (session.isImageURL ? "globe" : "cylinder.split.1x2.fill")),
+                      tint: connected ? (session.remoteKind?.tint ?? session.filesystem.tint) : .gray, size: 34)
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {
                     Text(session.displayName).font(.body.weight(.semibold)).lineLimit(1)
-                    FilesystemPill(kind: session.filesystem, compact: true)
+                    if let remote = session.remoteKind {
+                        KindPill(kind: remote, compact: true)
+                    } else {
+                        FilesystemPill(kind: session.filesystem, compact: true)
+                    }
                     StatusChip(title: connected ? L("Collegato", "Connected") : L("Non collegato", "Not connected"),
                                systemImage: connected ? "checkmark.circle.fill" : "minus.circle",
                                tint: connected ? .ldGood : .secondary)
@@ -644,6 +654,12 @@ struct ShadowSessionRow: View {
                          + (session.commitError.map { " — " + $0 } ?? ""))
                         .font(.caption)
                         .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if session.isRemote && !connected && !session.isStale {
+                    Text(ShadowWording.remoteResumeHint(session))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if session.isStale {
