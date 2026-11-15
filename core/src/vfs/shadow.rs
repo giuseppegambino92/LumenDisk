@@ -479,7 +479,8 @@ pub struct ShadowOverlay {
 }
 
 impl ShadowOverlay {
-    /// In-memory overlay (changes are lost when it is dropped). Used for remote volumes.
+    /// In-memory overlay (changes are lost when it is dropped). Used for volumes without a
+    /// session identity.
     pub fn new(lower: Box<dyn FileSystem>, stage_path: PathBuf) -> FsResult<Self> {
         if let Some(d) = stage_path.parent() {
             std::fs::create_dir_all(d)?;
