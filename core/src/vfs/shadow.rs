@@ -313,12 +313,18 @@ struct Session {
     /// Created at the first flush (after the manifest).
     journal: Option<RecordLog>,
     pending: Vec<JRec>,
-    /// Sequence number of `pending[0]` (records are numbered from 0 in each session).
+    /// Sequence number of `pending[0]` (records are numbered from 0 in each session). Records
+    /// below it are written to the journal: handed to the kernel, so they survive a crash of
+    /// this process, but not necessarily a power loss.
     pending_base: u64,
+    /// Records below this are durable (journal `F_FULLFSYNC`ed): they survive a power loss.
+    synced: u64,
     /// Distinguishes sessions (a background flush must not complete into a newer one).
     epoch: u64,
     next_start: u64,
     last_flush: Instant,
+    /// When the oldest record of `pending` was buffered.
+    pending_since: Instant,
     stage_dirty: bool,
     counts_dirty: bool,
     last_manifest: Instant,
@@ -345,9 +351,11 @@ impl Session {
             journal: None,
             pending: vec![],
             pending_base: 0,
+            synced: 0,
             epoch: SESSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             next_start: next,
             last_flush: Instant::now(),
+            pending_since: Instant::now(),
             stage_dirty: false,
             counts_dirty: false,
             last_manifest: Instant::now(),
@@ -358,8 +366,9 @@ impl Session {
 
 static SESSION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// A group commit whose expensive part (making the stage file durable) runs without the
-/// volume lock: see [`ShadowOverlay::begin_background_flush`].
+/// First half of a group commit whose expensive parts run without the volume lock (see
+/// [`ShadowOverlay::durable_begin`]): order the stage chunks of the sealed records before
+/// their journal frame.
 pub struct FlushJob {
     stage: File,
     target: u64,
@@ -368,14 +377,39 @@ pub struct FlushJob {
 }
 
 impl FlushJob {
-    /// `F_FULLFSYNC` the stage file (call it without holding the volume lock).
+    /// Barrier-sync the stage file (call it without holding the volume lock).
     pub fn sync_stage(&self) -> std::io::Result<()> {
         if self.dirty {
-            store::full_sync(&self.stage)
+            store::barrier_sync(&self.stage)
         } else {
             Ok(())
         }
     }
+}
+
+/// Second half of a group commit: the frame is written, make it durable.
+pub struct JournalJob {
+    journal: File,
+    target: u64,
+    epoch: u64,
+}
+
+impl JournalJob {
+    /// `F_FULLFSYNC` the journal (call it without holding the volume lock). This also flushes
+    /// the drive cache holding the stage chunks ordered before it by [`FlushJob::sync_stage`].
+    pub fn sync(&self) -> std::io::Result<()> {
+        store::full_sync(&self.journal)
+    }
+}
+
+/// Next step of a group commit (see [`ShadowOverlay::durable_begin`]).
+pub enum Durable {
+    /// Every operation answered so far is durable.
+    Done,
+    /// Run [`FlushJob::sync_stage`] without the lock, then [`ShadowOverlay::durable_after_stage`].
+    Stage(FlushJob),
+    /// Run [`JournalJob::sync`] without the lock, then [`ShadowOverlay::durable_after_journal`].
+    Journal(JournalJob),
 }
 
 fn drift_message(detail: &str) -> String {
@@ -989,9 +1023,14 @@ impl ShadowOverlay {
         if let (Some(op), Some(rc), Some(now)) = (op, rc, now) {
             if r.is_ok() || !rc.assign.is_empty() {
                 let s = self.sess.as_mut().unwrap();
+                if s.pending.is_empty() {
+                    s.pending_since = Instant::now();
+                }
                 s.pending.push(JRec { op, now, ok: r.is_ok(), a: rc.assign, seen: rc.seen });
                 s.counts_dirty = true;
-                let due = s.pending.len() >= FLUSH_RECORDS || s.last_flush.elapsed() >= self.flush_interval * 10;
+                // Safety net under the lock (the group commits normally run without it): too
+                // many buffered records, or the timer hasn't run for far too long.
+                let due = s.pending.len() >= FLUSH_RECORDS || s.pending_since.elapsed() >= self.flush_interval * 10;
                 if due {
                     if let Err(e) = self.flush() {
                         eprintln!("lumendisk: shadow journal: {e}");
@@ -1101,20 +1140,41 @@ impl ShadowOverlay {
     }
 
     // ── durability ──
+    //
+    // Two levels, in this order:
+    // * written: the frame is handed to the kernel (`pwrite`), so it survives SIGKILL / a crash
+    //   of this process (the page cache survives); `pending_base` counts these records;
+    // * synced: the journal is `F_FULLFSYNC`ed, so it survives a power loss; `synced`.
+    // Stage chunks are sealed and barrier-synced before the frame that references them is
+    // written, so a durable frame never points at stage bytes that didn't make it.
 
-    /// Group commit: make every buffered record durable (stage chunks first).
+    /// Group commit under the caller's lock: make every buffered record durable.
     fn flush(&mut self) -> FsResult<()> {
-        self.flush_upto(None, false)
+        let Some(s) = &mut self.sess else { return Ok(()) };
+        let end = s.pending_base + s.pending.len() as u64;
+        if end == s.synced {
+            return Ok(());
+        }
+        if s.stage_dirty {
+            store::barrier_sync(&self.stage).map_err(io)?;
+            s.stage_dirty = false;
+        }
+        // Everything written so far is ordered before the frame: never overwrite it in place.
+        self.unsealed.clear();
+        self.write_frame(end)?;
+        let s = self.sess.as_mut().unwrap();
+        s.journal.as_ref().unwrap().sync().map_err(io)?;
+        self.mark_synced(end);
+        Ok(())
     }
 
-    /// Write records with sequence number < `target` (all if None) as one frame. With
-    /// `stage_synced` the caller already made the stage durable and sealed those chunks.
-    fn flush_upto(&mut self, target: Option<u64>, stage_synced: bool) -> FsResult<()> {
+    /// Append the buffered records with sequence number < `target` as one frame (written, not
+    /// yet synced). Their stage chunks must be sealed and ordered before it.
+    fn write_frame(&mut self, target: u64) -> FsResult<()> {
         let (first, k) = match &self.sess {
             Some(s) => {
                 let end = s.pending_base + s.pending.len() as u64;
-                let t = target.unwrap_or(end).min(end);
-                (s.journal.is_none(), t.saturating_sub(s.pending_base) as usize)
+                (s.journal.is_none(), target.min(end).saturating_sub(s.pending_base) as usize)
             }
             None => return Ok(()),
         };
@@ -1137,35 +1197,95 @@ impl ShadowOverlay {
             j.append(&h).map_err(io)?;
             s.journal = Some(j);
         }
-        if !stage_synced {
-            if s.stage_dirty {
-                store::full_sync(&self.stage).map_err(io)?;
-                s.stage_dirty = false;
-            }
-            // Everything written so far is durable now: never overwrite it in place again.
-            self.unsealed.clear();
-        }
         let recs: Vec<JRec> = s.pending.drain(..k).collect();
         let batch = Frame::Batch(recs);
         let payload = serde_json::to_vec(&batch).map_err(json_err);
         let Frame::Batch(recs) = batch else { unreachable!() };
         let j = s.journal.as_mut().unwrap();
-        if let Err(e) = payload.and_then(|p| j.append(&p).and_then(|_| j.sync()).map_err(io)) {
+        if let Err(e) = payload.and_then(|p| j.append(&p).map_err(io)) {
             s.pending.splice(0..0, recs);
             return Err(e);
         }
         s.pending_base += k as u64;
         s.last_flush = Instant::now();
-        let durable = s.pending_base;
-        let (now_free, still): (Vec<_>, Vec<_>) = self.pending_free.drain(..).partition(|(seq, _)| *seq < durable);
-        self.pending_free = still;
-        self.free.extend(now_free.into_iter().map(|x| x.1));
         Ok(())
     }
 
-    /// First half of a timer group commit (under the volume lock): seal the chunks of the
-    /// buffered records. Then call [`FlushJob::sync_stage`] without the lock, and
-    /// [`ShadowOverlay::finish_background_flush`] with it.
+    /// Records below `upto` are durable: the chunks they released may be reused.
+    fn mark_synced(&mut self, upto: u64) {
+        let Some(s) = &mut self.sess else { return };
+        s.synced = s.synced.max(upto.min(s.pending_base));
+        let durable = s.synced;
+        let (now_free, still): (Vec<_>, Vec<_>) = self.pending_free.drain(..).partition(|(seq, _)| *seq < durable);
+        self.pending_free = still;
+        self.free.extend(now_free.into_iter().map(|x| x.1));
+    }
+
+    fn journal_job(&self, target: u64) -> FsResult<Durable> {
+        let s = self.sess.as_ref().unwrap();
+        if s.synced >= target {
+            return Ok(Durable::Done);
+        }
+        let journal = s.journal.as_ref().ok_or_else(|| FsError::Io("shadow journal: missing".into()))?.clone_file().map_err(io)?;
+        Ok(Durable::Journal(JournalJob { journal, target, epoch: s.epoch }))
+    }
+
+    /// Group commit with the expensive parts outside the volume lock. Under the lock, this
+    /// seals the stage chunks of every operation answered so far. The caller then alternates
+    /// (see `volume.rs`): run the returned job without the lock, call the matching
+    /// `durable_after_*` with it, until [`Durable::Done`]. Operations that run in between are
+    /// not covered (the next round takes them); rounds may overlap safely, since each one only
+    /// writes records it sealed, after ordering their chunks.
+    pub fn durable_begin(&mut self) -> FsResult<Durable> {
+        let Some(s) = &mut self.sess else { return Ok(Durable::Done) };
+        if !s.armed {
+            return Ok(Durable::Done);
+        }
+        let end = s.pending_base + s.pending.len() as u64;
+        if end == s.synced {
+            return Ok(Durable::Done);
+        }
+        if s.stage_dirty && !s.pending.is_empty() {
+            let stage = self.stage.try_clone().map_err(io)?;
+            let job = FlushJob { stage, target: end, epoch: s.epoch, dirty: true };
+            s.stage_dirty = false;
+            self.unsealed.clear();
+            return Ok(Durable::Stage(job));
+        }
+        self.unsealed.clear();
+        self.write_frame(end)?;
+        self.journal_job(end)
+    }
+
+    /// The stage chunks of `job` are ordered: write their records' frame (from here on they
+    /// survive a crash of this process).
+    pub fn durable_after_stage(&mut self, job: FlushJob, synced: std::io::Result<()>) -> FsResult<Durable> {
+        let Some(s) = &mut self.sess else { return Ok(Durable::Done) };
+        if s.epoch != job.epoch {
+            return Ok(Durable::Done); // committed or discarded meanwhile
+        }
+        if let Err(e) = synced {
+            s.stage_dirty = true;
+            return Err(io(e));
+        }
+        self.write_frame(job.target)?;
+        self.journal_job(job.target)
+    }
+
+    /// The journal holding `job`'s frame is synced: those records survive a power loss.
+    pub fn durable_after_journal(&mut self, job: JournalJob, synced: std::io::Result<()>) -> FsResult<()> {
+        match &self.sess {
+            Some(s) if s.epoch == job.epoch => {}
+            _ => return Ok(()),
+        }
+        synced.map_err(io)?;
+        self.mark_synced(job.target);
+        Ok(())
+    }
+
+    /// Timer flavour of [`ShadowOverlay::durable_begin`] (tests): only when records are
+    /// pending and the group-commit interval has passed. Call [`FlushJob::sync_stage`] without
+    /// the lock, then [`ShadowOverlay::finish_background_flush`] with it.
     pub fn begin_background_flush(&mut self) -> Option<FlushJob> {
         let s = self.sess.as_mut()?;
         if s.pending.is_empty() || !s.armed || s.last_flush.elapsed() < self.flush_interval {
@@ -1178,26 +1298,26 @@ impl ShadowOverlay {
         Some(job)
     }
 
+    /// Second half of [`ShadowOverlay::begin_background_flush`] (syncs the journal under the
+    /// caller's lock).
     pub fn finish_background_flush(&mut self, job: FlushJob, synced: std::io::Result<()>) {
-        let Some(s) = &mut self.sess else { return };
-        if s.epoch != job.epoch {
-            return;
-        }
-        if let Err(e) = synced {
-            s.stage_dirty = true;
-            eprintln!("lumendisk: shadow stage: {e}");
-            return;
-        }
-        if let Err(e) = self.flush_upto(Some(job.target), true) {
+        let r = match self.durable_after_stage(job, synced) {
+            Ok(Durable::Journal(j)) => {
+                let r = j.sync();
+                self.durable_after_journal(j, r)
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = r {
             eprintln!("lumendisk: shadow journal: {e}");
         }
         let _ = self.update_manifest(false);
     }
 
-    /// Timer hook for when no group commit is due: keep the session manifest (the change
-    /// counts shown for sessions that aren't mounted, e.g. after a crash) up to date. Large
-    /// writes flush the journal inline, so the background flush may find nothing to do for a
-    /// long time while the counts keep changing. Rate-limited to once per `MANIFEST_INTERVAL`.
+    /// Timer hook: keep the session manifest (the change counts shown for sessions that
+    /// aren't mounted, e.g. after a crash) up to date. Rate-limited to once per
+    /// `MANIFEST_INTERVAL`.
     pub fn refresh_manifest(&mut self) {
         let _ = self.update_manifest(false);
     }

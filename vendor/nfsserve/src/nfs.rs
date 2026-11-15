@@ -91,6 +91,19 @@ pub type cookie3 = u64;
 pub type cookieverf3 = [opaque; NFS3_COOKIEVERFSIZE as usize];
 pub type createverf3 = [opaque; NFS3_CREATEVERFSIZE as usize];
 pub type writeverf3 = [opaque; NFS3_WRITEVERFSIZE as usize];
+
+/// How durable a WRITE must be before the reply (RFC 1813 §3.3.7).
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum stable_how {
+    #[default]
+    UNSTABLE = 0,
+    DATA_SYNC = 1,
+    FILE_SYNC = 2,
+}
+xdr_enum_serde!(stable_how);
+
 pub type uid3 = u32;
 pub type gid3 = u32;
 pub type size3 = u64;

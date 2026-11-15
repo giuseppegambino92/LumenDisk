@@ -1035,3 +1035,42 @@ fn background_flush_covers_only_the_sealed_records() {
     assert_eq!(full_view(&mut r).0, sealed.0);
     assert_eq!(r.read(f, 0, 100_000).unwrap(), vec![1u8; 70_000]);
 }
+
+/// The group commit the NFS server runs before stable replies: its lock-free phases cover
+/// exactly the operations done before it started, while the volume keeps changing.
+#[test]
+fn durable_rounds_cover_the_operations_answered_before_them() {
+    let (dev, _) = setup();
+    let dir = tmp("durable").join("s");
+    let mut s = session(&dev, &dir);
+    let root = s.root_ino();
+    assert!(matches!(s.durable_begin().unwrap(), Durable::Done), "nothing to do yet");
+    let f = s.create(root, "f", 0o644, 0, 0).unwrap();
+    s.write(f, 0, &[1u8; 70_000]).unwrap();
+    s.mkdir(root, "d", 0o755, 0, 0).unwrap();
+    let sealed = full_view(&mut s);
+    let Durable::Stage(job) = s.durable_begin().unwrap() else { panic!("staged data must be ordered first") };
+    // Without the lock, while the stage is synced, the volume keeps changing.
+    s.write(f, 0, &[2u8; 70_000]).unwrap();
+    s.create(root, "later", 0o644, 0, 0).unwrap();
+    let r = job.sync_stage();
+    let Durable::Journal(j) = s.durable_after_stage(job, r).unwrap() else { panic!("the frame must be synced") };
+    s.rename(root, "d", root, "d2").unwrap();
+    let r = j.sync();
+    s.durable_after_journal(j, r).unwrap();
+    s.simulate_crash();
+
+    let mut r = session(&dev, &dir);
+    assert_eq!(full_view(&mut r).0, sealed.0);
+    assert_eq!(r.read(f, 0, 100_000).unwrap(), vec![1u8; 70_000]);
+    // A metadata-only round has no stage to order: straight to the journal.
+    r.mkdir(root, "m", 0o755, 0, 0).unwrap();
+    let Durable::Journal(j) = r.durable_begin().unwrap() else { panic!("metadata only: no stage job") };
+    let res = j.sync();
+    r.durable_after_journal(j, res).unwrap();
+    assert!(matches!(r.durable_begin().unwrap(), Durable::Done));
+    let want = full_view(&mut r).0;
+    r.simulate_crash();
+    let mut r = session(&dev, &dir);
+    assert_eq!(full_view(&mut r).0, want);
+}

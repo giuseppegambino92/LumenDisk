@@ -66,7 +66,7 @@ pub struct WalStats {
 }
 
 struct State {
-    log: File,
+    /// End of the log, including a record being written by the flush in progress.
     log_len: u64,
     seq: u64,
     /// Committed (complete-transaction) dirty blocks not yet in the WAL.
@@ -74,7 +74,8 @@ struct State {
     /// Blocks written by the transaction in progress.
     txn: BTreeMap<u64, Box<[u8]>>,
     in_txn: u32,
-    last_flush: Instant,
+    /// When `committed` last went from empty to non-empty.
+    committed_since: Instant,
     stats: WalStats,
     fault: Option<Fault>,
     dead: bool,
@@ -86,12 +87,20 @@ struct State {
     /// the last durable metadata may still reference them, so no in-place payload yet.
     freed_txn: std::collections::HashSet<u64>,
     freed_committed: std::collections::HashSet<u64>,
+    /// Blocks of the record being flushed (written to the log, then in place, without this
+    /// lock): reads and new transactions see them until they are in place.
+    flushing: BTreeMap<u64, Box<[u8]>>,
+    freed_flushing: std::collections::HashSet<u64>,
 }
 
 pub struct WalDev {
     inner: Arc<dyn BlockDev>,
     path: PathBuf,
+    log: File,
     st: Mutex<State>,
+    /// One flush at a time: records reach the log, the device and a checkpoint in order.
+    /// Lock order: the volume lock (if any) → `flush_lock` → `st`.
+    flush_lock: Mutex<()>,
 }
 
 impl WalDev {
@@ -127,14 +136,15 @@ impl WalDev {
         Ok(Arc::new(WalDev {
             inner,
             path: path.to_path_buf(),
+            log,
+            flush_lock: Mutex::new(()),
             st: Mutex::new(State {
-                log,
                 log_len: HDR_LEN,
                 seq: 1,
                 committed: BTreeMap::new(),
                 txn: BTreeMap::new(),
                 in_txn: 0,
-                last_flush: Instant::now(),
+                committed_since: Instant::now(),
                 stats: WalStats { enabled: true, mode: "ordered", replayed_at_mount: replayed, ..Default::default() },
                 fault: None,
                 dead: false,
@@ -142,6 +152,8 @@ impl WalDev {
                 wal_blocks: Default::default(),
                 freed_txn: Default::default(),
                 freed_committed: Default::default(),
+                flushing: BTreeMap::new(),
+                freed_flushing: Default::default(),
             }),
         }))
     }
@@ -212,88 +224,153 @@ impl WalDev {
 
     /// End a transaction. Group-commits when the batch is old/large enough or `force`.
     pub fn commit(&self, force: bool) -> io::Result<()> {
-        let mut s = self.st.lock().unwrap();
-        if s.in_txn > 0 {
-            s.in_txn -= 1;
-        }
-        if s.in_txn > 0 {
-            return Ok(());
-        }
-        let txn = std::mem::take(&mut s.txn);
-        if !txn.is_empty() {
-            s.stats.transactions += 1;
-        }
-        let ft = std::mem::take(&mut s.freed_txn);
-        s.freed_committed.extend(ft);
-        for (k, v) in txn {
-            s.committed.insert(k, v);
-        }
-        let due = force || s.last_flush.elapsed() >= BATCH_INTERVAL || s.committed.len() * BS as usize >= BATCH_BYTES;
+        let due = {
+            let mut s = self.st.lock().unwrap();
+            if s.in_txn > 0 {
+                s.in_txn -= 1;
+            }
+            if s.in_txn > 0 {
+                return Ok(());
+            }
+            let txn = std::mem::take(&mut s.txn);
+            if !txn.is_empty() {
+                s.stats.transactions += 1;
+            }
+            let ft = std::mem::take(&mut s.freed_txn);
+            s.freed_committed.extend(ft);
+            if s.committed.is_empty() && !txn.is_empty() {
+                s.committed_since = Instant::now();
+            }
+            for (k, v) in txn {
+                s.committed.insert(k, v);
+            }
+            // The volume's timer group-commits every BATCH_INTERVAL without the volume lock
+            // (`make_durable`); flushing here, inside an operation, is the safety net for a big
+            // batch or a timer that didn't run.
+            force || s.committed_since.elapsed() >= BATCH_INTERVAL * 10 || s.committed.len() * BS as usize >= BATCH_BYTES
+        };
         if due {
-            self.flush_locked(&mut s, force)?;
+            // A batch flush that finds another flush running leaves its blocks to the next one.
+            self.flush_round(force, force)?;
         }
         Ok(())
     }
 
-    fn flush_locked(&self, s: &mut State, checkpoint: bool) -> io::Result<()> {
-        s.last_flush = Instant::now();
-        if s.dead {
-            return Ok(());
-        }
-        if !s.committed.is_empty() {
-            if s.fault == Some(Fault::CrashBeforeWal) {
+    /// Make every complete transaction durable (payload first, then the redo record), with
+    /// the volume lock *not* held: the cache flushes run without `st`, so the volume keeps
+    /// serving I/O meanwhile. Transactions completed while it runs are left to the next call.
+    pub fn make_durable(&self) -> io::Result<()> {
+        self.flush_round(false, true)
+    }
+
+    /// One group commit: (1) under `st`, take the complete transactions as one record;
+    /// (2) without it, flush the payload written in place (ordered mode), append the record
+    /// and `F_FULLFSYNC` the log, write the blocks in place; (3) checkpoint if asked or due.
+    /// `wait`: wait for a flush already running instead of leaving the work to it.
+    fn flush_round(&self, checkpoint: bool, wait: bool) -> io::Result<()> {
+        let _round = if wait {
+            self.flush_lock.lock().unwrap_or_else(|e| e.into_inner())
+        } else {
+            match self.flush_lock.try_lock() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            }
+        };
+        let (rec, data_dirty, at) = {
+            let mut s = self.st.lock().unwrap();
+            if s.dead {
+                return Ok(());
+            }
+            if !s.committed.is_empty() && s.fault == Some(Fault::CrashBeforeWal) {
                 s.dead = true;
                 return Ok(());
             }
-            // Ordered mode: payload referenced by this metadata must be durable first.
-            if s.data_dirty {
-                self.inner.flush()?;
-                s.data_dirty = false;
-            }
-            let blocks = std::mem::take(&mut s.committed);
-            let mut payload = Vec::with_capacity(blocks.len() * (8 + BS as usize));
-            for (k, v) in &blocks {
-                payload.extend_from_slice(&k.to_le_bytes());
-                payload.extend_from_slice(v);
-            }
-            let mut rec = Vec::with_capacity(REC_HDR + payload.len());
-            rec.extend_from_slice(REC_MAGIC);
-            rec.extend_from_slice(&s.seq.to_le_bytes());
-            rec.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
-            rec.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-            rec.extend_from_slice(&crc32c(&payload).to_le_bytes());
-            rec.extend_from_slice(&payload);
-            s.log.write_all_at(&rec, s.log_len)?;
-            s.log.sync_data()?; // the record is durable before anything is written in place
-            s.log_len += rec.len() as u64;
-            s.stats.wal_bytes += rec.len() as u64;
-            s.freed_committed.clear();
-            s.seq += 1;
-            for k in blocks.keys() {
-                s.wal_blocks.insert(*k);
-            }
-            s.stats.flushes += 1;
-            let limit = match s.fault {
-                Some(Fault::CrashAfterWal { apply_blocks }) => Some(apply_blocks),
-                _ => None,
-            };
-            for (i, (k, v)) in blocks.iter().enumerate() {
-                if limit.map(|l| i >= l).unwrap_or(false) {
-                    s.dead = true;
-                    return Ok(());
+            let data_dirty = std::mem::take(&mut s.data_dirty);
+            if s.committed.is_empty() {
+                (None, data_dirty, 0)
+            } else {
+                let blocks = std::mem::take(&mut s.committed);
+                let mut payload = Vec::with_capacity(blocks.len() * (8 + BS as usize));
+                for (k, v) in &blocks {
+                    payload.extend_from_slice(&k.to_le_bytes());
+                    payload.extend_from_slice(v);
                 }
-                Self::write_block_clipped(self.inner.as_ref(), *k, v)?;
+                let mut rec = Vec::with_capacity(REC_HDR + payload.len());
+                rec.extend_from_slice(REC_MAGIC);
+                rec.extend_from_slice(&s.seq.to_le_bytes());
+                rec.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+                rec.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+                rec.extend_from_slice(&crc32c(&payload).to_le_bytes());
+                rec.extend_from_slice(&payload);
+                for k in blocks.keys() {
+                    s.wal_blocks.insert(*k);
+                }
+                let freed = std::mem::take(&mut s.freed_committed);
+                s.freed_flushing.extend(freed);
+                s.flushing = blocks;
+                let at = s.log_len;
+                s.log_len += rec.len() as u64;
+                s.seq += 1;
+                (Some(rec), data_dirty, at)
             }
+        };
+        // Ordered mode: payload referenced by this metadata is durable before the record. When
+        // the image lives on the same device as the log, a barrier suffices: the log's full
+        // sync below flushes the drive cache for both.
+        let r = (|| {
+            if data_dirty && (rec.is_none() || !self.inner.barrier_before(&self.log)?) {
+                self.inner.flush()?;
+            }
+            if let Some(rec) = &rec {
+                self.log.write_all_at(rec, at)?;
+                self.log.sync_data()?; // the record is durable before anything is written in place
+            }
+            Ok(())
+        })();
+        if let Err(e) = r {
+            self.undo_round(rec.is_some(), data_dirty, at);
+            return Err(e);
+        }
+        if let Some(rec) = rec {
+            let limit = {
+                let mut s = self.st.lock().unwrap();
+                s.stats.wal_bytes += rec.len() as u64;
+                s.stats.flushes += 1;
+                match s.fault {
+                    Some(Fault::CrashAfterWal { apply_blocks }) => Some(apply_blocks),
+                    _ => None,
+                }
+            };
+            let payload = &rec[REC_HDR..];
+            for (i, b) in payload.chunks_exact(8 + BS as usize).enumerate() {
+                if limit.map(|l| i >= l).unwrap_or(false) {
+                    break;
+                }
+                let k = u64::from_le_bytes(b[..8].try_into().unwrap());
+                if let Err(e) = Self::write_block_clipped(self.inner.as_ref(), k, &b[8..]) {
+                    // The record is durable (a replay would apply it): keep the blocks in the
+                    // overlay so that the next flush journals them again.
+                    let mut s = self.st.lock().unwrap();
+                    Self::requeue(&mut s);
+                    return Err(e);
+                }
+            }
+            let mut s = self.st.lock().unwrap();
             if limit.is_some() {
                 s.dead = true;
                 return Ok(());
             }
+            s.flushing.clear();
+            s.freed_flushing.clear();
         }
+        let mut s = self.st.lock().unwrap();
         if checkpoint || s.log_len > CHECKPOINT_BYTES {
+            // Under `st`: nothing is written in place while the device is flushed.
             self.inner.flush()?;
             if s.log_len > HDR_LEN {
-                s.log.set_len(HDR_LEN)?;
-                s.log.sync_data()?;
+                self.log.set_len(HDR_LEN)?;
+                self.log.sync_data()?;
                 s.log_len = HDR_LEN;
             }
             s.wal_blocks.clear();
@@ -302,18 +379,41 @@ impl WalDev {
         Ok(())
     }
 
+    /// A flush failed before its record was durable: put everything back for the next one.
+    fn undo_round(&self, had_record: bool, data_dirty: bool, at: u64) {
+        let mut s = self.st.lock().unwrap();
+        s.data_dirty |= data_dirty;
+        if had_record {
+            Self::requeue(&mut s);
+            s.log_len = at;
+            s.seq -= 1;
+            let _ = self.log.set_len(at);
+        }
+    }
+
+    fn requeue(s: &mut State) {
+        let blocks = std::mem::take(&mut s.flushing);
+        for (k, v) in blocks {
+            s.committed.entry(k).or_insert(v); // a newer committed version wins
+        }
+        let freed = std::mem::take(&mut s.freed_flushing);
+        s.freed_committed.extend(freed);
+    }
+
     /// Flush everything and checkpoint (unmount).
     pub fn flush_all(&self) -> io::Result<()> {
-        let mut s = self.st.lock().unwrap();
-        let txn = std::mem::take(&mut s.txn);
-        for (k, v) in txn {
-            s.committed.insert(k, v);
+        {
+            let mut s = self.st.lock().unwrap();
+            let txn = std::mem::take(&mut s.txn);
+            for (k, v) in txn {
+                s.committed.insert(k, v);
+            }
         }
-        self.flush_locked(&mut s, true)
+        self.flush_round(true, true)
     }
 
     fn overlay_block(s: &State, blk: u64) -> Option<&[u8]> {
-        s.txn.get(&blk).or_else(|| s.committed.get(&blk)).map(|b| &b[..])
+        s.txn.get(&blk).or_else(|| s.committed.get(&blk)).or_else(|| s.flushing.get(&blk)).map(|b| &b[..])
     }
 }
 
@@ -364,7 +464,7 @@ impl BlockDev for WalDev {
         for b in first..=last {
             let bstart = b * BS;
             if !s.txn.contains_key(&b) {
-                let base: Box<[u8]> = match s.committed.get(&b) {
+                let base: Box<[u8]> = match s.committed.get(&b).or_else(|| s.flushing.get(&b)) {
                     Some(c) => c.clone(),
                     None => {
                         let mut v = vec![0u8; BS as usize];
@@ -414,9 +514,11 @@ impl BlockDev for WalDev {
             for b in first..=last {
                 let j = s.txn.contains_key(&b)
                     || s.committed.contains_key(&b)
+                    || s.flushing.contains_key(&b)
                     || s.wal_blocks.contains(&b)
                     || s.freed_txn.contains(&b)
-                    || s.freed_committed.contains(&b);
+                    || s.freed_committed.contains(&b)
+                    || s.freed_flushing.contains(&b);
                 let a = offset.max(b * BS);
                 let z = end.min((b + 1) * BS);
                 match segs.last_mut() {
@@ -461,11 +563,10 @@ impl BlockDev for WalDev {
 
     fn flush(&self) -> io::Result<()> {
         // Driver-level flush = durable point: push complete transactions through the WAL.
-        let mut s = self.st.lock().unwrap();
-        if s.in_txn > 0 {
+        if self.st.lock().unwrap().in_txn > 0 {
             return Ok(()); // the enclosing commit flushes
         }
-        self.flush_locked(&mut s, true)
+        self.flush_round(true, true)
     }
 
     fn read_only(&self) -> bool {
@@ -731,5 +832,62 @@ mod tests {
         assert!(fs.lookup(root, "salvato").is_ok());
         assert_eq!(fs.lookup(root, "perso"), Err(FsError::NotFound));
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// The NFS server's group commit (`make_durable`) runs on another thread, without the
+    /// volume lock, while operations keep changing the same blocks: whatever it made durable
+    /// survives a crash, and reads never see a block between the log and its place.
+    #[test]
+    fn make_durable_beside_running_operations() {
+        for t in [FsType::Ext4, FsType::Fat32] {
+            let mem: Arc<dyn BlockDev> = Arc::new(MemDev::new(64 << 20));
+            format(mem.clone(), t, "LIVE").unwrap();
+            let p = tmp(&format!("live{t:?}"));
+            let mut n = 0;
+            {
+                let wal = WalDev::open(mem.clone(), &p, "x").unwrap();
+                let drv = open_fs(wal.clone(), false, MountDefaults::default()).unwrap();
+                let mut j = Journaled { inner: drv, wal: wal.clone() };
+                use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+                let stop = Arc::new(AtomicBool::new(false));
+                let rounds = Arc::new(AtomicU64::new(0));
+                let (w2, s2, r2) = (wal.clone(), stop.clone(), rounds.clone());
+                let flusher = std::thread::spawn(move || {
+                    while !s2.load(SeqCst) {
+                        w2.make_durable().unwrap();
+                        r2.fetch_add(1, SeqCst);
+                    }
+                });
+                let root = j.root_ino();
+                let d = j.mkdir(root, "dati", 0o755, 0, 0).unwrap();
+                while n < 300 || rounds.load(SeqCst) < 100 && n < 5000 {
+                    let i = n;
+                    let f = j.create(d, &format!("file {i}.txt"), 0o644, 0, 0).unwrap();
+                    j.write(f, 0, &testutil::pattern(3000 + i * 7, i as u32)).unwrap();
+                    n += 1;
+                    if i % 50 == 0 {
+                        // reads see every block, wherever it is in its flush
+                        assert_eq!(j.readdir(d).unwrap().len(), n);
+                    }
+                }
+                stop.store(true, SeqCst);
+                flusher.join().unwrap();
+                assert!(rounds.load(SeqCst) >= 100, "{} rounds", rounds.load(SeqCst));
+                wal.make_durable().unwrap(); // what a stable reply waits for
+                wal.inject_fault(Fault::CrashBeforeWal); // then the process dies
+                std::mem::forget(j);
+                std::mem::forget(wal);
+            }
+            drop(WalDev::open(mem.clone(), &p, "x").unwrap());
+            let mut fs = open_fs(mem, false, MountDefaults::default()).unwrap();
+            let root = fs.root_ino();
+            let d = fs.lookup(root, "dati").unwrap();
+            assert_eq!(fs.readdir(d).unwrap().len(), n);
+            for i in 0..n {
+                let f = fs.lookup(d, &format!("file {i}.txt")).unwrap();
+                assert_eq!(fs.read(f, 0, 1 << 20).unwrap(), testutil::pattern(3000 + i * 7, i as u32), "{t:?} file {i}");
+            }
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }

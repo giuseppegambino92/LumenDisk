@@ -127,6 +127,25 @@ pub trait NFSFileSystem: Sync {
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
 
+    /// LumenDisk patch: WRITE with its `stable` argument (RFC 1813 §3.3.7). Returns the
+    /// attributes and the stability actually reached (at least `stable`, or UNSTABLE when
+    /// `stable` is UNSTABLE). The default keeps upstream's behaviour.
+    async fn write_stable(&self, id: fileid3, offset: u64, data: &[u8], _stable: stable_how) -> Result<(fattr3, stable_how), nfsstat3> {
+        self.write(id, offset, data).await.map(|a| (a, stable_how::FILE_SYNC))
+    }
+
+    /// LumenDisk patch: COMMIT (RFC 1813 §3.3.21): make every WRITE of `id` answered UNSTABLE
+    /// so far durable, then return the file's attributes.
+    async fn commit(&self, id: fileid3, _offset: u64, _count: u32) -> Result<fattr3, nfsstat3> {
+        self.getattr(id).await
+    }
+
+    /// LumenDisk patch: verifier returned by WRITE and COMMIT. It must change whenever the
+    /// server may have lost UNSTABLE writes (a restart), so clients resend them.
+    fn write_verifier(&self) -> writeverf3 {
+        self.serverid()
+    }
+
     /// Creates a file with the following attributes.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)

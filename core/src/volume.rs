@@ -12,9 +12,9 @@ use crate::block::{self, BlockDev, CachedRangeDev, PartitionDev};
 use crate::remote::cache::{RemoteConfig, RemoteHandle, RemoteHealth, RemoteVfs};
 use crate::remote::RemoteBackend;
 use crate::wal::{Journaled, WalDev, WalStats};
-use crate::nfs_loopback::{self, ChangeTracker, LoopbackServer, NfsBridge};
+use crate::nfs_loopback::{self, ChangeTracker, GroupCommit, LoopbackServer, NfsBridge};
 use crate::vfs::ghost::{GhostEntry, GhostRules, GhostShield};
-use crate::vfs::shadow::{ShadowChange, ShadowOverlay, ShadowSummary};
+use crate::vfs::shadow::{Durable, ShadowChange, ShadowOverlay, ShadowSummary};
 use crate::vfs::shadow_store::{self, Identity, Manifest};
 use crate::vfs::uidmap::{self, PermissionBridge, SharedUidMap, UidMap};
 use crate::vfs::*;
@@ -100,6 +100,39 @@ impl FileSystem for Lower {
 }
 
 pub type Stack = GhostShield<Lower>;
+
+/// Group commit of a persistent Shadow session: stage barrier and journal `F_FULLFSYNC` run
+/// without the volume lock (see [`ShadowOverlay::durable_begin`]).
+fn shadow_group_commit(fs: &Arc<Mutex<Stack>>) -> Arc<GroupCommit> {
+    let fs = fs.clone();
+    GroupCommit::new(Box::new(move || {
+        let e = |e: FsError| format!("Shadow journal: {e}");
+        let mut step = match &mut lock_stack(&fs).inner {
+            Lower::Shadow(s) => s.durable_begin().map_err(e)?,
+            Lower::Direct(_) => return Ok(()),
+        };
+        loop {
+            step = match step {
+                Durable::Done => return Ok(()),
+                Durable::Stage(job) => {
+                    let r = job.sync_stage();
+                    match &mut lock_stack(&fs).inner {
+                        Lower::Shadow(s) => s.durable_after_stage(job, r).map_err(e)?,
+                        Lower::Direct(_) => return Ok(()),
+                    }
+                }
+                Durable::Journal(job) => {
+                    let r = job.sync();
+                    match &mut lock_stack(&fs).inner {
+                        Lower::Shadow(s) => s.durable_after_journal(job, r).map_err(e)?,
+                        Lower::Direct(_) => {}
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }))
+}
 
 // ───────────────────────────── requests / status ─────────────────────────────
 
@@ -647,13 +680,23 @@ impl Runtime {
         if let Some(icon) = req.volume_icon.as_ref().and_then(|p| std::fs::read(p).ok()) {
             stack.install_volume_icon(icon);
         }
+        let persistent_shadow = matches!(&stack.inner, Lower::Shadow(s) if s.is_persistent());
         let fs = Arc::new(Mutex::new(stack));
 
         let want_ro = req.mode == MountMode::ReadOnly;
         let nfs_ro = want_ro || (forced_ro.is_some() && req.mode != MountMode::Shadow);
         let fsid = u64::from_str_radix(&id[..12], 16).unwrap_or(0x1d);
         let tracker = Arc::new(ChangeTracker::default());
-        let bridge = NfsBridge::new(fs.clone(), nfs_ro, fsid, tracker.clone());
+        let group = if nfs_ro {
+            None
+        } else if persistent_shadow {
+            Some(shadow_group_commit(&fs))
+        } else if req.mode != MountMode::Shadow {
+            wal.clone().map(|w| GroupCommit::new(Box::new(move || w.make_durable().map_err(|e| format!("journal: {e}")))))
+        } else {
+            None // in-memory Shadow overlay: nothing is meant to survive
+        };
+        let bridge = NfsBridge::new(fs.clone(), nfs_ro, fsid, tracker.clone()).with_durability(group.clone());
         let server = nfs_loopback::start_server(&self.rt, bridge).map_err(|e| format!("NFS server: {e}"))?;
 
         let root = req.mount_root.as_ref().map(PathBuf::from).unwrap_or_else(nfs_loopback::default_mount_root);
@@ -683,29 +726,22 @@ impl Runtime {
                 tokio::time::sleep(crate::vfs::shadow::FLUSH_INTERVAL).await;
                 n = n.wrapping_add(1);
                 let fs3 = fs2.clone();
-                let full = n % 30 == 0;
-                let _ = tokio::task::spawn_blocking(move || {
-                    if full {
+                if n % 30 == 0 {
+                    let _ = tokio::task::spawn_blocking(move || {
                         let _ = lock_stack(&fs3).sync();
-                    } else {
-                        // Group commit of the Shadow journal: the stage file is made durable
-                        // without holding the volume lock, so NFS writes keep flowing.
-                        let job = match &mut lock_stack(&fs3).inner {
-                            Lower::Shadow(s) => {
-                                let job = s.begin_background_flush();
-                                if job.is_none() {
-                                    s.refresh_manifest();
-                                }
-                                job
-                            }
-                            Lower::Direct(_) => None,
-                        };
-                        if let Some(job) = job {
-                            let r = job.sync_stage();
-                            if let Lower::Shadow(s) = &mut lock_stack(&fs3).inner {
-                                s.finish_background_flush(job, r);
-                            }
-                        }
+                    })
+                    .await;
+                    continue;
+                }
+                // Group commit of what was written UNSTABLE meanwhile (and not COMMITted yet),
+                // sharing rounds with the stable requests: the cache flushes run without the
+                // volume lock, so NFS requests keep flowing.
+                if let Some(g) = &group {
+                    let _ = g.wait().await;
+                }
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Lower::Shadow(s) = &mut lock_stack(&fs3).inner {
+                        s.refresh_manifest();
                     }
                 })
                 .await;
