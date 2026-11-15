@@ -123,10 +123,19 @@ OUT=$(cargo test -q --release -p lumendisk-core --test lan_server 2>&1) || { ech
 ok "$(summary_of "$OUT")"; record "LAN server" "$(summary_of "$OUT")"
 
 bold "Swift 6 app (universal)"
-( cd macos && swift build -q -c release --arch arm64 --arch x86_64 2>&1 | grep -v -E 'deprecated|^$' || true )
+# Remove any binary left by an earlier build first, so the one checked below can only come
+# from this build; the build's own exit status decides, the output is filtered separately.
 BIN="macos/.build/out/Products/Release/LumenDisk"
+find macos/.build -path '*Release*' -name LumenDisk -type f -delete 2>/dev/null
+SWIFT_LOG="$(mktemp -t lumendisk-swift)"
+SWIFT_RC=0
+( cd macos && swift build -q -c release --arch arm64 --arch x86_64 ) > "$SWIFT_LOG" 2>&1 || SWIFT_RC=$?
+grep -v -E 'deprecated|^$' "$SWIFT_LOG" || :
+rm -f "$SWIFT_LOG"
+[ "$SWIFT_RC" = 0 ] || die "swift build failed (exit $SWIFT_RC)"
 [ -x "$BIN" ] || BIN="$(find macos/.build -path '*Release*' -name LumenDisk -type f -perm -111 | head -1)"
 [ -x "$BIN" ] || die "Swift build did not produce a binary"
+[ "$(lipo -archs "$BIN")" = "x86_64 arm64" ] || die "Swift binary is not universal ($(lipo -archs "$BIN"))"
 ok "LumenDisk binary ($(lipo -archs "$BIN"))"
 
 bold "Bundling dist/LumenDisk.app"

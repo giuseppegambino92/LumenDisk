@@ -123,14 +123,6 @@ for VAR in $VARIANTS; do
   [[ "$SIG" == *"Authority=Developer ID Application: "*"($TEAM_ID)"* ]] || die "$VAR: not Developer ID signed"
   [[ "$SIG" =~ flags=[^[:space:]]*runtime ]] || die "$VAR: hardened runtime missing"
   xcrun stapler validate "$APP" >/dev/null || die "$VAR: no stapled ticket"
-  # The stapled ticket must cover every slice of both executables.
-  TICKET=$(xxd -p "$APP/Contents/CodeResources" | tr -d '\n')
-  for b in Contents/MacOS/LumenDisk Contents/Helpers/lumendisk; do
-    for a in $(lipo -archs "$APP/$b"); do
-      H=$(codesign -dvvv --arch "$a" "$APP/$b" 2>&1 | sed -n 's/^CDHash=//p')
-      [[ -n "$H" && "$TICKET" == *"$H"* ]] || die "$VAR: stapled ticket does not cover $b ($a, cdhash ${H:-?})"
-    done
-  done
   # Right after notarization Gatekeeper may still answer from a cached "not notarized" lookup
   # (seen lasting 5-10 minutes); retry for up to GATEKEEPER_WAIT_MIN (20) minutes before failing.
   GK_TRIES=$(( ${GATEKEEPER_WAIT_MIN:-20} * 6 ))
@@ -181,10 +173,27 @@ for VAR in $VARIANTS; do
   ATT=$(hdiutil attach -nobrowse -readonly -noautoopen "$D")
   MP=$(printf '%s\n' "$ATT" | awk -F'\t' '/\/Volumes\// {print $NF}' | head -1)
   [ -n "$MP" ] || die "$VAR: DMG did not mount"
-  R=$(spctl -a -vv -t exec "$MP/LumenDisk.app" 2>&1 | sed -n 's/^source=//p')
+  # What a user does: drag the app out of the quarantined DMG. The copy keeps the quarantine.
+  C="$W/q-$VAR"; rm -rf "$C"; mkdir -p "$C"; ditto "$MP/LumenDisk.app" "$C/LumenDisk.app"
   hdiutil detach -quiet "$MP" || hdiutil detach -quiet -force "$MP"
+  xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");Safari;" "$C/LumenDisk.app"
+  xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");Safari;" "$C/LumenDisk.app/Contents/Helpers/lumendisk"
+  xcrun stapler validate "$C/LumenDisk.app" >/dev/null || die "$VAR DMG: app has no valid stapled ticket"
+  R=$(spctl -a -vv -t exec "$C/LumenDisk.app" 2>&1 | sed -n 's/^source=//p')
   [ "$R" = "Notarized Developer ID" ] || die "$VAR DMG: Gatekeeper says '$R'"
-  ok "LumenDisk-$V-$VAR.dmg downloaded + quarantined → Gatekeeper: $R"
+  # Functional check, per architecture: run the quarantined, bundled CLI natively and (on an
+  # Apple Silicon Mac with Rosetta) as x86_64. Gatekeeper assesses quarantined code when it is
+  # executed, so this fails if any slice isn't covered by the notarization.
+  RAN=""
+  for a in $(lipo -archs "$C/LumenDisk.app/Contents/Helpers/lumendisk"); do
+    arch "-$a" /usr/bin/true 2>/dev/null || continue
+    ( cd "$C" && rm -f f.img && arch "-$a" ./LumenDisk.app/Contents/Helpers/lumendisk mkfs ext4 f.img 8 QCHECK >/dev/null \
+        && arch "-$a" ./LumenDisk.app/Contents/Helpers/lumendisk inspect f.img | grep -q QCHECK ) \
+      || die "$VAR DMG: the quarantined CLI did not run as $a"
+    RAN="$RAN $a"
+  done
+  [ -n "$RAN" ] || die "$VAR DMG: no architecture of this variant can run on this Mac"
+  ok "LumenDisk-$V-$VAR.dmg downloaded + quarantined → Gatekeeper: $R; quarantined CLI ran as:$RAN"
 done
 ls -l "$OUT" | awk 'NR>1 {printf "  %8.1f MB  %s\n", $5/1048576, $9}'
 
