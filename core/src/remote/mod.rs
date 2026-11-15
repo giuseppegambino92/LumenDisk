@@ -25,6 +25,11 @@ pub struct RemoteEntry {
     pub perm: u16,
     /// Symlink target, when `kind == Symlink` and the backend reports it cheaply.
     pub symlink_target: Option<String>,
+    /// Opaque content version reported by the server (WebDAV `getetag`, weak/strong marker
+    /// stripped), when it has one. Persistent Shadow sessions use it to notice that a file
+    /// was changed on the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -311,6 +311,28 @@ pub trait FileSystem: Send {
     fn fingerprint(&mut self) -> Option<String> {
         None
     }
+
+    /// Content version of an object beyond its size and mtime (a WebDAV ETag), if the source
+    /// has one. Persistent Shadow sessions record it with the attributes they saw.
+    fn version_tag(&mut self, _ino: Ino) -> Option<String> {
+        None
+    }
+
+    /// Sources that can change behind LumenDisk's back while mounted (remote servers): make
+    /// the following metadata reads come from the source rather than from a cache, and fail if
+    /// it can't be reached. Returns a connection generation: two calls returning the same one
+    /// bracket a check that never fell back to cached data. None: a local volume, nothing to
+    /// revalidate (the default).
+    fn revalidate(&mut self) -> Option<FsResult<u64>> {
+        None
+    }
+
+    /// Like `sync`, for sources that queue changes locally (remote servers): returns only once
+    /// every change made so far has been applied by the source itself, or fails. Shadow
+    /// commits call it before each checkpoint. Default: `sync`.
+    fn commit_barrier(&mut self) -> FsResult<()> {
+        self.sync()
+    }
 }
 
 /// Defaults applied by drivers that have no on-disk ownership (FAT, exFAT, NTFS).

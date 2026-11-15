@@ -137,6 +137,10 @@ pub struct Shared {
     stop: AtomicBool,
     wake: (Mutex<bool>, Condvar),
     url: String,
+    /// Queued changes the server refused for good (dropped from the queue).
+    failed: AtomicU64,
+    /// Online → offline transitions (a connection generation for [`FileSystem::revalidate`]).
+    offline_events: AtomicU64,
 }
 
 /// Handle shared with the runtime for status / sync-now.
@@ -169,6 +173,7 @@ fn map_err(e: RemoteError) -> FsError {
 impl Shared {
     fn set_offline(&self, why: &RemoteError) {
         if self.online.swap(false, Ordering::SeqCst) {
+            self.offline_events.fetch_add(1, Ordering::SeqCst);
             eprintln!("lumendisk: {} offline ({why})", self.url);
         }
         *self.last_error.lock().unwrap() = Some(why.to_string());
@@ -288,6 +293,78 @@ impl Shared {
         st.queue.len() as u64 + st.dirty.len() as u64
     }
 
+    fn unreachable(e: impl std::fmt::Display) -> FsError {
+        FsError::Io(crate::i18n::t(&format!("server non raggiungibile: {e}"), &format!("server unreachable: {e}")))
+    }
+
+    /// Back online if possible (one bounded ping).
+    fn reconnect(&self) -> RResult<()> {
+        self.backend.set_timeout(self.cfg.meta_timeout * 5);
+        match self.backend.ping() {
+            Ok(l) => {
+                self.set_online(l);
+                Ok(())
+            }
+            Err(e) => {
+                self.set_offline(&e);
+                Err(e)
+            }
+        }
+    }
+
+    /// See [`FileSystem::revalidate`]: online check, then every cached entry becomes stale so
+    /// the next lookups ask the server. Returns the connection generation.
+    fn revalidate(&self) -> FsResult<u64> {
+        if !self.online.load(Ordering::SeqCst) {
+            self.reconnect().map_err(Self::unreachable)?;
+        }
+        let gen = self.offline_events.load(Ordering::SeqCst);
+        let old = Instant::now().checked_sub(self.cfg.attr_ttl * 2).unwrap_or_else(Instant::now);
+        let mut st = self.st.lock().unwrap();
+        for m in st.meta.values_mut() {
+            m.at = old;
+        }
+        for l in st.listed.values_mut() {
+            l.1 = old;
+        }
+        Ok(gen)
+    }
+
+    /// See [`FileSystem::commit_barrier`]: wait until the uploader has applied every queued
+    /// change on the server. Fails when the server can't be reached (the changes stay queued,
+    /// on disk), refuses one of them, or no progress is made for a long time.
+    fn drain(&self) -> FsResult<()> {
+        let failed0 = self.failed.load(Ordering::SeqCst);
+        self.kick();
+        let mut epoch = self.st.lock().unwrap().epoch;
+        let mut progress_at = Instant::now();
+        let mut reconnects = 0;
+        loop {
+            if self.failed.load(Ordering::SeqCst) != failed0 {
+                let why = self.last_error.lock().unwrap().clone().unwrap_or_default();
+                return Err(FsError::Io(crate::i18n::t(&format!("il server ha rifiutato una modifica: {why}"), &format!("the server refused a change: {why}"))));
+            }
+            if self.pending() == 0 {
+                return Ok(());
+            }
+            if !self.online.load(Ordering::SeqCst) {
+                if reconnects >= 3 {
+                    let why = self.last_error.lock().unwrap().clone().unwrap_or_default();
+                    return Err(Self::unreachable(why));
+                }
+                reconnects += 1;
+                self.reconnect().map_err(Self::unreachable)?;
+            }
+            let e = self.st.lock().unwrap().epoch;
+            if e != epoch {
+                (epoch, progress_at, reconnects) = (e, Instant::now(), 0);
+            } else if progress_at.elapsed() > self.cfg.data_timeout * 30 {
+                return Err(Self::unreachable(crate::i18n::t("nessun progresso nel caricamento", "no upload progress")));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Try to upload everything now (blocks up to `max`). Returns ops synced.
     pub fn sync_now(&self, max: Duration) -> u64 {
         if !self.online.load(Ordering::SeqCst) {
@@ -340,6 +417,7 @@ impl Shared {
                     return Some(false);
                 }
                 Err(e) => {
+                    self.failed.fetch_add(1, Ordering::SeqCst);
                     eprintln!("lumendisk: remote op {op:?} failed permanently: {e}; dropping");
                     *self.last_error.lock().unwrap() = Some(format!("{}: {e}", op.path()));
                 }
@@ -422,6 +500,7 @@ impl Shared {
             }
             r => {
                 if let Err(e) = r {
+                    self.failed.fetch_add(1, Ordering::SeqCst);
                     eprintln!("lumendisk: upload of {path} failed: {e}");
                     *self.last_error.lock().unwrap() = Some(format!("{path}: {e}"));
                 }
@@ -529,6 +608,8 @@ impl RemoteVfs {
             stop: AtomicBool::new(false),
             wake: (Mutex::new(false), Condvar::new()),
             url,
+            failed: AtomicU64::new(0),
+            offline_events: AtomicU64::new(0),
         });
         // First contact (bounded); failing is fine if we have a cache.
         sh.backend.set_timeout(sh.cfg.meta_timeout * 5);
@@ -1187,7 +1268,7 @@ impl FileSystem for RemoteVfs {
         if self.lookup(parent, name).is_ok() {
             return Err(FsError::Exists);
         }
-        let e = RemoteEntry { name: name.into(), kind: FileKind::File, size: 0, mtime: Timestamp::now(), perm, symlink_target: None };
+        let e = RemoteEntry { name: name.into(), kind: FileKind::File, size: 0, mtime: Timestamp::now(), perm, symlink_target: None, etag: None };
         let ino = self.local_add(&pp, name, e);
         {
             let mut st = self.sh.st.lock().unwrap();
@@ -1205,7 +1286,7 @@ impl FileSystem for RemoteVfs {
         if self.lookup(parent, name).is_ok() {
             return Err(FsError::Exists);
         }
-        let e = RemoteEntry { name: name.into(), kind: FileKind::Dir, size: 0, mtime: Timestamp::now(), perm, symlink_target: None };
+        let e = RemoteEntry { name: name.into(), kind: FileKind::Dir, size: 0, mtime: Timestamp::now(), perm, symlink_target: None, etag: None };
         let ino = self.local_add(&pp, name, e);
         self.sh.st.lock().unwrap().listed.insert(join(&pp, name), (vec![], Instant::now()));
         self.enqueue(Op::Mkdir { path: join(&pp, name), perm });
@@ -1226,6 +1307,7 @@ impl FileSystem for RemoteVfs {
             mtime: Timestamp::now(),
             perm: 0o777,
             symlink_target: Some(target.into()),
+            etag: None,
         };
         let ino = self.local_add(&pp, name, e);
         self.enqueue(Op::Symlink { path: join(&pp, name), target: target.into() });
@@ -1353,6 +1435,21 @@ impl FileSystem for RemoteVfs {
         DirtyState::Clean
     }
 
+    fn version_tag(&mut self, ino: Ino) -> Option<String> {
+        let p = self.path_of(ino).ok()?;
+        self.meta(&p).ok()?.etag
+    }
+
+    fn revalidate(&mut self) -> Option<FsResult<u64>> {
+        Some(self.sh.revalidate())
+    }
+
+    fn commit_barrier(&mut self) -> FsResult<()> {
+        self.sh.drain()?;
+        self.sh.persist_queue()?;
+        Ok(())
+    }
+
     fn repair(&mut self) -> FsResult<String> {
         Err(FsError::Unsupported("repair on a remote volume".into()))
     }
@@ -1395,6 +1492,7 @@ pub mod tests {
                 mtime: self.mtimes.lock().unwrap().get(path).copied().unwrap_or(Timestamp { secs: 1_700_000_000, nsecs: 0 }),
                 perm: v.2,
                 symlink_target: v.3.clone(),
+                etag: None,
             }
         }
     }

@@ -268,6 +268,8 @@ fn entry_from(name: String, a: &Attrs) -> RemoteEntry {
         mtime: Timestamp { secs: a.times.map(|t| t.1 as i64).unwrap_or(0), nsecs: 0 },
         perm,
         symlink_target: None,
+        // SFTP v3 has no content version: the base of a Shadow session is size + mtime.
+        etag: None,
     }
 }
 
@@ -356,6 +358,24 @@ impl SftpBackend {
     /// Absolute remote path of the export root.
     pub fn remote_root(&self) -> &str {
         &self.root
+    }
+
+    /// Canonical, credential-free identity of this export (Shadow session key):
+    /// `sftp://[user@]<host>:<port><absolute root>`, host lowercased, port written out, root
+    /// as resolved by the server (so "~/x" and "/home/pi/x" are the same export). Without a
+    /// user name in the URL ssh picks one (ssh config `User`, else the local user name).
+    pub fn canonical_endpoint(&self) -> String {
+        let user = self.cl.cfg.user.as_ref().map(|u| format!("{u}@")).unwrap_or_default();
+        let host = self.cl.cfg.host.trim_end_matches('.').to_ascii_lowercase();
+        let host = if host.contains(':') { format!("[{host}]") } else { host };
+        format!("sftp://{user}{host}:{}{}", self.cl.cfg.port, super::webdav::canonical_path(&self.root))
+    }
+
+    /// `user@host:/path`, for lists of saved Shadow sessions.
+    pub fn display_name(&self) -> String {
+        let user = self.cl.cfg.user.as_ref().map(|u| format!("{u}@")).unwrap_or_default();
+        let port = if self.cl.cfg.port == 22 { String::new() } else { format!(" (port {})", self.cl.cfg.port) };
+        format!("{user}{}:{}{port}", self.cl.cfg.host, self.root)
     }
 
     /// Kill the current ssh session (the next call reconnects).

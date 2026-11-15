@@ -30,6 +30,12 @@ pub struct WebDavBackend {
     agent: ureq::Agent,
     timeout: Mutex<Duration>,
     lumendisk: bool,
+    /// Login name (never the password): part of the Shadow session identity.
+    user: Option<String>,
+    /// LAN shares: the pinned certificate fingerprint.
+    fingerprint: Option<String>,
+    /// LAN shares: (name, stable share id) from `/.lumendisk/info`.
+    share: Option<(String, String)>,
 }
 
 fn pct_encode(path: &str) -> String {
@@ -59,6 +65,40 @@ fn pct_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `host[:port]` → (lowercase host without a trailing dot, port). IPv6 literals keep brackets.
+pub(crate) fn split_host_port(hostport: &str, default_port: u16) -> (String, u16) {
+    let (h, p) = if let Some(rest) = hostport.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, after)) => (format!("[{h}]"), after.strip_prefix(':')),
+            None => (hostport.to_string(), None),
+        }
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), Some(p)),
+            None => (hostport.to_string(), None),
+        }
+    };
+    let port = p.and_then(|p| p.parse().ok()).unwrap_or(default_port);
+    (h.trim_end_matches('.').to_ascii_lowercase(), port)
+}
+
+/// Absolute path without empty or "." components and without a trailing slash ("/" for root).
+pub(crate) fn canonical_path(p: &str) -> String {
+    let parts: Vec<&str> = p.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+    format!("/{}", parts.join("/"))
+}
+
+/// (name, stable id) of a LumenDisk share from its `/.lumendisk/info` JSON.
+fn share_identity(v: &serde_json::Value) -> (String, String) {
+    use sha2::Digest;
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let (name, fs, uuid) = (s("name"), s("fs_type"), s("uuid"));
+    // Volumes without a UUID / serial: the share name is the best stable hint there is.
+    let basis = if uuid.trim().is_empty() { format!("name|{fs}|{name}") } else { format!("uuid|{fs}|{uuid}") };
+    let d = sha2::Sha256::digest(basis.as_bytes());
+    (name, d[..12].iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn map_status(code: u16) -> RemoteError {
@@ -111,6 +151,7 @@ impl WebDavBackend {
         if cfg.bearer.is_some() && origin.starts_with("http://") {
             origin = origin.replacen("http://", "https://", 1);
         }
+        let mut pinned_fp = None;
         let builder = if cfg.bearer.is_some() {
             let fp = match cfg.fingerprint.clone().filter(|f| !f.trim().is_empty()) {
                 Some(f) => f,
@@ -132,17 +173,33 @@ impl WebDavBackend {
                 Err(ureq::Error::Transport(t)) => return Err(map_transport(&t)),
                 Err(ureq::Error::Status(c, _)) => return Err(map_status(c)),
             }
-            crate::lan::pinned_agent_builder(&fp)
+            let b = crate::lan::pinned_agent_builder(&fp);
+            pinned_fp = Some(fp);
+            b
         } else {
             ureq::AgentBuilder::new()
         };
         // Redirects are handled by hand: following them would drop the credentials.
         let agent = builder.timeout_connect(Duration::from_secs(3)).max_idle_connections_per_host(8).redirects(0).build();
-        let mut b = WebDavBackend { origin, base, auth, agent, timeout: Mutex::new(Duration::from_secs(5)), lumendisk: false };
+        let user = if cfg.bearer.is_some() { None } else { user.filter(|u| !u.is_empty()) };
+        let mut b = WebDavBackend {
+            origin,
+            base,
+            auth,
+            agent,
+            timeout: Mutex::new(Duration::from_secs(5)),
+            lumendisk: false,
+            user,
+            fingerprint: pinned_fp,
+            share: None,
+        };
         // Detect a LumenDisk share.
         if let Ok(r) = b.req("GET", "/.lumendisk/info", &[], None, 1) {
             if r.status() == 200 {
                 b.lumendisk = true;
+                let mut body = String::new();
+                let _ = r.into_reader().take(64 << 10).read_to_string(&mut body);
+                b.share = serde_json::from_str::<serde_json::Value>(&body).ok().map(|v| share_identity(&v));
             }
         }
         match b.stat("/") {
@@ -156,6 +213,39 @@ impl WebDavBackend {
 
     pub fn is_lumendisk(&self) -> bool {
         self.lumendisk
+    }
+
+    /// Name of the shared volume, for LumenDisk LAN shares.
+    pub fn share_name(&self) -> Option<String> {
+        self.share.as_ref().map(|s| s.0.clone()).filter(|n| !n.trim().is_empty())
+    }
+
+    /// Canonical, credential-free identity of what this backend serves (Shadow session key).
+    ///
+    /// * WebDAV: `webdav+<scheme>://[user@]<host>:<port><base>` with the host lowercased, the
+    ///   default port written out and the base path without duplicate or trailing slashes.
+    /// * LumenDisk LAN share: `lan://<share id>`. The id is derived from the shared volume's
+    ///   own identity (filesystem type + UUID / serial, see `/.lumendisk/info`), which stays
+    ///   the same when the sharing Mac restarts the share, while its address, port, pairing
+    ///   code and certificate are new every time. Older shares without one fall back to the
+    ///   certificate fingerprint (stable only while that share keeps running).
+    pub fn canonical_endpoint(&self) -> String {
+        if self.lumendisk {
+            if let Some((_, id)) = &self.share {
+                return format!("lan://{id}");
+            }
+            if let Some(fp) = &self.fingerprint {
+                return format!("lan-cert://{}", fp.to_ascii_lowercase());
+            }
+        }
+        let (scheme, hostport) = self.origin.split_once("://").unwrap_or(("http", &self.origin));
+        let scheme = scheme.to_ascii_lowercase();
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let (host, port) = split_host_port(hostport, default_port);
+        let user = self.user.as_ref().map(|u| format!("{u}@")).unwrap_or_default();
+        let base = canonical_path(&self.base);
+        let kind = if self.lumendisk { "lan" } else { "webdav" };
+        format!("{kind}+{scheme}://{user}{host}:{port}{base}")
     }
 
     fn url_for(&self, path: &str) -> String {
@@ -225,7 +315,7 @@ impl WebDavBackend {
                     if n == "response" {
                         cur = Some((
                             String::new(),
-                            RemoteEntry { name: String::new(), kind: FileKind::File, size: 0, mtime: Timestamp::default(), perm: 0, symlink_target: None },
+                            RemoteEntry { name: String::new(), kind: FileKind::File, size: 0, mtime: Timestamp::default(), perm: 0, symlink_target: None, etag: None },
                             None,
                         ));
                     } else if n == "collection" {
@@ -258,6 +348,13 @@ impl WebDavBackend {
                                 }
                             }
                             "mtime_ns" => c.2 = v.trim().parse().ok(),
+                            // The LAN server's ETag contains the sharing Mac's inode number, which
+                            // isn't stable across its restarts; its mtime_ns is precise instead.
+                            "getetag" if !self.lumendisk => {
+                                let t = v.trim();
+                                let t = t.strip_prefix("W/").unwrap_or(t).trim_matches('"');
+                                c.1.etag = Some(t.to_string()).filter(|t| !t.is_empty());
+                            }
                             "mode" => c.1.perm = u16::from_str_radix(v.trim(), 8).unwrap_or(0) & 0o7777,
                             "symlink" => {
                                 c.1.kind = FileKind::Symlink;
@@ -454,5 +551,67 @@ impl RemoteBackend for WebDavBackend {
         let r = self.req("GET", "/.lumendisk/info", &[], None, 1)?;
         let v: serde_json::Value = serde_json::from_reader(r.into_reader()).map_err(|e| RemoteError::Other(e.to_string()))?;
         Ok(Some((v["total_bytes"].as_u64().unwrap_or(0), v["free_bytes"].as_u64().unwrap_or(0))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend(origin: &str, base: &str, user: Option<&str>) -> WebDavBackend {
+        WebDavBackend {
+            origin: origin.into(),
+            base: base.into(),
+            auth: None,
+            agent: ureq::AgentBuilder::new().build(),
+            timeout: Mutex::new(Duration::from_secs(1)),
+            lumendisk: false,
+            user: user.map(String::from),
+            fingerprint: None,
+            share: None,
+        }
+    }
+
+    #[test]
+    fn etags_are_parsed_without_the_weak_marker() {
+        let b = backend("http://nas", "/dav", None);
+        let xml = r#"<?xml version="1.0"?><D:multistatus xmlns:D="DAV:">
+            <D:response><D:href>/dav/a.txt</D:href><D:propstat><D:prop><D:getcontentlength>5</D:getcontentlength>
+            <D:getetag>W/"5-63f1a2b3c4d5e"</D:getetag></D:prop></D:propstat></D:response>
+            <D:response><D:href>/dav/b.txt</D:href><D:propstat><D:prop><D:getetag>"9-1"</D:getetag></D:prop></D:propstat></D:response>
+            <D:response><D:href>/dav/c.txt</D:href><D:propstat><D:prop><D:getcontentlength>1</D:getcontentlength></D:prop></D:propstat></D:response>
+            </D:multistatus>"#;
+        let v = b.parse_multistatus(xml);
+        let tag = |p: &str| v.iter().find(|(x, _)| x == p).and_then(|(_, e)| e.etag.clone());
+        // Apache marks an ETag weak for a second after a change: same version, same tag.
+        assert_eq!(tag("/a.txt").as_deref(), Some("5-63f1a2b3c4d5e"));
+        assert_eq!(tag("/b.txt").as_deref(), Some("9-1"));
+        assert_eq!(tag("/c.txt"), None);
+        // LumenDisk shares put the host's inode number in theirs: ignored (mtime_ns instead).
+        let mut lan = backend("https://mac", "", None);
+        lan.lumendisk = true;
+        assert!(lan.parse_multistatus(xml).iter().all(|(_, e)| e.etag.is_none()));
+    }
+
+    #[test]
+    fn canonical_endpoints() {
+        assert_eq!(backend("https://NAS.Local.", "/dav/", Some("pi")).canonical_endpoint(), "webdav+https://pi@nas.local:443/dav");
+        assert_eq!(backend("http://nas:8080", "//dav//x/", None).canonical_endpoint(), "webdav+http://nas:8080/dav/x");
+        assert_eq!(backend("http://[fe80::1]", "", None).canonical_endpoint(), "webdav+http://[fe80::1]:80/");
+        let mut lan = backend("https://192.168.1.20:50123", "", None);
+        lan.lumendisk = true;
+        lan.fingerprint = Some("AB12".into());
+        assert_eq!(lan.canonical_endpoint(), "lan-cert://ab12");
+        let info = serde_json::json!({"name": "Disco di Anna", "fs_type": "EXT4", "uuid": "1234-abcd"});
+        lan.share = Some(share_identity(&info));
+        let a = lan.canonical_endpoint();
+        // Another address, port and certificate of the same shared volume: same identity.
+        let mut again = backend("https://10.0.0.7:61000", "", None);
+        again.lumendisk = true;
+        again.fingerprint = Some("CD34".into());
+        again.share = Some(share_identity(&info));
+        assert_eq!(a, again.canonical_endpoint());
+        assert!(a.starts_with("lan://"), "{a}");
+        assert_eq!(lan.share_name().as_deref(), Some("Disco di Anna"));
     }
 }
