@@ -212,6 +212,10 @@ char *ld_share_stop(const char *volume_id);
 /* Feature 4 — "Drop-to-Disk" Wi-Fi portal (HTML upload/download, PIN protected).
  * ld_portal_start: {"ok":true,"portal":PortalStatus}  (encode PortalStatus.url in the QR code) */
 char *ld_portal_start(const char *volume_id);
+/* HTTPS only by default. enabled=1 also opens PortalStatus.http_url: an UNENCRYPTED address for
+ * phones that refuse the self-signed certificate (PIN and files travel in clear); enabled=0
+ * closes it again and ends the sessions created over it. {"ok":true,"portal":PortalStatus} */
+char *ld_portal_set_plain_http(const char *volume_id, int enabled);
 char *ld_portal_stop(const char *volume_id);
 
 /* ── Phase 3 ──────────────────────────────────────────────────────────────────────── */

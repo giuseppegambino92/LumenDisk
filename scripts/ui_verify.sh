@@ -57,7 +57,7 @@ DEV=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$W/usb.im
 FAIL=0
 for LANG_CODE in it en; do
   rm -f "$W/ready" "$W/control" "$W/control.ack"
-  LUMENDISK_SUPPORT_DIR="$W/support" LUMENDISK_MOUNT_ROOT="$W/mnt" LUMENDISK_LANG="$LANG_CODE" LUMENDISK_NO_BONJOUR=1 \
+  LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK=1 LUMENDISK_SUPPORT_DIR="$W/support" LUMENDISK_MOUNT_ROOT="$W/mnt" LUMENDISK_LANG="$LANG_CODE" LUMENDISK_NO_BONJOUR=1 \
   LUMENDISK_WINDOW=1180x820 LUMENDISK_READY_FILE="$W/ready" LUMENDISK_CONTROL="$W/control" \
   LUMENDISK_MOUNT="$W/archivio.img|readWrite|0|Archivio;$W/foto.img|shadow|0|Foto" \
   LUMENDISK_SHARE=Archivio LUMENDISK_LAN_LOOPBACK=1 LUMENDISK_PORTAL=Archivio LUMENDISK_SPEEDTEST=Archivio \

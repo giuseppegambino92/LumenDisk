@@ -1,0 +1,6 @@
+# Test and `cargo run` binaries are ad-hoc signed, so macOS hides the system socket table from
+# them and LumenDisk can't verify who connects to its loopback NFS server (see SECURITY.md).
+# Allow unverified loopback connections for those development processes only; release builds
+# (Developer ID) verify every connection and never read this file.
+[env]
+LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK = "1"

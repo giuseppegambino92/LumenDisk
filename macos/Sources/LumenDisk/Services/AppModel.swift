@@ -915,6 +915,17 @@ final class AppModel {
         bringMainWindowForward()
     }
 
+    /// Explicit, insecure opt-in for phones that refuse the portal's self-signed certificate.
+    func setPortalPlainHTTP(_ volumeID: String, enabled: Bool) async {
+        do {
+            if let portal = try await bridge.portalSetPlainHTTP(volumeID: volumeID, enabled: enabled) { startedPortals[volumeID] = portal }
+        } catch {
+            present(enabled ? L("Impossibile attivare l'indirizzo non cifrato", "Could not turn on the unencrypted address")
+                            : L("Impossibile disattivare l'indirizzo non cifrato", "Could not turn off the unencrypted address"), error)
+        }
+        await refresh(force: true)
+    }
+
     func stopPortal(_ volumeID: String) async {
         do {
             try await bridge.portalStop(volumeID: volumeID)

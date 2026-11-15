@@ -288,7 +288,10 @@ enum DebugHooks {
             if let v = volume(named: arg, model) { await model.eject(v) }
         case "refresh": await model.refresh(force: true)
         case "activate": NSApp.activate()
-        case "qrcompat": PortalSheet.startCompatible = arg == "on"
+        case "qrcompat":
+            if let v = model.volumes.first(where: { model.portal(for: $0) != nil })?.id {
+                await model.setPortalPlainHTTP(v, enabled: arg == "on")
+            }
         case "quit": await quit(model)
         default: NSLog("DEBUG: unknown command \(line)")
         }

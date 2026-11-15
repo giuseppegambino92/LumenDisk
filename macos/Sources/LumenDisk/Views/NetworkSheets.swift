@@ -770,15 +770,8 @@ struct PortalSheet: View {
 
     @State private var isStopping = false
     @State private var copied = false
-    /// Shows the unencrypted compatibility address (`http_url`) instead of the https one.
-    @State private var useCompatible = PortalSheet.startCompatible
-
-    #if DEBUG
-    /// Screenshot hook (control command `qrcompat on`).
-    nonisolated(unsafe) static var startCompatible = false
-    #else
-    static let startCompatible = false
-    #endif
+    @State private var confirmingPlainHTTP = false
+    @State private var switchingPlainHTTP = false
 
     var body: some View {
         let volume = model.volume(id: volumeID)
@@ -829,8 +822,18 @@ struct PortalSheet: View {
         .frame(width: 500)
     }
 
+    /// The QR shows the unencrypted address only while the user has turned it on.
     private func shownURL(_ portal: PortalStatus) -> String {
-        useCompatible ? (portal.compatibilityURL ?? portal.url) : portal.url
+        portal.compatibilityURL ?? portal.url
+    }
+
+    private func setPlainHTTP(_ enabled: Bool) {
+        switchingPlainHTTP = true
+        copied = false
+        Task {
+            await model.setPortalPlainHTTP(volumeID, enabled: enabled)
+            switchingPlainHTTP = false
+        }
     }
 
     private func content(_ portal: PortalStatus) -> some View {
@@ -842,11 +845,9 @@ struct PortalSheet: View {
                 .transition(.opacity)
             VStack(spacing: 8) {
                 urlCapsule(url, encrypted: encrypted)
-                if portal.compatibilityURL != nil {
-                    compatibilityToggle(encrypted: encrypted)
-                }
+                compatibilityToggle(insecureOn: portal.compatibilityURL != nil)
             }
-            .animation(.snappy, value: useCompatible)
+            .animation(.snappy, value: encrypted)
 
             HStack(spacing: 10) {
                 VStack(spacing: 2) {
@@ -897,35 +898,40 @@ struct PortalSheet: View {
         .background(Color.ldWell, in: Capsule())
     }
 
-    /// "Il telefono mostra un avviso?": switch the QR to the plain-http compatibility address.
+    /// "Il telefono mostra un avviso?": the unencrypted address is an explicit, confirmed opt-in
+    /// (the core doesn't even listen on HTTP until then) and can be switched off again.
     @ViewBuilder
-    private func compatibilityToggle(encrypted: Bool) -> some View {
-        if useCompatible {
+    private func compatibilityToggle(insecureOn: Bool) -> some View {
+        if insecureOn {
             VStack(spacing: 4) {
-                Label(L("Questo indirizzo non è cifrato: usalo solo su una rete Wi-Fi di cui ti fidi.",
-                        "This address isn’t encrypted: only use it on a Wi-Fi network you trust."),
-                      systemImage: "exclamationmark.shield")
+                Label(L("Modalità non sicura attiva: PIN e file viaggiano in chiaro su questa rete. Disattivala appena hai finito.",
+                        "Insecure mode is on: the PIN and files travel in clear on this network. Turn it off as soon as you’re done."),
+                      systemImage: "exclamationmark.shield.fill")
                     .font(.caption)
                     .foregroundStyle(Color.ldAmber)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
-                Button(L("Torna all'indirizzo cifrato", "Back to the encrypted address")) {
-                    useCompatible = false
-                    copied = false
-                }
-                .buttonStyle(.link)
-                .font(.caption)
+                Button(L("Disattiva l'indirizzo non cifrato", "Turn off the unencrypted address")) { setPlainHTTP(false) }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .disabled(switchingPlainHTTP)
             }
         } else {
-            Button(L("Il telefono mostra un avviso? Usa l'indirizzo compatibile",
-                     "Phone shows a warning? Use the compatible address")) {
-                useCompatible = true
-                copied = false
+            Button(L("Il telefono non riesce ad aprire la pagina?", "Phone can’t open the page?")) {
+                confirmingPlainHTTP = true
             }
             .buttonStyle(.link)
             .font(.caption)
-            .help(L("Il portale usa un certificato creato da questo Mac: alcuni telefoni mostrano un avviso la prima volta.",
-                    "The portal uses a certificate made by this Mac: some phones show a warning the first time."))
+            .disabled(switchingPlainHTTP)
+            .help(L("Il portale usa un certificato creato da questo Mac: alcuni telefoni mostrano un avviso la prima volta. Di solito basta accettarlo.",
+                    "The portal uses a certificate made by this Mac: some phones show a warning the first time. Accepting it is usually enough."))
+            .alert(L("Attivare un indirizzo non cifrato?", "Turn on an unencrypted address?"), isPresented: $confirmingPlainHTTP) {
+                Button(L("Attiva modalità non sicura", "Turn On Insecure Mode"), role: .destructive) { setPlainHTTP(true) }
+                Button(L("Annulla", "Cancel"), role: .cancel) {}
+            } message: {
+                Text(L("Prima prova ad accettare l'avviso del telefono sull'indirizzo cifrato: è sicuro, il certificato è di questo Mac.\n\nSull'indirizzo http:// il PIN, l'elenco dei file e i file trasferiti viaggiano in chiaro: chiunque sia sulla stessa rete può leggerli o modificarli. Usalo solo su una rete di cui ti fidi e disattivalo appena hai finito.",
+                       "First try accepting the phone’s warning on the encrypted address: it’s safe, the certificate belongs to this Mac.\n\nOn the http:// address the PIN, the file list and the transferred files travel in clear: anyone on the same network can read or change them. Only use it on a network you trust and turn it off as soon as you’re done."))
+            }
         }
     }
 

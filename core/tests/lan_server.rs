@@ -601,8 +601,11 @@ fn portal(vol: &Vol) -> (LanServer, String) {
     (s, base)
 }
 
+/// Opt into the insecure HTTP compatibility address (off by default) and return its base URL.
 fn http_base(s: &LanServer) -> String {
-    format!("http://127.0.0.1:{}", s.http_port().expect("portal has an HTTP port"))
+    let port = s.set_plain_http(true).unwrap().expect("portal opened an HTTP port");
+    assert_eq!(s.http_port(), Some(port));
+    format!("http://127.0.0.1:{port}")
 }
 
 fn login(base: &str, pin: &str) -> Resp {
@@ -844,7 +847,8 @@ fn stop_frees_port() {
 
     // Portal: both ports, even with an idle keep-alive TLS connection and a stalled handshake open.
     let (srv, base) = portal(&vol);
-    let (port, hport) = (srv.port(), srv.http_port().unwrap());
+    let port = srv.port();
+    let hport = srv.set_plain_http(true).unwrap().unwrap();
     let a = agent(); // keeps its connection pooled
     assert_eq!(send(a.get(&format!("{base}/")), None).status, 200);
     let _stalled = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -1097,6 +1101,37 @@ fn portal_sessions_bound_to_scheme() {
     // Both cookies present (what a browser sends to the HTTPS port): the right one is used.
     assert_eq!(dl(&https, &format!("{plain_cookie}; {tls_cookie}")), 200);
     assert_eq!(dl(&http, &format!("{tls_cookie}; {plain_cookie}")), 200);
+}
+
+#[test]
+fn portal_plain_http_is_off_by_default_and_closes_cleanly() {
+    let vol = volume(16);
+    mkfile(&vol, "/", "notes.txt", b"hi");
+    let (srv, https) = portal(&vol);
+    // Default: HTTPS only, no unencrypted listener at all.
+    assert_eq!(srv.http_port(), None);
+    // Explicit opt-in opens it (idempotently)…
+    let http = http_base(&srv);
+    let hport = srv.http_port().unwrap();
+    assert_eq!(srv.set_plain_http(true).unwrap(), Some(hport));
+    let dl = |base: &str, cookie: &str| send(agent().get(&format!("{base}/dl/notes.txt")).set("Cookie", cookie), None).status;
+    let tls_cookie = session_cookie(&login(&https, PIN));
+    let plain_cookie = session_cookie(&login(&http, PIN));
+    assert_eq!(dl(&http, &plain_cookie), 200);
+
+    // …and switching it off closes the port and ends the sessions that travelled in clear,
+    // while HTTPS keeps working with its own session.
+    assert_eq!(srv.set_plain_http(false).unwrap(), None);
+    assert_eq!(srv.http_port(), None);
+    assert!(std::net::TcpStream::connect(("127.0.0.1", hport)).is_err(), "HTTP port still accepting");
+    assert_eq!(dl(&https, &tls_cookie), 200);
+    let http2 = http_base(&srv);
+    assert_eq!(dl(&http2, &plain_cookie), 303, "an HTTP session must not survive switching HTTP off");
+    srv.set_plain_http(false).unwrap();
+    // Share mode can never open one.
+    let (share_srv, _) = share(&vol, false);
+    assert!(share_srv.set_plain_http(true).is_err());
+    assert_eq!(share_srv.http_port(), None);
 }
 
 #[test]

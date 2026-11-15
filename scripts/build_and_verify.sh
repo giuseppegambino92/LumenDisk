@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 # LumenDisk — build everything, prove it works, install it.
 #
-#   scripts/build_and_verify.sh             build + unit tests + real mount/e2e tests (Docker) + install
+#   scripts/build_and_verify.sh             build + unit tests + real mount/e2e tests (Docker)
 #   SKIP_E2E=1 scripts/build_and_verify.sh  build + unit tests only (no Docker needed)
 #   FULL=1 scripts/build_and_verify.sh      also the long driver suites (ntfs-3g / kernel ntfs3 / vfat / exfat)
-#   NO_INSTALL=1 scripts/build_and_verify.sh  don't copy to /Applications or launch
 #   SKIP_UI=1 scripts/build_and_verify.sh     skip the real-core UI screenshot pass (it opens app windows)
+#   INSTALL=1 scripts/build_and_verify.sh     also copy this development build to /Applications and launch it
+#
+# The bundle built here is ad-hoc signed. macOS hides the system socket table from such builds,
+# so they can't verify loopback NFS clients and refuse to mount unless
+# LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK=1 is set (the tests below set it). scripts/release.sh turns
+# this bundle into the Developer ID-signed, notarized release, which verifies every connection.
 #
 # Produces:
 #   build/lib/liblumendisk_core.a   universal (arm64 + x86_64) static library
 #   build/bin/lumendisk             universal CLI
-#   dist/LumenDisk.app              universal app bundle (ad-hoc signed), also installed to /Applications
+#   dist/LumenDisk.app              universal app bundle (ad-hoc signed; input of scripts/release.sh)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export PATH="$HOME/.cargo/bin:$PATH"
+# Everything this script runs is an ad-hoc development build (see the header).
+export LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK=1
 
 bold() { printf '\n\033[1m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -193,8 +200,8 @@ rm -f "$SENT1" "$SENT2"
 [ -d "$SUPPORT" ] && ok "pre-existing data in ~/Library/Application Support/LumenDisk left untouched" || ok "no test artifacts in ~/Library/Application Support/LumenDisk"
 [ -d "$HOME/Volumes" ] && [ -n "$(ls -A "$HOME/Volumes" 2>/dev/null)" ] && ok "~/Volumes holds only pre-existing items" || ok "no leftovers in ~/Volumes"
 
-if [ -z "${NO_INSTALL:-}" ]; then
-  bold "Install to /Applications and launch"
+if [ -n "${INSTALL:-}" ]; then
+  bold "Install the development build to /Applications and launch (needs LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK=1 to mount)"
   DEST=/Applications/LumenDisk.app
   if [ -d "$DEST" ]; then
     BID=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$DEST/Contents/Info.plist" 2>/dev/null || true)

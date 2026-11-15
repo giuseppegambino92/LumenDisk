@@ -10,6 +10,7 @@
 #                                          LumenDisk-<v>-universal.zip, lumendisk-cli-<v>-macos-universal.tar.gz,
 #                                          SHA256SUMS.txt}
 #   TEAM_ID=XXXXXXXXXX scripts/release.sh   to sign for another team
+#   INSTALL=1 scripts/release.sh            also install the notarized universal app to /Applications
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -24,7 +25,11 @@ V=$($PB -c 'Print CFBundleShortVersionString' "$SRC/Contents/Info.plist")
 BUILD=$($PB -c 'Print CFBundleVersion' "$SRC/Contents/Info.plist")
 BUNDLE_ID=$($PB -c 'Print CFBundleIdentifier' "$SRC/Contents/Info.plist")
 W="$(mktemp -d -t lumendisk-release)"
-trap 'rm -rf "$W"' EXIT
+cleanup() {
+  mount | grep -q "$W/mounttest/mnt" && /sbin/umount -f "$W/mounttest/mnt/RELCHECK" 2>/dev/null
+  rm -rf "$W"
+}
+trap cleanup EXIT
 ok() { printf '  ✓ %s\n' "$*"; }
 die() { printf '  ✗ %s\n' "$*"; exit 1; }
 VARIANTS="universal arm64 x86_64"
@@ -113,7 +118,24 @@ for VAR in $VARIANTS; do
   ok "$VAR: Developer ID, hardened runtime, ticket stapled, Gatekeeper: $(spctl -a -vv -t exec "$APP" 2>&1 | sed -n 's/^source=//p')"
 done
 
-# 4. Package.
+# 4. The release must verify loopback clients for real: mount a test volume with the notarized
+#    CLI and without the development opt-in. This only works if the kernel's NFS client is
+#    positively identified (see SECURITY.md).
+echo "▸ Mounting a test volume with the notarized build (verified loopback, no development opt-in)"
+CLI="$W/universal/LumenDisk.app/Contents/Helpers/lumendisk"
+T="$W/mounttest"; mkdir -p "$T/mnt"
+( cd "$T" && env -u LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK "$CLI" mkfs ext4 t.img 32 RELCHECK >/dev/null )
+( cd "$T" && env -u LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK HOME="$T" "$CLI" mount t.img --root "$T/mnt" --control c.sock > mount.log 2>&1 & )
+for _ in $(seq 1 100); do mount | grep -q "$T/mnt/RELCHECK" && break; sleep 0.2; done
+mount | grep -q "$T/mnt/RELCHECK" || { cat "$T/mount.log"; die "the notarized build could not mount (loopback verification failed)"; }
+echo verified > "$T/mnt/RELCHECK/check.txt"
+[ "$(cat "$T/mnt/RELCHECK/check.txt")" = verified ] || die "write through the verified mount failed"
+"$CLI" ctl "$T/c.sock" unmount >/dev/null
+for _ in $(seq 1 50); do mount | grep -q "$T/mnt/RELCHECK" || break; sleep 0.2; done
+! grep -q 'refused loopback' "$T/mount.log" || { cat "$T/mount.log"; die "a legitimate loopback client was refused"; }
+ok "mounted, written and unmounted: the kernel NFS client was identified, nothing refused"
+
+# 5. Package.
 echo "▸ Packaging dist/release"
 rm -rf "$OUT"; mkdir -p "$OUT"
 for VAR in $VARIANTS; do
@@ -126,7 +148,7 @@ mkdir -p "$W/cli"; ditto "$W/universal/LumenDisk.app/Contents/Helpers/lumendisk"
 tar -czf "$OUT/lumendisk-cli-$V-macos-universal.tar.gz" -C "$W/cli" lumendisk
 ( cd "$OUT" && shasum -a 256 LumenDisk-$V-*.dmg LumenDisk-$V-*.zip lumendisk-cli-*.tar.gz > SHA256SUMS.txt )
 
-# 5. Simulate a download: quarantine each DMG, mount it, and check the app inside with Gatekeeper.
+# 6. Simulate a download: quarantine each DMG, mount it, and check the app inside with Gatekeeper.
 for VAR in $VARIANTS; do
   D="$W/q-$VAR.dmg"; cp "$OUT/LumenDisk-$V-$VAR.dmg" "$D"
   xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");Safari;" "$D"
@@ -139,3 +161,17 @@ for VAR in $VARIANTS; do
   ok "LumenDisk-$V-$VAR.dmg downloaded + quarantined → Gatekeeper: $R"
 done
 ls -l "$OUT" | awk 'NR>1 {printf "  %8.1f MB  %s\n", $5/1048576, $9}'
+
+if [ -n "${INSTALL:-}" ]; then
+  DEST=/Applications/LumenDisk.app
+  if [ -d "$DEST" ]; then
+    BID=$($PB -c 'Print CFBundleIdentifier' "$DEST/Contents/Info.plist" 2>/dev/null || true)
+    [ "$BID" = "$BUNDLE_ID" ] || die "$DEST exists and is not LumenDisk ($BID): not touching it"
+    osascript -e "tell application id \"$BUNDLE_ID\" to quit" >/dev/null 2>&1 || true
+    for _ in $(seq 1 20); do pgrep -f "$DEST/Contents/MacOS/LumenDisk" >/dev/null || break; sleep 0.5; done
+    pgrep -f "$DEST/Contents/MacOS/LumenDisk" >/dev/null && die "LumenDisk is still running (volumes in use?): not replacing it"
+    rm -rf "$DEST"
+  fi
+  ditto "$W/universal/LumenDisk.app" "$DEST" && open "$DEST"
+  ok "installed and launched $DEST ($(spctl -a -vv -t exec "$DEST" 2>&1 | sed -n 's/^source=//p'))"
+fi

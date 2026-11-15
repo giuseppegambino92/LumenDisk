@@ -219,6 +219,11 @@ actor CoreBridge {
         try await checked(PortalReply.self) { ld_portal_start(volumeID) }.portal
     }
 
+    /// Opens (or closes) the portal's unencrypted HTTP address. Off unless explicitly enabled.
+    func portalSetPlainHTTP(volumeID: String, enabled: Bool) async throws -> PortalStatus? {
+        try await checked(PortalReply.self) { ld_portal_set_plain_http(volumeID, enabled ? 1 : 0) }.portal
+    }
+
     func portalStop(volumeID: String) async throws {
         _ = try await checked(Empty.self) { ld_portal_stop(volumeID) }
     }

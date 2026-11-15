@@ -13,13 +13,15 @@
 //! certificate; [`LanServer::fingerprint`] is its SHA-256, to be pinned by the client
 //! ([`pinned_agent`]).
 //! * Share: HTTPS only, TLS 1.3 only, on [`LanServer::port`].
-//! * Portal: HTTPS (TLS 1.2+) on [`LanServer::port`] **and** a plain-HTTP compatibility
-//!   listener on [`LanServer::http_port`] for phones that refuse self-signed certificates.
-//!   Same PIN, same rate limit; sessions are bound to the scheme they were created on (see
-//!   `portal.rs`). No HSTS is ever sent: it is host-wide and would break the HTTP fallback.
+//! * Portal: HTTPS (TLS 1.2+) on [`LanServer::port`]. A plain-HTTP compatibility listener
+//!   for phones that refuse self-signed certificates exists only while explicitly enabled
+//!   ([`LanServer::set_plain_http`], off by default: over HTTP the PIN and the files travel in
+//!   clear). Same PIN, same rate limit; sessions are bound to the scheme they were created on
+//!   (see `portal.rs`) and HTTP sessions end when HTTP is switched off. No HSTS is ever sent:
+//!   it is host-wide and would break the opt-in HTTP fallback.
 //!
 //! Internally, TLS is terminated by `tls.rs` and relayed to a tiny_http listener on
-//! 127.0.0.1; the plain-HTTP portal listener is a second tiny_http server on 0.0.0.0.
+//! 127.0.0.1; the opt-in plain-HTTP portal listener is a second tiny_http server on 0.0.0.0.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
@@ -153,12 +155,20 @@ impl Ctx {
 pub struct LanServer {
     ctx: Arc<Ctx>,
     port: u16,
-    http_port: Option<u16>,
+    /// The portal's unencrypted compatibility listener, only while explicitly enabled.
+    plain: Mutex<Option<PlainListener>>,
     fingerprint: String,
     /// tiny_http servers (internal loopback one, plus the portal's plain-HTTP one) and their ports.
     servers: Mutex<Vec<(Arc<tiny_http::Server>, u16)>>,
     /// Accept loops (tiny_http dispatchers and the TLS front).
     threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+struct PlainListener {
+    server: Arc<tiny_http::Server>,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
 }
 
 /// Which listener a request came through.
@@ -172,7 +182,8 @@ enum Via {
 
 impl LanServer {
     /// Bind 0.0.0.0:0 (all interfaces, ephemeral port), serve on background threads.
-    /// Share mode: HTTPS (TLS 1.3) only. Portal mode: HTTPS on `port()` + HTTP on `http_port()`.
+    /// Both modes serve HTTPS (TLS 1.3) only. In Portal mode an unencrypted HTTP listener can
+    /// be added later with [`LanServer::set_plain_http`], as an explicit insecure opt-in.
     pub fn start<S: FileSystem + Send + 'static>(
         fs: Arc<Mutex<S>>,
         mode: LanMode,
@@ -221,7 +232,7 @@ impl LanServer {
         let mut srv = LanServer {
             ctx: ctx.clone(),
             port: 0,
-            http_port: None,
+            plain: Mutex::new(None),
             fingerprint: identity.fingerprint.clone(),
             servers: Mutex::new(Vec::new()),
             threads: Mutex::new(Vec::new()),
@@ -240,14 +251,44 @@ impl LanServer {
             .name(format!("lan-tls-accept-{}", srv.port))
             .spawn(move || tls::front_loop(public, tls_cfg, internal_addr, c))?;
         srv.threads.lock().unwrap_or_else(|e| e.into_inner()).push(front);
-
-        // Portal: plain-HTTP compatibility listener.
-        if !is_share {
-            let plain = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-            srv.http_port = Some(plain.local_addr()?.port());
-            srv.spawn_http(plain, Via::Plain)?;
-        }
         Ok(srv)
+    }
+
+    /// Portal only: open (`true`) or close (`false`) the unencrypted HTTP compatibility
+    /// listener. Off by default. Over HTTP the PIN, the file list and every transferred file
+    /// cross the network in clear, so this is an explicit, insecure opt-in for phones that
+    /// can't get past the self-signed certificate. Closing it also ends every session that was
+    /// created over HTTP. Returns the HTTP port while enabled.
+    pub fn set_plain_http(&self, enabled: bool) -> std::io::Result<Option<u16>> {
+        if !matches!(self.ctx.auth, Auth::Pin(_)) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "plain HTTP is only available for the portal"));
+        }
+        let mut g = self.plain.lock().unwrap_or_else(|e| e.into_inner());
+        if enabled {
+            if let Some(p) = g.as_ref() {
+                return Ok(Some(p.port));
+            }
+            if self.ctx.is_stopped() {
+                return Err(std::io::Error::other("server stopped"));
+            }
+            let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+            let port = listener.local_addr()?.port();
+            let server = Arc::new(tiny_http::Server::from_listener(listener, None).map_err(|e| std::io::Error::other(e.to_string()))?);
+            let stop = Arc::new(AtomicBool::new(false));
+            let (sv, c, st) = (server.clone(), self.ctx.clone(), stop.clone());
+            let thread = std::thread::Builder::new()
+                .name(format!("lan-plain-{port}"))
+                .spawn(move || accept_loop(sv, c, Via::Plain, Some(st)))?;
+            *g = Some(PlainListener { server, port, stop, thread });
+            Ok(Some(port))
+        } else {
+            if let Some(p) = g.take() {
+                close_listener(p);
+            }
+            // Sessions that travelled in clear die with the listener.
+            self.ctx.sessions.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (_, secure)| *secure);
+            Ok(None)
+        }
     }
 
     fn spawn_http(&self, listener: std::net::TcpListener, via: Via) -> std::io::Result<()> {
@@ -256,7 +297,7 @@ impl LanServer {
         let server = Arc::new(server);
         self.servers.lock().unwrap_or_else(|e| e.into_inner()).push((server.clone(), port));
         let c = self.ctx.clone();
-        let h = std::thread::Builder::new().name(format!("lan-accept-{port}")).spawn(move || accept_loop(server, c, via))?;
+        let h = std::thread::Builder::new().name(format!("lan-accept-{port}")).spawn(move || accept_loop(server, c, via, None))?;
         self.threads.lock().unwrap_or_else(|e| e.into_inner()).push(h);
         Ok(())
     }
@@ -266,9 +307,9 @@ impl LanServer {
         self.port
     }
 
-    /// Plain-HTTP compatibility port: `Some` in Portal mode only.
+    /// Plain-HTTP compatibility port: `Some` only while enabled with [`Self::set_plain_http`].
     pub fn http_port(&self) -> Option<u16> {
-        self.http_port
+        self.plain.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.port)
     }
 
     /// Lowercase hex SHA-256 of this run's certificate (DER). Stable until the server stops;
@@ -285,6 +326,9 @@ impl LanServer {
     /// sockets are closed before this returns.
     pub fn stop(&self) {
         self.ctx.stopped.store(true, Ordering::SeqCst);
+        if let Some(p) = self.plain.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            close_listener(p);
+        }
         let servers = std::mem::take(&mut *self.servers.lock().unwrap_or_else(|e| e.into_inner()));
         for (s, _) in &servers {
             s.unblock();
@@ -323,20 +367,40 @@ impl Drop for LanServer {
     }
 }
 
-fn accept_loop(server: Arc<tiny_http::Server>, ctx: Arc<Ctx>, via: Via) {
-    while !ctx.is_stopped() {
+/// Stop one listener's accept loop and make sure its port is closed before returning.
+fn close_listener(p: PlainListener) {
+    p.stop.store(true, Ordering::SeqCst);
+    p.server.unblock();
+    let _ = p.thread.join();
+    drop(p.server);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, p.port));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            Ok(s) => {
+                drop(s);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn accept_loop(server: Arc<tiny_http::Server>, ctx: Arc<Ctx>, via: Via, stop: Option<Arc<AtomicBool>>) {
+    let halted = || ctx.is_stopped() || stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst));
+    while !halted() {
         let rq = match server.recv_timeout(Duration::from_millis(150)) {
             Ok(Some(rq)) => rq,
             Ok(None) => continue,
             Err(_) => {
-                if ctx.is_stopped() {
+                if halted() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
         };
-        if ctx.is_stopped() {
+        if halted() {
             let _ = rq.respond(http::text(503, "server stopped"));
             break;
         }

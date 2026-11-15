@@ -455,8 +455,11 @@ impl LoopbackServer {
 
 /// Bind a server on 127.0.0.1:0 and start serving on `rt`.
 pub fn start_server<S: FileSystem + Send + 'static>(rt: &tokio::runtime::Runtime, bridge: NfsBridge<S>) -> std::io::Result<LoopbackServer> {
-    let export = format!("lumendisk-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    // 128 random bits. The path is visible to other local users while mount_nfs runs (ps),
+    // so it is not what keeps them out (see `peer_is_trusted`), but it should not be guessable.
+    let export = format!("lumendisk-{}", uuid::Uuid::new_v4().simple());
     let exp = export.clone();
+    loopback_access_check().map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
     let mut listener = rt.block_on(async move { NFSTcpListener::bind("127.0.0.1:0", bridge).await })?;
     listener.with_export_name(&exp);
     let port = listener.get_listen_port();
@@ -560,8 +563,7 @@ pub fn unmount(mountpoint: &Path, force: bool) -> Result<(), String> {
 // ───────────────────────────── loopback access control ─────────────────────────────
 
 /// Owner of the client end of a loopback TCP connection, as reported by the system
-/// `netstat -anv` (the only unprivileged way to see socket owners on recent macOS: the
-/// pcblist sysctls are filtered for unentitled processes).
+/// `netstat -anv` (the unprivileged way to see socket owners on macOS).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerOwner {
     Kernel,
@@ -612,46 +614,112 @@ fn uid_of_pid(pid: i32) -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-/// Defense-in-depth connection filter: refuse a peer that is positively identified as a
-/// process of another (non-root) user. The primary protections are the random export path,
-/// the single MOUNT handshake, 128-bit secret file handles and AUTH_SYS uid enforcement.
+/// Connection filter, **fail-closed**. A connection is accepted only when its client socket is
+/// positively identified as belonging to:
+/// * the kernel (`kernel_task`, pid 0): the macOS NFS client, which performs both the MOUNT
+///   handshake and all NFS traffic for `mount_nfs` mounts and stamps every call with the real
+///   uid of the process doing the file operation (that is what makes the AUTH_SYS uid check
+///   meaningful), or
+/// * a process running as the same user as LumenDisk, or as root (both can already read the
+///   disk image or device directly, so they gain nothing).
+///
+/// Anything else is refused, including when the owner cannot be determined at all (netstat
+/// missing or failing, row not found after retries). This filter is what stops another local
+/// user from talking to the server with a hand-made NFS client and a forged AUTH_SYS uid; the
+/// random export path, single MOUNT and 128-bit handle secret are additional layers.
+/// See SECURITY.md for the threat model.
 pub fn peer_is_trusted(peer: std::net::SocketAddr, server_port: u16) -> bool {
+    peer_is_trusted_with(peer, server_port, socket_table_visible(), unverified_loopback_allowed())
+}
+
+fn peer_is_trusted_with(peer: std::net::SocketAddr, server_port: u16, table_visible: bool, allow_unverified: bool) -> bool {
     if !peer.ip().is_loopback() {
         return false;
     }
+    if !table_visible {
+        // Development build: nothing can be verified. Only an explicit opt-in lets it through.
+        if !allow_unverified {
+            eprintln!("lumendisk: refused loopback connection from {peer}: this build cannot verify connections");
+        }
+        return allow_unverified;
+    }
     let me = unsafe { libc::geteuid() };
-    for attempt in 0..3 {
+    let verdict = peer_owner(peer, server_port).and_then(|owner| match owner {
+        PeerOwner::Kernel => Ok(()),
+        PeerOwner::Process { pid, name } => match uid_of_pid(pid) {
+            Some(u) if u == me || u == 0 => Ok(()),
+            uid => Err(format!("owned by {name}:{pid} uid {uid:?}")),
+        },
+    });
+    if let Err(why) = &verdict {
+        eprintln!("lumendisk: refused loopback connection from {peer}: {why}");
+    }
+    verdict.is_ok()
+}
+
+/// macOS only shows the system socket table to processes signed with a Developer ID; ad-hoc
+/// and Apple Development builds get an empty table from netstat (and from the pcblist
+/// sysctls), so for them no connection owner can ever be verified.
+pub fn socket_table_visible() -> bool {
+    static VISIBLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VISIBLE.get_or_init(|| {
+        // Our own listener guarantees at least one row whenever the table is visible.
+        let l = std::net::TcpListener::bind("127.0.0.1:0");
+        let out = Command::new("/usr/sbin/netstat").args(["-anv", "-f", "inet"]).output();
+        drop(l);
+        out.map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| l.starts_with("tcp"))).unwrap_or(false)
+    })
+}
+
+/// Explicit opt-in for development builds that cannot verify loopback peers.
+pub const ALLOW_UNVERIFIED_ENV: &str = "LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK";
+
+pub fn unverified_loopback_allowed() -> bool {
+    std::env::var(ALLOW_UNVERIFIED_ENV).map(|v| v == "1").unwrap_or(false)
+}
+
+/// Refuse to serve at all when connections can't be verified and nobody opted in, with an
+/// error people can act on (instead of mount_nfs timing out on refused connections).
+pub fn loopback_access_check() -> Result<(), String> {
+    if socket_table_visible() {
+        return Ok(());
+    }
+    if unverified_loopback_allowed() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!("lumendisk: WARNING: {ALLOW_UNVERIFIED_ENV}=1 — loopback connections are NOT verified (development build)")
+        });
+        return Ok(());
+    }
+    Err(crate::i18n::t(
+        &format!("questa build di LumenDisk non è firmata con un Developer ID, quindi macOS non le permette di verificare chi si collega al server locale. Usa la versione ufficiale, oppure (solo per sviluppo) imposta {ALLOW_UNVERIFIED_ENV}=1"),
+        &format!("this LumenDisk build is not signed with a Developer ID, so macOS doesn't let it verify who connects to its local server. Use the official release, or (development only) set {ALLOW_UNVERIFIED_ENV}=1"),
+    ))
+}
+
+/// Who owns the client end of `peer` → `127.0.0.1:server_port`.
+fn peer_owner(peer: std::net::SocketAddr, server_port: u16) -> Result<PeerOwner, String> {
+    let run = |args: &[&str]| -> Option<String> {
+        let o = Command::new("/usr/sbin/netstat").args(args).output().ok()?;
+        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    // The socket table can lag the accept() by a few milliseconds: retry for up to ~0.6 s.
+    // The kernel NFS client simply reconnects if a connection is refused.
+    let mut delay = 10;
+    for _ in 0..7 {
         // Note: `netstat -p tcp` prints nothing when spawned from some processes on macOS 27,
         // so ask for the IPv4 table (falling back to everything) and filter rows ourselves.
-        let run = |args: &[&str]| -> Option<String> {
-            let o = Command::new("/usr/sbin/netstat").args(args).output().ok()?;
-            o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
-        };
-        let out = match run(&["-anv", "-f", "inet"]).filter(|o| o.lines().any(|l| l.starts_with("tcp"))).or_else(|| run(&["-anv"])) {
-            Some(o) => o,
-            None => {
-                eprintln!("lumendisk: netstat unavailable, falling back to AUTH_SYS checks only");
-                return true;
-            }
-        };
-        match parse_netstat_owner(&out, peer.port(), server_port) {
-            Some(PeerOwner::Kernel) => return true,
-            Some(PeerOwner::Process { pid, name }) => {
-                let uid = uid_of_pid(pid);
-                let ok = matches!(uid, Some(u) if u == me || u == 0);
-                if !ok {
-                    eprintln!("lumendisk: peer {peer} owned by {name}:{pid} uid {uid:?} → refused");
-                }
-                return ok;
-            }
-            None if attempt < 2 => std::thread::sleep(std::time::Duration::from_millis(30)),
-            // Unsigned / non-platform processes get a filtered socket table on recent macOS, so
-            // "not found" is not evidence of anything: fail open and rely on the export secret,
-            // single MOUNT, 128-bit handle secret and AUTH_SYS uid checks.
-            None => return true,
+        let out = run(&["-anv", "-f", "inet"])
+            .filter(|o| o.lines().any(|l| l.starts_with("tcp")))
+            .or_else(|| run(&["-anv"]))
+            .ok_or_else(|| "cannot read the socket table (netstat failed)".to_string())?;
+        if let Some(owner) = parse_netstat_owner(&out, peer.port(), server_port) {
+            return Ok(owner);
         }
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        delay *= 2;
     }
-    false
+    Err("socket owner not found".into())
 }
 
 /// The access policy for one volume's server.
@@ -674,6 +742,32 @@ tcp4       0      0  127.0.0.1.50101        127.0.0.1.11811        ESTABLISHED  
         assert_eq!(parse_netstat_owner(SAMPLE, 50101, 11811), Some(PeerOwner::Kernel));
         assert_eq!(parse_netstat_owner(SAMPLE, 50102, 11811), Some(PeerOwner::Process { name: "Google Chrome He".into(), pid: 74714 }));
         assert_eq!(parse_netstat_owner(SAMPLE, 1, 11811), None);
+    }
+
+    #[test]
+    fn peer_filter_is_fail_closed() {
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_s, peer) = l.accept().unwrap();
+        let ghost: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.7:50000".parse().unwrap();
+        // Never anything off-loopback, whatever the build or opt-in.
+        for (vis, allow) in [(true, false), (true, true), (false, false), (false, true)] {
+            assert!(!peer_is_trusted_with(remote, port, vis, allow));
+        }
+        // Table hidden (development build): refused unless explicitly allowed.
+        assert!(!peer_is_trusted_with(peer, port, false, false));
+        assert!(peer_is_trusted_with(peer, port, false, true));
+        if socket_table_visible() {
+            // Developer ID build: this very process (same uid) is identified and accepted…
+            assert!(peer_is_trusted_with(peer, port, true, false));
+            // …while a peer whose owner can't be found is refused, not waved through.
+            assert!(!peer_is_trusted_with(ghost, port, true, false));
+            assert!(!peer_is_trusted_with(ghost, port, true, true), "the opt-in never loosens a verifiable build");
+        }
+        drop(c);
     }
 }
 

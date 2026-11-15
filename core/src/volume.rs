@@ -270,7 +270,7 @@ pub struct ShareStatus {
 pub struct PortalStatus {
     /// https:// (encrypted; self-signed, phones warn once).
     pub url: String,
-    /// http:// compatibility address (unencrypted).
+    /// http:// compatibility address (unencrypted): only while explicitly enabled.
     pub http_url: Option<String>,
     pub fingerprint: String,
     pub pin: String,
@@ -851,6 +851,17 @@ impl Runtime {
             let host = crate::lan::lan_addresses().into_iter().next().ok_or_else(|| crate::i18n::t("nessuna rete Wi-Fi/Ethernet attiva", "no active Wi-Fi/Ethernet network"))?;
             let url = format!("https://{host}:{}/", srv.port());
             *v.portal.lock().unwrap() = Some((srv, pin, url));
+        }
+        self.portal_status(&v).ok_or_else(|| crate::i18n::t("portale non attivo", "portal is not active"))
+    }
+
+    /// Explicit, insecure opt-in: also serve the portal over unencrypted HTTP (or stop doing so).
+    pub fn portal_set_plain_http(&self, id: &str, enabled: bool) -> Result<PortalStatus, String> {
+        let v = self.get(id)?;
+        {
+            let g = v.portal.lock().unwrap();
+            let (srv, _, _) = g.as_ref().ok_or_else(|| crate::i18n::t("portale non attivo", "portal is not active"))?;
+            srv.set_plain_http(enabled).map_err(|e| e.to_string())?;
         }
         self.portal_status(&v).ok_or_else(|| crate::i18n::t("portale non attivo", "portal is not active"))
     }

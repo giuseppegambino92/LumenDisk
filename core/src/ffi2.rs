@@ -68,6 +68,12 @@ pub extern "C" fn ld_portal_start(id: *const c_char) -> *mut c_char {
     ffi_call(|| Ok(json!({"portal": runtime().portal_start(&arg_str(id)?)?})))
 }
 
+/// `enabled`: 1 opens the unencrypted HTTP compatibility address, 0 closes it.
+#[no_mangle]
+pub extern "C" fn ld_portal_set_plain_http(id: *const c_char, enabled: i32) -> *mut c_char {
+    ffi_call(|| Ok(json!({"portal": runtime().portal_set_plain_http(&arg_str(id)?, enabled != 0)?})))
+}
+
 #[no_mangle]
 pub extern "C" fn ld_portal_stop(id: *const c_char) -> *mut c_char {
     ffi_call(|| {

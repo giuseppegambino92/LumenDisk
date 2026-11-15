@@ -142,7 +142,8 @@ struct PortalStatus: Codable, Sendable, Hashable {
     var port: UInt16 = 0
     var uploads: UInt64 = 0
     var downloads: UInt64 = 0
-    // Phase 3 (TLS): `url` is https, `httpUrl` the unencrypted compatibility address.
+    // `url` is https; `httpUrl` is the unencrypted compatibility address, present only while
+    // the user has explicitly turned it on.
     var httpUrl: String?
     var fingerprint: String?
 

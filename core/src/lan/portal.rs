@@ -12,8 +12,9 @@
 //! The pages are self-contained (inline CSS/JS, inline SVG, no external URLs).
 //!
 //! # Schemes and sessions
-//! The portal is served over HTTPS (`port()`) and, for phones that refuse the self-signed
-//! certificate, plain HTTP (`http_port()`). The PIN and its rate limit are shared; sessions are
+//! The portal is served over HTTPS (`port()`) and, only when the user explicitly enables the
+//! insecure compatibility mode for phones that refuse the self-signed certificate, over plain
+//! HTTP (`http_port()`). The PIN and its rate limit are shared; sessions are
 //! not:
 //! * HTTPS login sets `__Host-ld_session=…; Secure; HttpOnly; SameSite=Strict; Path=/`. The
 //!   `__Host-` prefix makes browsers refuse to set or overwrite it from plain HTTP (no cookie

@@ -605,7 +605,11 @@ fn e2e_portal_and_volume_icon() {
     // …and the portal answers with a PIN page.
     let p = runtime().portal_start(&st.id).unwrap();
     assert_eq!(p.pin.len(), 6);
-    assert!(p.url.starts_with("https://") && p.http_url.as_deref().map(|u| u.starts_with("http://")).unwrap_or(false), "{p:?}");
+    assert!(p.url.starts_with("https://") && p.http_url.is_none(), "HTTPS only by default: {p:?}");
+    // The unencrypted address only exists after an explicit opt-in, and goes away again.
+    let p2 = runtime().portal_set_plain_http(&st.id, true).unwrap();
+    assert!(p2.http_url.as_deref().is_some_and(|u| u.starts_with("http://")), "{p2:?}");
+    assert!(runtime().portal_set_plain_http(&st.id, false).unwrap().http_url.is_none());
     let local = format!("https://127.0.0.1:{}/", p.port);
     let page = lumendisk_core::lan::pinned_agent(&p.fingerprint).get(&local).call().unwrap().into_string().unwrap();
     assert!(page.to_lowercase().contains("pin"), "{page}");
