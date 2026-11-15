@@ -1,0 +1,3 @@
+/* Local network permission prompt */
+"NSLocalNetworkUsageDescription" = "LumenDisk finds other Macs sharing disks on your network, shares your volumes when you ask it to, and lets your phone send and receive files over Wi-Fi.";
+"NSHumanReadableCopyright" = "© 2026 LumenDisk. All rights reserved.";

@@ -1,0 +1,4 @@
+module CLumenDisk [system] {
+    header "shim.h"
+    export *
+}

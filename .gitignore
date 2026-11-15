@@ -1,0 +1,17 @@
+# Build output
+/target/
+/build/
+/dist/
+/macos/.build/
+/macos/.swiftpm/
+/vendor/nfsserve/target/
+
+# Disk images and test data
+*.img
+*.dmg
+*.wal
+*.stage
+
+# macOS
+.DS_Store
+._*

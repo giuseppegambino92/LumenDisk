@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["core"]
+exclude = ["vendor/nfsserve"]
+
+[profile.release]
+opt-level = 3
+lto = false  # staticlib is linked by Apple's toolchain: ship native objects, not LLVM bitcode
+codegen-units = 4
+debug = false
+panic = "unwind"
