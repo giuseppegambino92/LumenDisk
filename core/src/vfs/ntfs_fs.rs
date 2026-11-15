@@ -2329,6 +2329,22 @@ impl FileSystem for NtfsFs {
         Ok(())
     }
 
+    fn fingerprint(&mut self) -> Option<String> {
+        // Windows rewrites $LogFile's restart area and $Volume on every mount, and the MFT
+        // records / MFT bitmap on every change; LumenDisk never writes them while reading.
+        let mut parts = vec![self.dev.read_vec(0, 512).ok()?];
+        for no in 0..16 {
+            parts.push(self.read_record_raw(no).unwrap_or_default());
+        }
+        parts.push(self.mft_bitmap.clone());
+        if let Ok(lf) = self.load_inode(2) {
+            if let Ok(Some(st)) = self.stream(&lf, AT_DATA, &[]) {
+                parts.push(self.read_stream(&st, 0, 65536.min(st.size())).unwrap_or_default());
+            }
+        }
+        Some(digest_parts(parts.iter().map(|p| &p[..])))
+    }
+
     fn dirty_state(&mut self) -> DirtyState {
         let mut reasons = vec![];
         match self.volume_flags() {

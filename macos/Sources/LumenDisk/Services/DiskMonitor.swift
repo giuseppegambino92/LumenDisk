@@ -349,6 +349,9 @@ final class DiskMonitor {
 
     /// Called once per partition the first time it appears (and again after re-plug).
     @ObservationIgnored var onPartitionAppeared: ((DiskDescription) -> Void)?
+    /// Called after a rebuild that added or removed partitions, or changed one's identity
+    /// (media UUID, label), after the `onPartitionAppeared` calls.
+    @ObservationIgnored var onPartitionsChanged: (() -> Void)?
 
     @ObservationIgnored private var descriptions: [String: DiskDescription] = [:]
     @ObservationIgnored private let engine = DiskArbitrationEngine()
@@ -484,11 +487,16 @@ final class DiskMonitor {
             result.append(PhysicalDisk(whole: whole, partitions: partitions))
         }
         result.sort { $0.whole.bsdName.localizedStandardCompare($1.whole.bsdName) == .orderedAscending }
+        let identity = { (list: [PhysicalDisk]) in
+            Set(list.flatMap(\.partitions).map { "\($0.bsdName)|\($0.mediaUUID ?? "")|\($0.volumeName ?? "")|\($0.probedLabel ?? "")" })
+        }
+        let partitionsChanged = identity(result) != identity(disks)
         if result != disks { disks = result }
 
         for partition in result.flatMap(\.partitions) where !announced.contains(partition.bsdName) {
             announced.insert(partition.bsdName)
             onPartitionAppeared?(partition)
         }
+        if partitionsChanged { onPartitionsChanged?() }
     }
 }

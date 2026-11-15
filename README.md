@@ -47,7 +47,7 @@ Requires macOS 14 Sonoma or later.
 
 ### Protection
 - **Ghost Shield**: `.DS_Store`, `._*` AppleDouble files, `.Spotlight-V100`, `.Trashes` and `.fseventsd` are kept in a local vault and never written to your Linux or Windows disk. Finder still works as usual.
-- **Shadow Mode**: every change is staged on the Mac. Review the list of added, modified and deleted files, then **Commit** to the disk or **Rollback** to leave it untouched.
+- **Shadow Mode**: every change is staged on the Mac. Review the list of added, modified and deleted files, then **Commit** to the disk or **Rollback** to leave it untouched. Staged changes are journaled on the Mac, so they survive a crash, a force-quit, a power cut or quitting the app: the next time the disk is connected LumenDisk offers to resume them. If a commit is interrupted (disk unplugged, disk full, crash), it continues from where it stopped; it is not undone. If the disk was changed elsewhere in the meantime, saved changes can only be discarded.
 - **Crash-safe writes**: an ordered metadata journal (like ext4 `data=ordered`). If the Mac loses power mid-copy, the disk is repaired automatically at the next mount. Large copies are written only once (0.05 % journal overhead on ext4).
 - **Linux permissions bridge**: files owned by your Linux user (e.g. `1000:1000`) look like yours on the Mac, and new files are saved with the Linux owner.
 - **Dirty-bit & journal doctor**: detects volumes left dirty by Windows or Linux (dirty flag, hibernation, unreplayed ext4 journal) and repairs them in one click.
@@ -127,9 +127,9 @@ mount_nfs 127.0.0.1:/<random export>  →  ~/Volumes/<Name>
 
 | Suite | What it proves |
 |---|---|
-| Unit (85) | every driver passes the same conformance suite; WAL crash replay; Ghost Shield; Shadow; remote cache races |
+| Unit (102) | every driver passes the same conformance suite; WAL crash replay; Ghost Shield; Shadow, incl. journal replay of random sessions, torn journals, a simulated crash at every step of a commit on ext4 and FAT32, and changes made to the disk elsewhere; remote cache races |
 | ext4 vs e2fsprogs (5) | real `mkfs.ext4` volumes (64bit, flex_bg, metadata_csum, orphan_file) modified by LumenDisk stay `e2fsck`-clean; jbd2 replay of a real transaction |
-| End-to-end (24) | real `mount_nfs` + Finder's NFS client on ext4 / FAT32 / exFAT / NTFS; Shadow; Doctor; Raspberry Pi image; NTFS symlinks; loopback security; HTTP Range images; offline LAN shares; SFTP; power loss with a 64 MB file; Apache WebDAV with offline queue across restarts; TLS through a sniffing proxy (no plaintext); a real attached block device |
+| End-to-end (26) | real `mount_nfs` + Finder's NFS client on ext4 / FAT32 / exFAT / NTFS; Shadow, incl. `kill -9` of the server with staged changes and in the middle of a commit, then `e2fsck`; Doctor; Raspberry Pi image; NTFS symlinks; loopback security; HTTP Range images; offline LAN shares; SFTP; power loss with a 64 MB file; Apache WebDAV with offline queue across restarts; TLS through a sniffing proxy (no plaintext); a real attached block device |
 | LAN server (21) · SFTP (4) | WebDAV/portal protocol over TLS; OpenSSH auth, timeouts and reconnects |
 | UI | every screen driven with the real engine and real volumes, in English and Italian |
 
@@ -141,6 +141,7 @@ mount_nfs 127.0.0.1:/<random export>  →  ~/Volumes/<Name>
 - NTFS: compressed and encrypted files are read-only; not yet verified against Windows `chkdsk`.
 - ext4 volumes using inline_data, encryption, casefold, bigalloc, quota or verity mount read-only.
 - Most USB bridges hide SMART data from macOS; LumenDisk then says so plainly.
+- Shadow Mode: a commit can't be rolled back once it has started; the guarantee is that it can always be finished. Changes made in the last ~100 ms before a crash may be lost. The check that the disk wasn't changed elsewhere looks at filesystem metadata and at the files the session touched, so an edit made elsewhere that leaves both unchanged can go unnoticed; it isn't done while a commit is being finished. Shadow changes on SFTP, WebDAV and LAN volumes stay in memory only.
 
 ## Support
 

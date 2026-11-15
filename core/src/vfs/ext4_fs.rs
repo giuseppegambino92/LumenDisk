@@ -2802,6 +2802,13 @@ impl FileSystem for Ext4Fs {
         self.ro_reason.clone()
     }
 
+    fn fingerprint(&mut self) -> Option<String> {
+        // Superblock (mount count, mount/write times, kbytes written, free counts, state) and
+        // group descriptors (per-group free counts / checksums): Linux changes them whenever it
+        // mounts the volume read/write or allocates; LumenDisk only when it writes.
+        Some(digest_parts(std::iter::once(&self.sb[..]).chain(self.gds.iter().map(|g| &g[..]))))
+    }
+
     fn dirty_state(&mut self) -> DirtyState {
         let state = r16(&self.sb, S_STATE);
         let mut reasons = vec![];

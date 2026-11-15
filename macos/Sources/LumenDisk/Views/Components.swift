@@ -380,6 +380,321 @@ struct DiagnosticBanner: View {
     }
 }
 
+// MARK: - Saved Shadow sessions
+
+/// Wording about saved Shadow sessions, shared by the recovery prompt, Shadow Staging, the
+/// volume detail and the partition page so the same situation always reads the same way.
+enum ShadowWording {
+    static func date(_ date: Date) -> String {
+        date.formatted(Date.FormatStyle(date: .long, time: .shortened, locale: L10n.locale))
+    }
+
+    static func unappliedTitle(changes: UInt64, name: String) -> String {
+        L10n.plural(changes,
+                    one: ("C'è %d modifica Shadow non applicata su \(name)", "There is %d unapplied Shadow change on \(name)"),
+                    other: ("Ci sono %d modifiche Shadow non applicate su \(name)", "There are %d unapplied Shadow changes on \(name)"))
+    }
+
+    static func interruptedTitle(name: String, applied: UInt64, total: UInt64) -> String {
+        L("L'applicazione delle modifiche Shadow su \(name) si è interrotta: \(applied) di \(total) già applicate",
+          "Applying Shadow changes to \(name) was interrupted: \(applied) of \(total) already applied")
+    }
+
+    static func appliedProgress(applied: UInt64, total: UInt64) -> String {
+        L("\(applied) di \(total) modifiche già applicate", "\(applied) of \(total) changes already applied")
+    }
+
+    static func promptTitle(for session: ShadowSession) -> String {
+        session.isCommitInterrupted
+            ? interruptedTitle(name: session.displayName, applied: session.commitApplied, total: session.commitTotal)
+            : unappliedTitle(changes: session.changeCount, name: session.displayName)
+    }
+
+    static func promptMessage(for session: ShadowSession) -> String {
+        let when = date(session.updatedDate)
+        var text: String
+        if session.isCommitInterrupted {
+            text = L("Il \(when) LumenDisk stava scrivendo le modifiche Shadow sul disco quando si è chiuso o il disco è stato scollegato. Le modifiche rimanenti sono state conservate su questo Mac.",
+                     "On \(when) LumenDisk was writing the Shadow changes to the disk when it was closed or the disk was disconnected. The remaining changes were kept on this Mac.")
+            if let error = session.commitError, !error.isEmpty {
+                text += "\n\n" + L("Ultimo errore: \(error)", "Last error: \(error)")
+            }
+            if !session.isStale {
+                text += "\n\n" + L("«Riprendi applicazione» monta il disco in Shadow Mode e completa le modifiche rimanenti.",
+                                   "“Resume applying” mounts the disk in Shadow Mode and finishes the remaining changes.")
+            }
+        } else {
+            text = L10n.plural(session.changeCount,
+                               one: ("Ultima modifica: \(when). È stata conservata su questo Mac dopo la chiusura di LumenDisk e non è ancora stata scritta sul disco.",
+                                     "Last change: \(when). It was kept on this Mac after LumenDisk was closed and hasn’t been written to the disk yet."),
+                               other: ("Ultima modifica: \(when). Sono state conservate su questo Mac dopo la chiusura di LumenDisk e non sono ancora state scritte sul disco.",
+                                       "Last change: \(when). They were kept on this Mac after LumenDisk was closed and haven’t been written to the disk yet."))
+            if !session.isStale {
+                text += "\n\n" + L("«Riprendi» monta il disco in Shadow Mode con le modifiche ripristinate: potrai rivederle, applicarle o scartarle.",
+                                   "“Resume” mounts the disk in Shadow Mode with the changes restored: you can then review, apply or discard them.")
+            }
+        }
+        if session.isStale {
+            text += "\n\n" + staleExplanation(session) + " "
+                + L("Le modifiche salvate si possono solo scartare.", "The saved changes can only be discarded.")
+        }
+        return text
+    }
+
+    static func staleExplanation(_ session: ShadowSession) -> String {
+        if let problem = session.fingerprintProblem, !problem.isEmpty { return problem }
+        return L("Il disco è stato modificato altrove dopo l'inizio della sessione Shadow.",
+                 "The disk was modified elsewhere after the Shadow session started.")
+    }
+
+    static func discardTitle(name: String) -> String {
+        L("Scartare le modifiche Shadow su «\(name)»?", "Discard the Shadow changes on “\(name)”?")
+    }
+
+    static func discardMessage(changes: UInt64) -> String {
+        L10n.plural(changes,
+                    one: ("La modifica verrà eliminata definitivamente; il disco resta com'era.",
+                          "The change will be deleted permanently; the disk stays as it was."),
+                    other: ("Le %d modifiche verranno eliminate definitivamente; il disco resta com'era.",
+                            "The %d changes will be deleted permanently; the disk stays as it was."))
+    }
+
+    static func discardButton(changes: UInt64) -> String {
+        L10n.plural(changes, one: ("Scarta %d Modifica", "Discard %d Change"), other: ("Scarta %d Modifiche", "Discard %d Changes"))
+    }
+
+    static func abandonTitle(name: String) -> String {
+        L("Abbandonare le modifiche non ancora applicate su «\(name)»?", "Abandon the changes not yet applied to “\(name)”?")
+    }
+
+    static func abandonMessage(applied: UInt64, total: UInt64) -> String {
+        guard total > 0 else {
+            return L("Le modifiche già applicate restano sul disco e non vengono annullate. Verranno eliminate definitivamente solo quelle non ancora applicate.",
+                     "The changes already applied stay on the disk and are not undone. Only the ones not yet applied will be deleted permanently.")
+        }
+        let remaining = total > applied ? total - applied : 0
+        return L("Le \(applied) modifiche già applicate restano sul disco e non vengono annullate. Verranno eliminate definitivamente solo le \(remaining) non ancora applicate, quindi il disco resterà a metà tra prima e dopo.",
+                 "The \(applied) changes already applied stay on the disk and are not undone. Only the \(remaining) not yet applied will be deleted permanently, so the disk will be left part-way between before and after.")
+    }
+
+    static var abandonButton: String { L("Abbandona il Resto", "Abandon the Rest") }
+
+    static var restoredNote: String { L("Modifiche ripristinate dalla sessione precedente", "Changes restored from the previous session") }
+
+    /// Eject confirmations: what happens to changes that are neither applied nor discarded.
+    static var keptOnEject: String {
+        L("Se espelli senza applicarle restano salvate su questo Mac: LumenDisk te le riproporrà la prossima volta che monti il disco.",
+          "If you eject without applying them they stay saved on this Mac: LumenDisk will offer them again the next time you mount the disk.")
+    }
+}
+
+/// Mounted volume whose Shadow commit stopped half-way: new writes are refused until the user
+/// retries or abandons the remaining steps.
+struct ShadowCommitInterruptedBanner: View {
+    @Environment(AppModel.self) private var model
+    var volume: VolumeStatus
+    @State private var confirmAbandon = false
+
+    var body: some View {
+        let shadow = volume.shadow ?? ShadowSummary()
+        let busy = model.activity(for: volume.id)
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
+                .font(.system(size: 20, weight: .medium))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.orange)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(busy == nil ? L("L'applicazione delle modifiche si è interrotta", "Applying the changes was interrupted")
+                                 : L("Applicazione delle modifiche in corso…", "Applying the changes…"))
+                    .font(.body.weight(.semibold))
+                Text(ShadowWording.appliedProgress(applied: shadow.commitApplied, total: shadow.commitTotal))
+                    .font(.callout)
+                    .monospacedDigit()
+                if shadow.commitTotal > 0 {
+                    ProgressView(value: Double(min(shadow.commitApplied, shadow.commitTotal)), total: Double(shadow.commitTotal))
+                        .tint(.orange)
+                        .frame(maxWidth: 320)
+                }
+                if let error = shadow.commitError, !error.isEmpty, busy == nil {
+                    Text(error)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                Text(L("Finché non riprovi o abbandoni il resto, il volume non accetta nuove modifiche.",
+                       "Until you retry or abandon the rest, the volume doesn’t accept new changes."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+            VStack(alignment: .trailing, spacing: 8) {
+                Button {
+                    Task { _ = await model.commitShadow(volume) }
+                } label: {
+                    if busy != nil {
+                        ProgressView().controlSize(.small).padding(.horizontal, 12)
+                    } else {
+                        Text(L("Riprova", "Retry"))
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                Button(L("Abbandona il resto…", "Abandon the rest…"), role: .destructive) { confirmAbandon = true }
+            }
+            .disabled(busy != nil)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.orange.opacity(0.22), lineWidth: 1))
+        .confirmationDialog(ShadowWording.abandonTitle(name: volume.displayName), isPresented: $confirmAbandon, titleVisibility: .visible) {
+            Button(ShadowWording.abandonButton, role: .destructive) {
+                Task { _ = await model.rollbackShadow(volume) }
+            }
+            Button(L("Annulla", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(ShadowWording.abandonMessage(applied: shadow.commitApplied, total: shadow.commitTotal))
+        }
+    }
+}
+
+/// "Modifiche ripristinate dalla sessione precedente".
+struct ShadowRestoredNote: View {
+    var body: some View {
+        Label(ShadowWording.restoredNote, systemImage: "clock.arrow.circlepath")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+    }
+}
+
+/// Card listing saved Shadow sessions whose volume isn't mounted.
+struct SavedShadowSessionsCard: View {
+    var sessions: [ShadowSession]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            CardHeader(title: L("Sessioni Shadow salvate", "Saved Shadow sessions"),
+                       subtitle: L("Modifiche conservate su questo Mac per dischi non montati. Collega il disco per riprenderle, oppure scartale.",
+                                   "Changes kept on this Mac for disks that aren’t mounted. Connect the disk to resume them, or discard them."),
+                       systemImage: "clock.arrow.circlepath")
+            ForEach(sessions) { session in
+                if session.id != sessions.first?.id { Divider() }
+                ShadowSessionRow(session: session)
+            }
+        }
+        .card()
+    }
+}
+
+/// One saved Shadow session with Resume (when its disk is connected) and a confirmed Discard.
+struct ShadowSessionRow: View {
+    @Environment(AppModel.self) private var model
+    var session: ShadowSession
+    @State private var confirmDiscard = false
+
+    private var counts: String {
+        var parts = [L10n.plural(session.changeCount, one: ("%d modifica", "%d change"), other: ("%d modifiche", "%d changes"))]
+        let detail = [(ShadowChangeKind.added, session.added), (.modified, session.modified), (.deleted, session.deleted)]
+            .filter { $0.1 > 0 }
+            .map { "\($0.1) \($0.0.pluralTitle.lowercased())" }
+        if !detail.isEmpty { parts.append(detail.joined(separator: ", ")) }
+        parts.append(ByteFormat.delta(session.pendingBytes))
+        return parts.joined(separator: " · ")
+    }
+
+    private var source: String {
+        if session.isPhysical {
+            if let partition = model.partition(for: session) {
+                return (model.diskMonitor.disk(containing: partition.bsdName)?.title ?? L("Disco esterno", "External disk")) + " · " + partition.devicePath
+            }
+            return L("Disco esterno", "External disk") + (session.size > 0 ? " · " + ByteFormat.string(session.size) : "")
+        }
+        if session.isImageURL { return session.sourcePath }
+        let path = (session.sourcePath as NSString).abbreviatingWithTildeInPath
+        return session.partition > 0 ? path + " · " + L("Partizione \(session.partition)", "Partition \(session.partition)") : path
+    }
+
+    var body: some View {
+        let connected = model.isConnected(session)
+        let busy = model.activity(for: model.activityKey(for: session))
+        HStack(alignment: .top, spacing: 12) {
+            IconBadge(systemImage: session.isPhysical ? "externaldrive.fill" : (session.isImageURL ? "globe" : "cylinder.split.1x2.fill"),
+                      tint: connected ? session.filesystem.tint : .gray, size: 34)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text(session.displayName).font(.body.weight(.semibold)).lineLimit(1)
+                    FilesystemPill(kind: session.filesystem, compact: true)
+                    StatusChip(title: connected ? L("Collegato", "Connected") : L("Non collegato", "Not connected"),
+                               systemImage: connected ? "checkmark.circle.fill" : "minus.circle",
+                               tint: connected ? .ldGood : .secondary)
+                    if session.isCommitInterrupted {
+                        StatusChip(title: L("Applicazione interrotta", "Apply interrupted"),
+                                   systemImage: "exclamationmark.triangle.fill", tint: .orange)
+                    }
+                }
+                Text(counts)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                if session.isCommitInterrupted {
+                    Text(ShadowWording.appliedProgress(applied: session.commitApplied, total: session.commitTotal)
+                         + (session.commitError.map { " — " + $0 } ?? ""))
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if session.isStale {
+                    Label(ShadowWording.staleExplanation(session) + " " + L("Si possono solo scartare.", "They can only be discarded."),
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(L("Aggiornata \(session.updatedDate.relativeDescription)", "Updated \(session.updatedDate.relativeDescription)") + " · " + source)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(ShadowWording.date(session.updatedDate) + "\n" + session.sourcePath)
+            }
+            Spacer(minLength: 8)
+            if let busy {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(busy).font(.callout).foregroundStyle(.secondary)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Button(session.isCommitInterrupted ? L("Abbandona il resto…", "Abandon the rest…") : L("Scarta…", "Discard…"), role: .destructive) {
+                        confirmDiscard = true
+                    }
+                    if model.canResume(session) {
+                        Button(session.isCommitInterrupted ? L("Riprendi applicazione", "Resume applying") : L("Riprendi", "Resume")) {
+                            Task { await model.resumeShadowSession(session) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+        }
+        .confirmationDialog(session.isCommitInterrupted ? ShadowWording.abandonTitle(name: session.displayName)
+                                                        : ShadowWording.discardTitle(name: session.displayName),
+                            isPresented: $confirmDiscard, titleVisibility: .visible) {
+            Button(session.isCommitInterrupted ? ShadowWording.abandonButton : ShadowWording.discardButton(changes: session.changeCount),
+                   role: .destructive) {
+                Task { await model.discardShadowSession(session) }
+            }
+            Button(L("Annulla", "Cancel"), role: .cancel) {}
+        } message: {
+            Text(session.isCommitInterrupted ? ShadowWording.abandonMessage(applied: session.commitApplied, total: session.commitTotal)
+                                             : ShadowWording.discardMessage(changes: session.changeCount))
+        }
+    }
+}
+
 /// Live Ghost Shield counter capsule.
 struct GhostBadge: View {
     var count: UInt64

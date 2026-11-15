@@ -151,9 +151,150 @@ struct ShadowSummary: Codable, Sendable, Hashable {
     var modified: UInt64 = 0
     var deleted: UInt64 = 0
     var pendingBytes: Int64 = 0
+    // Persistent sessions (absent on older cores)
+    /// Changes are journaled on this Mac and survive a crash, quit or eject.
+    var persistent = false
+    var sessionKey: String?
+    /// The changes were restored from a previous run when the volume was mounted.
+    var restored = false
+    /// `"pending"` or `"committing"` (a commit started and has not finished).
+    var state = ShadowSessionState.pending
+    var commitApplied: UInt64 = 0
+    var commitTotal: UInt64 = 0
+    var commitError: String?
 
     var totalChanges: UInt64 { added + modified + deleted }
     var hasChanges: Bool { totalChanges > 0 }
+    /// A commit started and did not finish: new writes are refused until it is retried or the
+    /// remaining steps are abandoned.
+    var isCommitInterrupted: Bool { state == ShadowSessionState.committing }
+    var commitRemaining: UInt64 { commitTotal > commitApplied ? commitTotal - commitApplied : 0 }
+
+    init() {}
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        added = try c.decodeIfPresent(UInt64.self, forKey: .added) ?? 0
+        modified = try c.decodeIfPresent(UInt64.self, forKey: .modified) ?? 0
+        deleted = try c.decodeIfPresent(UInt64.self, forKey: .deleted) ?? 0
+        pendingBytes = try c.decodeIfPresent(Int64.self, forKey: .pendingBytes) ?? 0
+        persistent = (try? c.decodeIfPresent(Bool.self, forKey: .persistent)) ?? false
+        sessionKey = (try? c.decodeIfPresent(String.self, forKey: .sessionKey)) ?? nil
+        restored = (try? c.decodeIfPresent(Bool.self, forKey: .restored)) ?? false
+        state = (try? c.decodeIfPresent(String.self, forKey: .state)) ?? ShadowSessionState.pending
+        commitApplied = (try? c.decodeIfPresent(UInt64.self, forKey: .commitApplied)) ?? 0
+        commitTotal = (try? c.decodeIfPresent(UInt64.self, forKey: .commitTotal)) ?? 0
+        commitError = (try? c.decodeIfPresent(String.self, forKey: .commitError)) ?? nil
+    }
+}
+
+enum ShadowSessionState {
+    static let pending = "pending"
+    static let committing = "committing"
+}
+
+/// A saved Shadow session (`ld_shadow_sessions`): the pending changes of one volume, kept on this
+/// Mac until they are committed or discarded, whether the volume is mounted or not.
+struct ShadowSession: Codable, Sendable, Hashable, Identifiable {
+    var key: String
+    var name: String
+    var label: String
+    var fsType: String
+    var uuid: String
+    var sourcePath: String
+    var partition: UInt32
+    /// `"local"` or `"image_url"`.
+    var kind: String
+    var mediaUUID: String?
+    var size: UInt64
+    var created: Int64
+    var updated: Int64
+    var state: String
+    var changes: UInt64
+    var added: UInt64
+    var modified: UInt64
+    var deleted: UInt64
+    var pendingBytes: Int64
+    var commitApplied: UInt64
+    var commitTotal: UInt64
+    var commitError: String?
+    /// The source path exists right now (image file or device node). For physical disks the app
+    /// also checks the media UUID: see `AppModel.isConnected(_:)`.
+    var connected: Bool
+    var mountedVolumeID: String?
+    /// nil = not verified, false = the disk was modified elsewhere (only Discard is possible).
+    var fingerprintOK: Bool?
+    var fingerprintProblem: String?
+
+    var id: String { key }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = try c.decode(String.self, forKey: .key)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
+        fsType = try c.decodeIfPresent(String.self, forKey: .fsType) ?? ""
+        uuid = try c.decodeIfPresent(String.self, forKey: .uuid) ?? ""
+        sourcePath = try c.decodeIfPresent(String.self, forKey: .sourcePath) ?? ""
+        partition = try c.decodeIfPresent(UInt32.self, forKey: .partition) ?? 0
+        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "local"
+        mediaUUID = try c.decodeIfPresent(String.self, forKey: .mediaUUID)
+        size = try c.decodeIfPresent(UInt64.self, forKey: .size) ?? 0
+        created = try c.decodeIfPresent(Int64.self, forKey: .created) ?? 0
+        updated = try c.decodeIfPresent(Int64.self, forKey: .updated) ?? created
+        state = try c.decodeIfPresent(String.self, forKey: .state) ?? ShadowSessionState.pending
+        added = try c.decodeIfPresent(UInt64.self, forKey: .added) ?? 0
+        modified = try c.decodeIfPresent(UInt64.self, forKey: .modified) ?? 0
+        deleted = try c.decodeIfPresent(UInt64.self, forKey: .deleted) ?? 0
+        changes = try c.decodeIfPresent(UInt64.self, forKey: .changes) ?? (added + modified + deleted)
+        pendingBytes = try c.decodeIfPresent(Int64.self, forKey: .pendingBytes) ?? 0
+        commitApplied = try c.decodeIfPresent(UInt64.self, forKey: .commitApplied) ?? 0
+        commitTotal = try c.decodeIfPresent(UInt64.self, forKey: .commitTotal) ?? 0
+        commitError = try c.decodeIfPresent(String.self, forKey: .commitError)
+        connected = try c.decodeIfPresent(Bool.self, forKey: .connected) ?? false
+        mountedVolumeID = try c.decodeIfPresent(String.self, forKey: .mountedVolumeID)
+        fingerprintOK = try c.decodeIfPresent(Bool.self, forKey: .fingerprintOK)
+        fingerprintProblem = try c.decodeIfPresent(String.self, forKey: .fingerprintProblem)
+    }
+
+    // Raw values are the keys after `.convertFromSnakeCase` ("media_uuid" → "mediaUuid").
+    enum CodingKeys: String, CodingKey {
+        case key, name, label, fsType, uuid, sourcePath, partition, kind
+        case mediaUUID = "mediaUuid"
+        case size, created, updated, state, changes, added, modified, deleted, pendingBytes
+        case commitApplied, commitTotal, commitError, connected
+        case mountedVolumeID = "mountedVolumeId"
+        case fingerprintOK = "fingerprintOk"
+        case fingerprintProblem
+    }
+
+    // MARK: Derived
+
+    var displayName: String {
+        if !name.isEmpty { return name }
+        if !label.isEmpty { return label }
+        return sourceFileName
+    }
+
+    var filesystem: FilesystemKind { FilesystemKind(coreName: fsType) }
+    var isImageURL: Bool { kind == "image_url" }
+    /// Physical partition (`/dev/diskNsM`), as opposed to an image file.
+    var deviceBSDName: String? { isImageURL ? nil : DeviceNode.bsdName(fromPath: sourcePath) }
+    var isPhysical: Bool { deviceBSDName != nil }
+    var isCommitInterrupted: Bool { state == ShadowSessionState.committing }
+    /// The disk was modified elsewhere since the session started: only Discard is possible.
+    var isStale: Bool { fingerprintOK == false }
+    var changeCount: UInt64 { changes > 0 ? changes : added + modified + deleted }
+    var commitRemaining: UInt64 { commitTotal > commitApplied ? commitTotal - commitApplied : 0 }
+    var updatedDate: Date { Date(timeIntervalSince1970: TimeInterval(updated > 0 ? updated : created)) }
+    var sourceFileName: String {
+        if isImageURL, let url = URL(string: sourcePath), !url.lastPathComponent.isEmpty { return url.lastPathComponent }
+        return URL(fileURLWithPath: sourcePath).lastPathComponent
+    }
+
+    /// What makes a recovery prompt worth showing again in the same run. The change count is
+    /// left out on purpose: it only moves when the user edits the volume in this run.
+    var promptSignature: String { "\(state)|\(isStale)|\(commitApplied)" }
 }
 
 struct UIDMapStatus: Codable, Sendable, Hashable {
@@ -250,6 +391,10 @@ struct VolumeStatus: Codable, Sendable, Hashable, Identifiable {
     /// layer by design): that is not something to repair.
     var needsRepair: Bool { dirty.isDirty || (forcedReadOnlyReason != nil && kind != .imageURL) }
     var hasPendingShadowChanges: Bool { mode == .shadow && (shadow?.hasChanges ?? false) }
+    /// A Shadow commit stopped half-way (crash, unplugged disk, I/O error).
+    var isShadowCommitInterrupted: Bool { mode == .shadow && (shadow?.isCommitInterrupted ?? false) }
+    /// Pending Shadow changes survive an eject or quit (kept on this Mac by the core).
+    var keepsShadowChanges: Bool { mode == .shadow && (shadow?.persistent ?? false) }
 
     /// `diskNsM` when the source is a physical device node, else nil.
     var deviceBSDName: String? {
@@ -502,6 +647,11 @@ struct MountRequest: Encodable, Sendable, Hashable {
     var name: String? = nil
     var fd: Int32? = nil
     var volumeIcon: String? = AppPaths.volumeIconPath
+    /// DiskArbitration media UUID of a physical partition, stored in its Shadow session so the
+    /// disk can be recognised when it is plugged in again.
+    var mediaUUID: String? = nil
+    /// `ShadowSession.key` to resume: the core refuses the mount if the source doesn't hold it.
+    var expectSession: String? = nil
 
     func encode(to encoder: any Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -514,8 +664,16 @@ struct MountRequest: Encodable, Sendable, Hashable {
         try c.encode(name, forKey: .name)
         try c.encode(fd, forKey: .fd)
         try c.encode(volumeIcon, forKey: .volumeIcon)
+        // Only sent when set, so older cores never see them.
+        try c.encodeIfPresent(mediaUUID, forKey: .mediaUUID)
+        try c.encodeIfPresent(expectSession, forKey: .expectSession)
     }
-    enum CodingKeys: String, CodingKey { case path, partition, mode, ghostShield, uidMap, mountRoot, name, fd, volumeIcon }
+    // `.convertToSnakeCase` turns these into "media_uuid" / "expect_session".
+    enum CodingKeys: String, CodingKey {
+        case path, partition, mode, ghostShield, uidMap, mountRoot, name, fd, volumeIcon
+        case mediaUUID = "mediaUuid"
+        case expectSession
+    }
 }
 
 struct SourceRequest: Encodable, Sendable {

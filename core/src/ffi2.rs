@@ -109,3 +109,15 @@ pub extern "C" fn ld_set_language(code: *const c_char) -> *mut c_char {
         Ok(json!({"language": if crate::i18n::is_english() { "en" } else { "it" }}))
     })
 }
+
+// ───────────── Persistent Shadow sessions ─────────────
+
+#[no_mangle]
+pub extern "C" fn ld_shadow_sessions() -> *mut c_char {
+    ffi_call(|| Ok(json!({"sessions": runtime().shadow_sessions()})))
+}
+
+#[no_mangle]
+pub extern "C" fn ld_shadow_discard_session(key: *const c_char) -> *mut c_char {
+    ffi_call(|| Ok(json!({"discarded": runtime().shadow_discard_session(&arg_str(key)?)?})))
+}

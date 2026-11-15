@@ -151,8 +151,15 @@ final class AppModel {
     private(set) var speedTests: [String: SpeedTestRecord] = [:]
     /// Hardware reports keyed by BSD name.
     private(set) var diskHealthReports: [String: DiskHealthLoad] = [:]
+    /// Saved Shadow sessions (mounted or not), refreshed on launch, disk hot-plug and after
+    /// mount / eject / commit / rollback / discard — not on every poll tick (it may read disks).
+    private(set) var shadowSessions: [ShadowSession] = []
 
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var sessionsRefreshTask: Task<Void, Never>?
+    /// Recovery prompts already shown in this run: session key → `promptSignature`.
+    @ObservationIgnored private var promptedSessions: [String: String] = [:]
+    @ObservationIgnored private var isPromptingSessions = false
     @ObservationIgnored private var isRefreshing = false
     @ObservationIgnored private var lastRefresh = Date.distantPast
     @ObservationIgnored private var autoMountAttempted: Set<String> = []
@@ -164,6 +171,14 @@ final class AppModel {
     var shadowVolumes: [VolumeStatus] { volumes.filter { $0.mode == .shadow } }
     var totalShadowChanges: UInt64 { shadowVolumes.reduce(0) { $0 + ($1.shadow?.totalChanges ?? 0) } }
     var pendingShadowVolumes: [VolumeStatus] { volumes.filter(\.hasPendingShadowChanges) }
+    /// Saved Shadow sessions that are not mounted right now.
+    var savedShadowSessions: [ShadowSession] {
+        shadowSessions.filter { session in session.mountedVolumeID.map { volume(id: $0) == nil } ?? true }
+    }
+    /// Pending Shadow changes on mounted volumes plus those saved for disks not mounted.
+    var totalPendingShadowChanges: UInt64 {
+        savedShadowSessions.reduce(totalShadowChanges) { $0 + $1.changeCount }
+    }
     var localVolumes: [VolumeStatus] { volumes.filter { !$0.isRemote } }
     var remoteVolumes: [VolumeStatus] { volumes.filter(\.isRemote) }
     /// Remote volumes with changes still waiting to be uploaded.
@@ -230,6 +245,9 @@ final class AppModel {
         diskMonitor.onPartitionAppeared = { [weak self] partition in
             self?.handleAppeared(partition)
         }
+        diskMonitor.onPartitionsChanged = { [weak self] in
+            self?.scheduleShadowSessionsRefresh()
+        }
         diskMonitor.start()
 
         await refresh(force: true)
@@ -237,6 +255,10 @@ final class AppModel {
             selection = volumes.first.map { .volume($0.id) } ?? .images
         }
         startPolling()
+        // Saved Shadow sessions: listed now, offered once the window and the disks plugged in at
+        // launch have settled (DiskArbitration announces them over the first second or so).
+        await refreshShadowSessions(prompt: false)
+        scheduleShadowSessionsRefresh(after: .milliseconds(1500))
         #if DEBUG
         DebugHooks.apply(to: self)
         #endif
@@ -344,16 +366,21 @@ final class AppModel {
             let volume = try await bridge.mount(request)
             await refresh(force: true)
             if select { selection = .volume(volume.id) }
+            await refreshShadowSessions()
             return volume
         } catch {
             present(L("Impossibile montare il volume", "Could not mount the volume"), error)
+            // A refused Shadow mount may have just found the disk modified elsewhere.
+            await refreshShadowSessions()
             return nil
         }
     }
 
     /// Mount a physical partition through LumenDisk, releasing macOS's own mount first.
+    /// `expectSession` resumes that saved Shadow session (the mount fails if the disk doesn't hold it).
     @discardableResult
-    func mountPhysical(_ partition: DiskDescription, options: MountOptions, select: Bool = true) async -> VolumeStatus? {
+    func mountPhysical(_ partition: DiskDescription, options: MountOptions, select: Bool = true,
+                       expectSession: String? = nil) async -> VolumeStatus? {
         let key = partition.bsdName
         guard !isBusy(key) else { return nil }
         if partition.isMountedByMacOS {
@@ -368,8 +395,10 @@ final class AppModel {
                 return nil
             }
         }
-        let request = MountRequest(path: partition.devicePath, partition: 0, mode: options.mode,
+        var request = MountRequest(path: partition.devicePath, partition: 0, mode: options.mode,
                                    ghostShield: options.ghostShield, uidMap: options.uidMap)
+        request.mediaUUID = partition.mediaUUID
+        request.expectSession = expectSession
         guard let volume = await mount(request, activityKey: key, select: select) else { return nil }
         rules.addAliases([partition.mediaUUID, partition.volumeUUID], toRuleWithVolumeUUID: volume.uuid, sourcePath: nil)
         return volume
@@ -380,6 +409,19 @@ final class AppModel {
               let rule = rule(for: partition), rule.automount,
               !autoMountAttempted.contains(partition.bsdName),
               !volumes.contains(where: { $0.deviceBSDName == partition.bsdName }) else { return }
+        var options = MountOptions(rule: rule)
+        if let session = shadowSession(for: partition) {
+            // The core refuses a read/write mount while Shadow changes are saved for this disk,
+            // and an interrupted commit or a disk modified elsewhere needs a decision: in those
+            // cases the recovery prompt (shown by the session refresh) replaces the automount.
+            // A Shadow rule simply mounts it: the core restores the saved changes.
+            guard rule.mode == .shadow, !session.isCommitInterrupted, !session.isStale else {
+                promptedSessions[session.key] = nil   // ask even if "Later" was chosen earlier
+                return
+            }
+            promptedSessions[session.key] = session.promptSignature
+            options.mode = .shadow
+        }
         autoMountAttempted.insert(partition.bsdName)
         Task {
             // Give DiskArbitration a moment to settle (macOS may still be probing the volume).
@@ -389,7 +431,7 @@ final class AppModel {
                 autoMountAttempted.remove(partition.bsdName)
                 return
             }
-            await mountPhysical(current, options: MountOptions(rule: rule), select: false)
+            await mountPhysical(current, options: options, select: false)
             autoMountAttempted.remove(partition.bsdName)
         }
     }
@@ -416,6 +458,7 @@ final class AppModel {
         }
         await refresh(force: true)
         await ejectDeviceIfIdle(bsdName: volume.deviceBSDName)
+        await refreshShadowSessions()
     }
 
     /// After LumenDisk released a physical partition, eject the device unless another LumenDisk
@@ -448,6 +491,7 @@ final class AppModel {
         let bsd = volume(id: inspection.volumeID)?.deviceBSDName
         await refresh(force: true)
         await ejectDeviceIfIdle(bsdName: bsd)
+        await refreshShadowSessions()
         return true
     }
 
@@ -461,6 +505,7 @@ final class AppModel {
             let result = try await bridge.unmountAll()
             await refresh(force: true)
             for bsd in Set(physical.map(DeviceNode.wholeDisk(of:))) { await ejectDeviceIfIdle(bsdName: bsd) }
+            await refreshShadowSessions()
             let failedNames = names(ofFailed: result.failed, among: snapshot)
             if !failedNames.isEmpty {
                 present(L("Alcuni volumi sono ancora in uso", "Some volumes are still in use"),
@@ -488,7 +533,18 @@ final class AppModel {
         let snapshot = volumes
         do {
             let result = try await bridge.unmountAll()
-            return names(ofFailed: result.failed, among: snapshot)
+            var failed: [String] = []
+            for entry in result.failed {
+                let id = entry.split(separator: ":", maxSplits: 1).first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? entry
+                // Persistent Shadow changes are kept on this Mac (the quit dialog said so):
+                // the core refuses a plain eject while they are pending, so force it.
+                if let v = snapshot.first(where: { $0.id == id }), v.keepsShadowChanges,
+                   (try? await bridge.unmount(volumeID: v.id, force: true)) != nil {
+                    continue
+                }
+                failed.append(entry)
+            }
+            return names(ofFailed: failed, among: snapshot)
         } catch {
             return volumes.map(\.displayName)
         }
@@ -518,6 +574,7 @@ final class AppModel {
             case nil: break
             }
         } catch {
+            await refresh(force: true)   // a failed commit leaves the volume in "committing" state
             present(L("Impossibile cambiare modalità", "Could not change the mode"), error)
             return
         }
@@ -532,12 +589,13 @@ final class AppModel {
             return
         }
 
-        let request = MountRequest(
+        var request = MountRequest(
             path: volume.sourcePath, partition: volume.partition, mode: mode,
             ghostShield: volume.ghost.enabled,
             uidMap: UIDMapRequest(enabled: volume.uidMap.enabled, linuxUid: volume.uidMap.linuxUid, linuxGid: volume.uidMap.linuxGid),
             mountRoot: volume.mountpoint.isEmpty ? AppPaths.defaultMountRoot : (volume.mountpoint as NSString).deletingLastPathComponent,
             name: volume.mountFolderName.isEmpty ? nil : volume.mountFolderName)
+        request.mediaUUID = physicalPartition(for: volume)?.mediaUUID
         do {
             let remounted = try await bridge.mount(request)
             if volume.ghost.rules != .all {
@@ -549,6 +607,7 @@ final class AppModel {
             await refresh(force: true)
             present(L("Il volume è stato smontato ma non rimontato", "The volume was unmounted but not remounted"), error)
         }
+        await refreshShadowSessions()
     }
 
     private func patchVolume(_ id: String, _ change: (inout VolumeStatus) -> Void) {
@@ -615,24 +674,272 @@ final class AppModel {
         do {
             try await bridge.shadowCommit(volumeID: volume.id)
             await refresh(force: true)
+            await refreshShadowSessions()
             return true
         } catch {
+            // A commit that stops half-way leaves the volume in "committing" state: show it.
+            await refresh(force: true)
+            await refreshShadowSessions()
             present(L("Impossibile applicare le modifiche", "Could not apply the changes"), error)
             return false
         }
     }
 
+    /// Discards the pending changes; after an interrupted commit it abandons only the steps not
+    /// yet applied (the applied ones stay on the disk).
     func rollbackShadow(_ volume: VolumeStatus) async -> Bool {
-        setActivity(volume.id, L("Annullamento delle modifiche…", "Discarding changes…"))
+        setActivity(volume.id, volume.isShadowCommitInterrupted ? L("Abbandono delle modifiche rimanenti…", "Abandoning the remaining changes…")
+                                                                : L("Annullamento delle modifiche…", "Discarding changes…"))
         defer { setActivity(volume.id, nil) }
         do {
             try await bridge.shadowRollback(volumeID: volume.id)
             await refresh(force: true)
+            await refreshShadowSessions()
             return true
         } catch {
+            await refresh(force: true)
             present(L("Impossibile scartare le modifiche", "Could not discard the changes"), error)
             return false
         }
+    }
+
+    // MARK: Saved Shadow sessions
+
+    /// Reloads `shadowSessions`, then offers the recoverable ones (see `promptForSavedSessions`).
+    func refreshShadowSessions(prompt: Bool = true) async {
+        guard isReady, !isTerminating else { return }
+        do {
+            let latest = try await bridge.shadowSessions()
+            if latest != shadowSessions { shadowSessions = latest }
+            // A session mounted in this run is something the user is already working on: don't
+            // offer it again after it is ejected (unless its state changes).
+            for session in latest {
+                if let id = session.mountedVolumeID, volume(id: id) != nil {
+                    promptedSessions[session.key] = session.promptSignature
+                }
+            }
+        } catch {
+            NSLog("LumenDisk: ld_shadow_sessions failed: \(error.localizedDescription)")
+            return
+        }
+        if prompt { promptForSavedSessions() }
+    }
+
+    /// Coalesces bursts of hot-plug events (a disk with several partitions) into one refresh.
+    func scheduleShadowSessionsRefresh(after delay: Duration = .milliseconds(700)) {
+        sessionsRefreshTask?.cancel()
+        sessionsRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled, let self else { return }
+            await self.refreshShadowSessions()
+        }
+    }
+
+    /// The connected physical partition holding `session`: media UUID first, else the same
+    /// device node with the same label. Nil for image sessions or when the disk isn't plugged in.
+    func partition(for session: ShadowSession) -> DiskDescription? {
+        guard let bsd = session.deviceBSDName else { return nil }
+        let partitions = diskMonitor.disks.flatMap(\.partitions)
+        let sessionMedia = session.mediaUUID.flatMap { $0.isEmpty ? nil : $0 }
+        if let sessionMedia,
+           let match = partitions.first(where: { $0.mediaUUID?.caseInsensitiveCompare(sessionMedia) == .orderedSame }) {
+            return match
+        }
+        return partitions.first { partition in
+            guard partition.bsdName == bsd else { return false }
+            // Two different media UUIDs: a different partition that got the same node.
+            if let sessionMedia, let media = partition.mediaUUID, !media.isEmpty,
+               media.caseInsensitiveCompare(sessionMedia) != .orderedSame { return false }
+            let labels = [partition.probedLabel, partition.volumeName].compactMap { $0 }.filter { !$0.isEmpty }
+            if session.label.isEmpty { return labels.isEmpty }
+            return labels.contains { $0.caseInsensitiveCompare(session.label) == .orderedSame }
+        }
+    }
+
+    /// The saved session of a physical partition, if any.
+    func shadowSession(for partition: DiskDescription) -> ShadowSession? {
+        shadowSessions.first { $0.isPhysical && self.partition(for: $0)?.bsdName == partition.bsdName }
+    }
+
+    /// The saved session of an image file partition, if any.
+    func shadowSession(imagePath: String, partition: UInt32) -> ShadowSession? {
+        shadowSessions.first { !$0.isPhysical && !$0.isImageURL && $0.sourcePath == imagePath && $0.partition == partition }
+    }
+
+    /// The volume this session is mounted as right now.
+    func mountedVolume(for session: ShadowSession) -> VolumeStatus? {
+        session.mountedVolumeID.flatMap { volume(id: $0) }
+    }
+
+    /// Whether the session's disk or image can be mounted right now.
+    func isConnected(_ session: ShadowSession) -> Bool {
+        if mountedVolume(for: session) != nil { return true }
+        if session.isPhysical { return partition(for: session) != nil }
+        return session.connected
+    }
+
+    func canResume(_ session: ShadowSession) -> Bool {
+        !session.isStale && mountedVolume(for: session) == nil && isConnected(session)
+    }
+
+    /// Activity key used while a session is being resumed or discarded.
+    func activityKey(for session: ShadowSession) -> String {
+        if let partition = partition(for: session) { return partition.bsdName }
+        return session.isPhysical || session.isImageURL ? "session:" + session.key : "\(session.sourcePath)#\(session.partition)"
+    }
+
+    /// Mounts the session's source in Shadow mode: the core restores the saved changes, or
+    /// finishes an interrupted commit.
+    @discardableResult
+    func resumeShadowSession(_ session: ShadowSession) async -> VolumeStatus? {
+        if let mounted = mountedVolume(for: session) {
+            shadowFocusID = mounted.id
+            selection = .shadow
+            return mounted
+        }
+        promptedSessions[session.key] = session.promptSignature
+        if session.isImageURL {
+            let key = activityKey(for: session)
+            setActivity(key, L("Montaggio…", "Mounting…"))
+            defer { setActivity(key, nil) }
+            do {
+                return try await mountImageURL(ImageURLRequest(url: session.sourcePath, partition: session.partition, mode: .shadow))
+            } catch {
+                present(L("Impossibile riprendere le modifiche Shadow", "Could not resume the Shadow changes"), error)
+                await refreshShadowSessions()
+                return nil
+            }
+        }
+        if session.isPhysical {
+            guard let partition = partition(for: session) else {
+                present(L("Disco non collegato", "Disk not connected"),
+                        message: L("Collega «\(session.displayName)» per riprendere le modifiche Shadow salvate.",
+                                   "Connect “\(session.displayName)” to resume the saved Shadow changes."))
+                return nil
+            }
+            var options = rule(for: partition).map(MountOptions.init(rule:)) ?? MountOptions()
+            options.mode = .shadow
+            return await mountPhysical(partition, options: options, expectSession: session.key)
+        }
+        let rule = rules.rule(matching: [session.uuid.isEmpty ? nil : session.uuid, session.sourcePath])
+        var request = MountRequest(path: session.sourcePath, partition: session.partition, mode: .shadow)
+        if let rule {
+            request.ghostShield = rule.ghostShield
+            request.uidMap = rule.uidMapRequest
+        }
+        request.expectSession = session.key
+        let volume = await mount(request, activityKey: activityKey(for: session))
+        if volume != nil { rememberRecent(URL(fileURLWithPath: session.sourcePath)) }
+        return volume
+    }
+
+    /// Deletes a saved session (the caller has already asked for confirmation). While a commit
+    /// is interrupted only the steps not yet applied are abandoned.
+    @discardableResult
+    func discardShadowSession(_ session: ShadowSession) async -> Bool {
+        let key = activityKey(for: session)
+        setActivity(key, session.isCommitInterrupted ? L("Abbandono delle modifiche rimanenti…", "Abandoning the remaining changes…")
+                                                     : L("Eliminazione delle modifiche…", "Deleting the changes…"))
+        defer { setActivity(key, nil) }
+        do {
+            try await bridge.discardShadowSession(key: session.key)
+            promptedSessions[session.key] = nil
+            if mountedVolume(for: session) != nil { await refresh(force: true) }
+            await refreshShadowSessions()
+            return true
+        } catch {
+            await refreshShadowSessions()
+            present(L("Impossibile scartare le modifiche", "Could not discard the changes"), error)
+            return false
+        }
+    }
+
+    // MARK: Recovery prompt
+
+    private enum RecoveryChoice { case resume, discard, later }
+
+    private var shadowPromptsDisabled: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.environment["LUMENDISK_NO_SHADOW_PROMPT"] == "1"
+        #else
+        false
+        #endif
+    }
+
+    /// Offers, one at a time, the saved sessions whose disk or image is connected but not mounted.
+    /// Each session is offered once per run unless its state changes.
+    private func promptForSavedSessions() {
+        guard isReady, !isTerminating, !isPromptingSessions, !shadowPromptsDisabled else { return }
+        let next = shadowSessions.first { session in
+            promptedSessions[session.key] != session.promptSignature
+                && mountedVolume(for: session) == nil
+                && isConnected(session)
+                && !isBusy(activityKey(for: session))
+                && (session.changeCount > 0 || session.isCommitInterrupted || session.isStale)
+        }
+        guard let session = next else { return }
+        promptedSessions[session.key] = session.promptSignature
+        isPromptingSessions = true
+        Task { @MainActor [weak self] in
+            // Let the window finish appearing and DiskArbitration settle before a modal alert.
+            try? await Task.sleep(for: .milliseconds(300))
+            guard let self else { return }
+            let choice = self.runRecoveryPrompt(for: session)
+            self.isPromptingSessions = false
+            switch choice {
+            case .resume: await self.resumeShadowSession(session)
+            case .discard: await self.discardShadowSession(session)
+            case .later: break
+            }
+            self.promptForSavedSessions()
+        }
+    }
+
+    /// NSAlert asking what to do with a saved session. Discard is confirmed before returning.
+    private func runRecoveryPrompt(for session: ShadowSession) -> RecoveryChoice {
+        let canResume = !session.isStale
+        while true {
+            let alert = NSAlert()
+            alert.alertStyle = canResume && !session.isCommitInterrupted ? .informational : .warning
+            alert.messageText = ShadowWording.promptTitle(for: session)
+            alert.informativeText = ShadowWording.promptMessage(for: session)
+            var choices: [RecoveryChoice] = []
+            if canResume {
+                alert.addButton(withTitle: session.isCommitInterrupted ? L("Riprendi applicazione", "Resume applying") : L("Riprendi", "Resume"))
+                choices.append(.resume)
+            }
+            let discard = alert.addButton(withTitle: session.isCommitInterrupted ? L("Abbandona il resto…", "Abandon the rest…") : L("Scarta…", "Discard…"))
+            discard.hasDestructiveAction = true
+            discard.keyEquivalent = ""   // never the default button
+            choices.append(.discard)
+            let later = alert.addButton(withTitle: L("Più tardi", "Later"))
+            later.keyEquivalent = "\u{1b}"
+            choices.append(.later)
+
+            NSApp.activate()
+            let index = alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+            let choice = choices.indices.contains(index) ? choices[index] : .later
+            if choice != .discard || confirmDiscard(session) { return choice }
+        }
+    }
+
+    private func confirmDiscard(_ session: ShadowSession) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if session.isCommitInterrupted {
+            alert.messageText = ShadowWording.abandonTitle(name: session.displayName)
+            alert.informativeText = ShadowWording.abandonMessage(applied: session.commitApplied, total: session.commitTotal)
+        } else {
+            alert.messageText = ShadowWording.discardTitle(name: session.displayName)
+            alert.informativeText = ShadowWording.discardMessage(changes: session.changeCount)
+        }
+        let confirm = alert.addButton(withTitle: session.isCommitInterrupted ? ShadowWording.abandonButton
+                                                                             : ShadowWording.discardButton(changes: session.changeCount))
+        confirm.hasDestructiveAction = true
+        confirm.keyEquivalent = ""
+        let cancel = alert.addButton(withTitle: L("Annulla", "Cancel"))
+        cancel.keyEquivalent = "\u{1b}"
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     // MARK: Lock inspector
@@ -698,9 +1005,12 @@ final class AppModel {
                 for partition in inspection.partitions {
                     let rule = rules.rule(matching: [partition.uuid, url.path])
                     let alreadyMounted = isMounted(path: url.path, partition: partition.index)
+                    // Saved Shadow changes can only be reopened in Shadow mode (the core
+                    // refuses a read/write mount and restores them in Shadow mode).
+                    let hasSavedSession = shadowSession(imagePath: url.path, partition: partition.index) != nil
                     session.choices[partition.index] = .init(
                         selected: partition.isMountable && !alreadyMounted,
-                        mode: rule?.mode ?? .readWrite,
+                        mode: hasSavedSession ? .shadow : (rule?.mode ?? .readWrite),
                         ruleName: rule?.displayName)
                     if let rule {
                         session.ghostShield = rule.ghostShield
@@ -875,6 +1185,7 @@ final class AppModel {
         let volume = try await bridge.mountImageURL(request)
         await refresh(force: true)
         selection = .volume(volume.id)
+        await refreshShadowSessions()
         return volume
     }
 

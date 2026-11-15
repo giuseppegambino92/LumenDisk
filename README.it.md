@@ -47,7 +47,7 @@ Richiede macOS 14 Sonoma o successivo.
 
 ### Protezione
 - **Ghost Shield**: `.DS_Store`, i file AppleDouble `._*`, `.Spotlight-V100`, `.Trashes` e `.fseventsd` restano in un archivio locale e non vengono mai scritti sul disco Linux o Windows. Il Finder funziona come sempre.
-- **Shadow Mode**: ogni modifica resta sul Mac. Controlli l'elenco dei file aggiunti, modificati ed eliminati, poi **Applica su Disco** oppure **Scarta Modifiche** e il disco resta intatto.
+- **Shadow Mode**: ogni modifica resta sul Mac. Controlli l'elenco dei file aggiunti, modificati ed eliminati, poi **Applica su Disco** oppure **Scarta Modifiche** e il disco resta intatto. Le modifiche in sospeso vengono registrate in un journal sul Mac, quindi sopravvivono a un crash, a un'uscita forzata, a un blackout o alla chiusura dell'app: la volta dopo che colleghi il disco LumenDisk ti propone di riprenderle. Se l'applicazione si interrompe (disco scollegato, disco pieno, crash), riparte da dove si era fermata; non viene annullata. Se nel frattempo il disco è stato modificato altrove, le modifiche salvate si possono solo scartare.
 - **Scritture a prova di blackout**: un journal ordinato dei metadati (come `data=ordered` di ext4). Se il Mac si spegne a metà copia, il disco viene riparato da solo al montaggio successivo. Le copie grandi vengono scritte una volta sola (0,05 % di journal in più su ext4).
 - **Ponte dei permessi Linux**: i file del tuo utente Linux (per esempio `1000:1000`) sul Mac risultano tuoi, e i file nuovi vengono salvati con il proprietario Linux.
 - **Riparazione flag "dirty" e journal**: riconosce i volumi lasciati in sospeso da Windows o Linux (flag dirty, ibernazione, journal ext4 non applicato) e li ripara con un clic.
@@ -127,9 +127,9 @@ mount_nfs 127.0.0.1:/<export casuale>  →  ~/Volumes/<Nome>
 
 | Suite | Cosa dimostra |
 |---|---|
-| Unitari (85) | ogni driver supera la stessa suite di conformità; replay del journal dopo un crash; Ghost Shield; Shadow; race della cache remota |
+| Unitari (102) | ogni driver supera la stessa suite di conformità; replay del journal dopo un crash; Ghost Shield; Shadow, compresi il replay del journal di sessioni casuali, journal troncati, un crash simulato a ogni passo dell'applicazione su ext4 e FAT32 e modifiche fatte al disco altrove; race della cache remota |
 | ext4 contro e2fsprogs (5) | volumi creati con il vero `mkfs.ext4` (64bit, flex_bg, metadata_csum, orphan_file) modificati da LumenDisk restano puliti per `e2fsck`; replay jbd2 di una transazione reale |
-| End-to-end (24) | `mount_nfs` reale + client NFS del Finder su ext4 / FAT32 / exFAT / NTFS; Shadow; riparazione; immagine Raspberry Pi; symlink NTFS; sicurezza del loopback; immagini via HTTP Range; condivisione LAN offline; SFTP; blackout con un file da 64 MB; WebDAV Apache con coda offline tra riavvii; TLS attraverso un proxy intercettatore (niente in chiaro); un dispositivo a blocchi reale collegato |
+| End-to-end (26) | `mount_nfs` reale + client NFS del Finder su ext4 / FAT32 / exFAT / NTFS; Shadow, compreso il `kill -9` del server con modifiche in sospeso e a metà applicazione, poi `e2fsck`; riparazione; immagine Raspberry Pi; symlink NTFS; sicurezza del loopback; immagini via HTTP Range; condivisione LAN offline; SFTP; blackout con un file da 64 MB; WebDAV Apache con coda offline tra riavvii; TLS attraverso un proxy intercettatore (niente in chiaro); un dispositivo a blocchi reale collegato |
 | Server LAN (21) · SFTP (4) | protocollo WebDAV/portale su TLS; autenticazione, timeout e riconnessioni con OpenSSH |
 | Interfaccia | ogni schermata guidata dal motore reale con volumi reali, in italiano e inglese |
 
@@ -141,6 +141,7 @@ mount_nfs 127.0.0.1:/<export casuale>  →  ~/Volumes/<Nome>
 - NTFS: i file compressi e cifrati sono in sola lettura; non ancora verificato con `chkdsk` di Windows.
 - I volumi ext4 con inline_data, cifratura, casefold, bigalloc, quota o verity vengono montati in sola lettura.
 - La maggior parte degli adattatori USB nasconde i dati SMART a macOS; in quel caso LumenDisk lo dice chiaramente.
+- Shadow Mode: un'applicazione delle modifiche già iniziata non si può annullare; la garanzia è che si può sempre portare a termine. Le modifiche degli ultimi ~100 ms prima di un crash possono andare perse. Il controllo che il disco non sia stato modificato altrove guarda i metadati del file system e i file toccati dalla sessione, quindi una modifica fatta altrove che non cambia né gli uni né gli altri può sfuggire; non viene fatto mentre si completa un'applicazione interrotta. Le modifiche Shadow sui volumi SFTP, WebDAV e LAN restano solo in memoria.
 
 ## Supporto
 

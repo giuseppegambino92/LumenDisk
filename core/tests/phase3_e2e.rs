@@ -40,6 +40,8 @@ fn req(dir: &Path, path: &str, mode: MountMode) -> MountRequest {
         name: None,
         fd: None,
         volume_icon: None,
+        media_uuid: None,
+        expect_session: None,
     }
 }
 

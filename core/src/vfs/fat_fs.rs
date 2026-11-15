@@ -2144,14 +2144,24 @@ impl FileSystem for FatFs {
             return Ok(());
         }
         self.flush_fat()?;
-        self.write_fsinfo()?;
         if self.marked {
+            // Only after our own mutations: a mount that just reads writes nothing.
+            self.write_fsinfo()?;
             self.set_dirty_flags(false)?;
             self.marked = false;
         }
         self.dev.flush()?;
         Ok(())
     }
+    fn fingerprint(&mut self) -> Option<String> {
+        // Boot sector (incl. the dirty flag), the whole FAT (any allocation / free) and the
+        // root directory entries. FSInfo is advisory and left out.
+        let boot = self.dev.read_vec(0, 512).ok()?;
+        let fat = self.fat.clone();
+        let root = listing_bytes(self, ROOT);
+        Some(digest_parts([&boot[..], &fat[..], &root[..]]))
+    }
+
     fn dirty_state(&mut self) -> DirtyState {
         match &self.dirty_reason {
             Some(r) => DirtyState::Dirty(r.clone()),

@@ -15,6 +15,7 @@ use crate::wal::{Journaled, WalDev, WalStats};
 use crate::nfs_loopback::{self, ChangeTracker, LoopbackServer, NfsBridge};
 use crate::vfs::ghost::{GhostEntry, GhostRules, GhostShield};
 use crate::vfs::shadow::{ShadowChange, ShadowOverlay, ShadowSummary};
+use crate::vfs::shadow_store::{self, Identity, Manifest};
 use crate::vfs::uidmap::{self, PermissionBridge, SharedUidMap, UidMap};
 use crate::vfs::*;
 
@@ -93,6 +94,9 @@ impl FileSystem for Lower {
     fn repair(&mut self) -> FsResult<String> {
         delegate!(self, repair())
     }
+    fn fingerprint(&mut self) -> Option<String> {
+        delegate!(self, fingerprint())
+    }
 }
 
 pub type Stack = GhostShield<Lower>;
@@ -142,6 +146,44 @@ pub struct MountRequest {
     /// .icns shown as the Finder volume icon (virtualised by Ghost Shield).
     #[serde(default)]
     pub volume_icon: Option<String>,
+    /// DiskArbitration media UUID of the partition, stored in a persistent Shadow session so
+    /// the app recognises the disk when it is connected again.
+    #[serde(default)]
+    pub media_uuid: Option<String>,
+    /// Resume this Shadow session (ShadowSession.key): refuse the mount if the source does not
+    /// hold it.
+    #[serde(default)]
+    pub expect_session: Option<String>,
+}
+
+/// A persistent Shadow session as listed by `ld_shadow_sessions`.
+#[derive(Clone, Debug, Serialize)]
+pub struct ShadowSessionInfo {
+    pub key: String,
+    pub name: String,
+    pub label: String,
+    pub fs_type: String,
+    pub uuid: String,
+    pub source_path: String,
+    pub partition: u32,
+    pub kind: String,
+    pub media_uuid: Option<String>,
+    pub size: u64,
+    pub created: i64,
+    pub updated: i64,
+    pub state: String,
+    pub changes: u64,
+    pub added: u64,
+    pub modified: u64,
+    pub deleted: u64,
+    pub pending_bytes: i64,
+    pub commit_applied: u64,
+    pub commit_total: u64,
+    pub commit_error: Option<String>,
+    pub connected: bool,
+    pub mounted_volume_id: Option<String>,
+    pub fingerprint_ok: Option<bool>,
+    pub fingerprint_problem: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -331,6 +373,8 @@ pub struct Volume {
     pub range: Option<Arc<CachedRangeDev>>,
     pub share: Mutex<Option<(crate::lan::LanServer, String)>>,
     pub portal: Mutex<Option<(crate::lan::LanServer, String, String)>>,
+    /// Persistent Shadow session of this volume.
+    pub session_key: Option<String>,
 }
 
 pub struct Runtime {
@@ -548,10 +592,49 @@ impl Runtime {
         let Prepared { layered, info, forced_ro, uid_map, kind, wal, remote, range, part } = p;
         let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
         let support = self.support();
+        let mut layered = layered;
+        let identity = Self::shadow_identity(kind, &req, &info, layered.as_mut());
+        let mut session_key = None;
         let lower = if req.mode == MountMode::Shadow {
-            let stage = support.join("Shadow").join(format!("{id}.stage"));
-            Lower::Shadow(ShadowOverlay::new(layered, stage).map_err(|e| e.to_string())?)
+            match identity {
+                Some(identity) => {
+                    // Persistent session: restores pending changes / finishes an interrupted commit.
+                    let key = shadow_store::session_key(&identity);
+                    if let Some(want) = &req.expect_session {
+                        if *want != key {
+                            return Err(crate::i18n::t(
+                                "Questo disco non corrisponde alla sessione Shadow salvata.",
+                                "This disk doesn't match the saved Shadow session.",
+                            ));
+                        }
+                    }
+                    if self.vols.lock().unwrap().values().any(|v| v.session_key.as_deref() == Some(key.as_str())) {
+                        return Err(crate::i18n::t("Questo volume è già montato.", "This volume is already mounted."));
+                    }
+                    let dir = shadow_store::sessions_root(&support).join(&key);
+                    let mut ov = ShadowOverlay::open_session(layered, dir, identity)?;
+                    if ov.commit_pending() {
+                        if let Err(e) = ov.commit() {
+                            eprintln!("lumendisk: resuming the interrupted Shadow commit: {e}");
+                        }
+                    }
+                    session_key = Some(key);
+                    Lower::Shadow(ov)
+                }
+                None => {
+                    let stage = shadow_store::sessions_root(&support).join(format!(".mem-{id}.stage"));
+                    Lower::Shadow(ShadowOverlay::new(layered, stage).map_err(|e| e.to_string())?)
+                }
+            }
         } else {
+            if req.mode == MountMode::ReadWrite && forced_ro.is_none() {
+                if let Some(identity) = &identity {
+                    let dir = shadow_store::sessions_root(&support).join(shadow_store::session_key(identity));
+                    if let Some(m) = Manifest::load(&dir) {
+                        return Err(Self::pending_session_message(&m));
+                    }
+                }
+            }
             Lower::Direct(layered)
         };
         let vault_key = if info.uuid.is_empty() { id.clone() } else {
@@ -595,11 +678,29 @@ impl Runtime {
         }
         let fs2 = fs.clone();
         let sync_task = self.rt.spawn(async move {
+            let mut n: u32 = 0;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tokio::time::sleep(crate::vfs::shadow::FLUSH_INTERVAL).await;
+                n = n.wrapping_add(1);
                 let fs3 = fs2.clone();
+                let full = n % 30 == 0;
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _ = lock_stack(&fs3).sync();
+                    if full {
+                        let _ = lock_stack(&fs3).sync();
+                    } else {
+                        // Group commit of the Shadow journal: the stage file is made durable
+                        // without holding the volume lock, so NFS writes keep flowing.
+                        let job = match &mut lock_stack(&fs3).inner {
+                            Lower::Shadow(s) => s.begin_background_flush(),
+                            Lower::Direct(_) => None,
+                        };
+                        if let Some(job) = job {
+                            let r = job.sync_stage();
+                            if let Lower::Shadow(s) = &mut lock_stack(&fs3).inner {
+                                s.finish_background_flush(job, r);
+                            }
+                        }
+                    }
                 })
                 .await;
             }
@@ -625,6 +726,7 @@ impl Runtime {
             range,
             share: Mutex::new(None),
             portal: Mutex::new(None),
+            session_key,
         });
         self.vols.lock().unwrap().insert(id, vol.clone());
         Ok(self.status(&vol))
@@ -721,6 +823,8 @@ impl Runtime {
             name: Some(label),
             fd: None,
             volume_icon: r.volume_icon.clone(),
+            media_uuid: None,
+            expect_session: None,
         };
         let p = Prepared { layered, info, forced_ro: None, uid_map, kind, wal: None, remote: Some(handle), range: None, part: None };
         self.publish(req, p)
@@ -785,6 +889,8 @@ impl Runtime {
             name: r.name.clone(),
             fd: None,
             volume_icon: r.volume_icon.clone(),
+            media_uuid: None,
+            expect_session: None,
         };
         let p = Prepared {
             layered,
@@ -987,6 +1093,9 @@ impl Runtime {
         {
             let mut g = lock_stack(&v.fs);
             if let Lower::Shadow(s) = &mut g.inner {
+                if s.commit_pending() && !force {
+                    return Err(crate::i18n::t("L'applicazione delle modifiche Shadow si è interrotta: riprova (Commit) o abbandona il resto (Rollback) prima di espellere.", "Applying the Shadow changes was interrupted: retry (Commit) or abandon the rest (Rollback) before ejecting."));
+                }
                 if s.has_changes() && !s.changes().is_empty() && !force {
                     return Err(crate::i18n::t("Ci sono modifiche Shadow non applicate: applicale (Commit) o scartale (Rollback) prima di espellere.", "There are pending Shadow changes: apply (Commit) or discard (Rollback) them before ejecting."));
                 }
@@ -1101,6 +1210,28 @@ impl Runtime {
         let replayed = self.replay_pending_wal(path, partition, fd).unwrap_or(0);
         let (dev, _) = open_partition(path, partition, false, fd)?;
         let mut fs = open_fs(dev, false, MountDefaults::default()).map_err(|e| e.to_string())?;
+        // A repair writes to the disk: it would invalidate saved Shadow changes.
+        let req = MountRequest {
+            path: path.into(),
+            partition,
+            mode: MountMode::ReadWrite,
+            ghost_shield: false,
+            ghost_rules: None,
+            uid_map: None,
+            mount_root: None,
+            name: None,
+            fd: None,
+            volume_icon: None,
+            media_uuid: None,
+            expect_session: None,
+        };
+        let info = fs.volume_info();
+        if let Some(id) = Self::shadow_identity(VolumeKind::Local, &req, &info, fs.as_mut()) {
+            let dir = shadow_store::sessions_root(&self.support()).join(shadow_store::session_key(&id));
+            if let Some(m) = Manifest::load(&dir) {
+                return Err(Self::pending_session_message(&m));
+            }
+        }
         if replayed > 0 {
             eprintln!("lumendisk: replayed {replayed} journal record(s) before repair");
         }
@@ -1144,6 +1275,151 @@ impl Runtime {
             return Err(e.to_string());
         }
         Ok(path.to_string())
+    }
+}
+
+impl Runtime {
+    /// Identity of a volume for persistent Shadow sessions (None: remote filesystems, whose
+    /// Shadow changes stay in memory).
+    fn shadow_identity(kind: VolumeKind, req: &MountRequest, info: &VolumeInfo, fs: &mut dyn FileSystem) -> Option<Identity> {
+        let kind = match kind {
+            VolumeKind::Local => "local",
+            VolumeKind::ImageUrl => "image_url",
+            _ => return None,
+        };
+        Some(Identity {
+            kind: kind.into(),
+            fs_type: info.fs_type.label().into(),
+            uuid: info.uuid.clone(),
+            label: info.label.clone(),
+            // Absolute, so that "is it connected?" works from any working directory.
+            source_path: if kind == "local" { std::fs::canonicalize(&req.path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| req.path.clone()) } else { req.path.clone() },
+            partition: req.partition,
+            size: fs.statfs().map(|s| s.total_bytes).unwrap_or(0),
+            media_uuid: req.media_uuid.clone(),
+        })
+    }
+
+    fn session_display_name(m: &Manifest) -> String {
+        let l = m.identity.label.trim();
+        if l.is_empty() {
+            format!("{} Volume", m.identity.fs_type)
+        } else {
+            l.to_string()
+        }
+    }
+
+    fn pending_session_message(m: &Manifest) -> String {
+        let name = Self::session_display_name(m);
+        if m.state == "committing" {
+            crate::i18n::t(
+                &format!("L'applicazione delle modifiche Shadow su {name} si è interrotta ({} di {} passi già applicati): montalo in Shadow Mode per completarla, oppure abbandona il resto.", m.commit_applied, m.commit_total),
+                &format!("Applying the Shadow changes to {name} was interrupted ({} of {} steps already applied): mount it in Shadow Mode to finish, or abandon the rest.", m.commit_applied, m.commit_total),
+            )
+        } else {
+            let n = m.counts.changes;
+            crate::i18n::t(
+                &format!("Ci sono {n} modifiche Shadow non applicate su {name}: montalo in Shadow Mode per riprenderle, oppure scartale prima di montarlo in lettura/scrittura."),
+                &format!("There are {n} unapplied Shadow changes on {name}: mount it in Shadow Mode to resume them, or discard them before mounting it read/write."),
+            )
+        }
+    }
+
+    /// Every saved Shadow session, mounted or not.
+    pub fn shadow_sessions(&self) -> Vec<ShadowSessionInfo> {
+        let support = self.support();
+        let mounted: Vec<(String, String)> = self.vols.lock().unwrap().values().filter_map(|v| v.session_key.clone().map(|k| (k, v.id.clone()))).collect();
+        let mut out = vec![];
+        for (dir, m) in shadow_store::list_sessions(&support) {
+            let key = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let mounted_id = mounted.iter().find(|(k, _)| *k == key).map(|x| x.1.clone());
+            // A live session: report its current counters.
+            let (mut counts, mut state, mut applied, mut total, mut cerr) =
+                (m.counts.clone(), m.state.clone(), m.commit_applied, m.commit_total, m.commit_error.clone());
+            if let Some(id) = &mounted_id {
+                if let Ok(v) = self.get(id) {
+                    let mut g = lock_stack(&v.fs);
+                    if let Lower::Shadow(s) = &mut g.inner {
+                        let sm = s.summary();
+                        counts = shadow_store::Counts { changes: sm.added + sm.modified + sm.deleted, added: sm.added, modified: sm.modified, deleted: sm.deleted, pending_bytes: sm.pending_bytes };
+                        state = sm.state.to_string();
+                        (applied, total, cerr) = (sm.commit_applied, sm.commit_total, sm.commit_error);
+                    }
+                }
+            }
+            if mounted_id.is_none() && state == "committing" {
+                applied = shadow_store::checkpointed_steps(&dir).unwrap_or(applied).max(applied);
+            }
+            let connected = m.identity.kind == "local" && Path::new(&m.identity.source_path).exists();
+            let (fingerprint_ok, fingerprint_problem) = match (&m.drift, mounted_id.is_some()) {
+                (Some(d), _) => (Some(false), Some(d.clone())),
+                (None, true) => (Some(true), None),
+                (None, false) if connected && m.state == "pending" => match Self::check_fingerprint(&m) {
+                    Some(true) => (Some(true), None),
+                    Some(false) => (Some(false), Some(crate::i18n::t("Il disco è stato modificato altrove dopo l'inizio della sessione Shadow.", "The disk was modified elsewhere after the Shadow session started."))),
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
+            out.push(ShadowSessionInfo {
+                key,
+                name: Self::session_display_name(&m),
+                label: m.identity.label.clone(),
+                fs_type: m.identity.fs_type.clone(),
+                uuid: m.identity.uuid.clone(),
+                source_path: m.identity.source_path.clone(),
+                partition: m.identity.partition,
+                kind: m.identity.kind.clone(),
+                media_uuid: m.identity.media_uuid.clone(),
+                size: m.identity.size,
+                created: m.created,
+                updated: m.updated,
+                state,
+                changes: counts.changes,
+                added: counts.added,
+                modified: counts.modified,
+                deleted: counts.deleted,
+                pending_bytes: counts.pending_bytes,
+                commit_applied: applied,
+                commit_total: total,
+                commit_error: cerr,
+                connected,
+                mounted_volume_id: mounted_id,
+                fingerprint_ok,
+                fingerprint_problem,
+            });
+        }
+        out
+    }
+
+    /// Compare the saved fingerprint with the disk, when the source is readable without
+    /// authorisation (image files). None: can't tell.
+    fn check_fingerprint(m: &Manifest) -> Option<bool> {
+        let want = m.fingerprint.as_ref()?;
+        let (dev, _) = open_partition(&m.identity.source_path, m.identity.partition, true, None).ok()?;
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_fs(dev, true, MountDefaults::default())));
+        let mut fs = opened.ok()?.ok()?;
+        let vi = fs.volume_info();
+        if vi.uuid != m.identity.uuid || vi.fs_type.label() != m.identity.fs_type {
+            return Some(false);
+        }
+        Some(fs.fingerprint().as_ref() == Some(want))
+    }
+
+    /// Delete a saved session. If its volume is mounted this is a Shadow rollback (which, while
+    /// a commit is interrupted, abandons only the steps not applied yet).
+    pub fn shadow_discard_session(&self, key: &str) -> Result<u64, String> {
+        if key.is_empty() || key.contains('/') || key.starts_with('.') {
+            return Err(crate::i18n::t("sessione non valida", "invalid session"));
+        }
+        let mounted = self.vols.lock().unwrap().values().find(|v| v.session_key.as_deref() == Some(key)).map(|v| v.id.clone());
+        if let Some(id) = mounted {
+            return self.shadow_rollback(&id);
+        }
+        let dir = shadow_store::sessions_root(&self.support()).join(key);
+        let m = Manifest::load(&dir).ok_or_else(|| crate::i18n::t("sessione Shadow non trovata", "Shadow session not found"))?;
+        shadow_store::remove_session_dir(&dir).map_err(|e| e.to_string())?;
+        Ok(if m.state == "committing" { m.commit_total.saturating_sub(m.commit_applied) } else { m.counts.changes })
     }
 }
 

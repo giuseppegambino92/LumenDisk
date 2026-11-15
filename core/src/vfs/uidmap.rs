@@ -161,6 +161,12 @@ impl FileSystem for PermissionBridge {
     fn repair(&mut self) -> FsResult<String> {
         self.inner.repair()
     }
+    fn read_only_reason(&self) -> Option<String> {
+        self.inner.read_only_reason()
+    }
+    fn fingerprint(&mut self) -> Option<String> {
+        self.inner.fingerprint()
+    }
 }
 
 #[cfg(test)]

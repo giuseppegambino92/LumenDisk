@@ -35,6 +35,7 @@ private struct VolumesReply: Decodable, Sendable { var volumes: [VolumeStatus] }
 private struct ChangesReply: Decodable, Sendable { var changes: [ShadowChange] }
 private struct AppliedReply: Decodable, Sendable { var applied: UInt64? }
 private struct DiscardedReply: Decodable, Sendable { var discarded: UInt64? }
+private struct SessionsReply: Decodable, Sendable { var sessions: [ShadowSession]? }
 private struct EntriesReply: Decodable, Sendable { var entries: [GhostEntry] }
 private struct HoldersReply: Decodable, Sendable { var holders: [LockHolder] }
 private struct TerminatedReply: Decodable, Sendable { var terminated: [Int32]? }
@@ -123,6 +124,18 @@ actor CoreBridge {
     @discardableResult
     func shadowRollback(volumeID: String) async throws -> UInt64 {
         try await checked(DiscardedReply.self) { ld_shadow_rollback(volumeID) }.discarded ?? 0
+    }
+
+    /// Every saved Shadow session, mounted or not. May read the disks to verify fingerprints.
+    func shadowSessions() async throws -> [ShadowSession] {
+        try await checked(SessionsReply.self) { ld_shadow_sessions() }.sessions ?? []
+    }
+
+    /// Deletes a saved session and its pending changes (only the not-yet-applied steps of an
+    /// interrupted commit).
+    @discardableResult
+    func discardShadowSession(key: String) async throws -> UInt64 {
+        try await checked(DiscardedReply.self) { ld_shadow_discard_session(key) }.discarded ?? 0
     }
 
     // MARK: Ghost Shield

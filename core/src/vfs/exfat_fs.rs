@@ -1759,14 +1759,27 @@ impl FileSystem for ExFatFs {
             return Ok(());
         }
         self.flush_meta()?;
-        self.write_percent()?;
         if self.marked {
+            // Only after our own mutations: a mount that just reads writes nothing.
+            self.write_percent()?;
             self.set_volume_flags(VF_DIRTY, false)?;
             self.marked = false;
         }
         self.dev.flush()?;
         Ok(())
     }
+    fn fingerprint(&mut self) -> Option<String> {
+        // Boot sector without VolumeFlags / PercentInUse, FAT, allocation bitmap and the root
+        // directory entries.
+        let mut boot = self.dev.read_vec(0, 512).ok()?;
+        boot[106..108].fill(0);
+        boot[112] = 0;
+        let (fat, bitmap) = (self.fat.clone(), self.bitmap.clone());
+        let root = self.root_ino();
+        let listing = listing_bytes(self, root);
+        Some(digest_parts([&boot[..], &fat[..], &bitmap[..], &listing[..]]))
+    }
+
     fn dirty_state(&mut self) -> DirtyState {
         match &self.dirty_reason {
             Some(r) => DirtyState::Dirty(r.clone()),
