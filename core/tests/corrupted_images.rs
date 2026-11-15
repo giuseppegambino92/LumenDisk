@@ -11,7 +11,7 @@
 //! without a runaway allocation (a counting global allocator caps it).
 //!
 //! Knobs:
-//! * `LUMENDISK_CORRUPT_CASES=N`  number of mutants (default 4000)
+//! * `LUMENDISK_CORRUPT_CASES=N`  number of mutants (default 16000; partition tables get half that)
 //! * `LUMENDISK_CORRUPT_SEED=S`   start of the case-number range (explore other mutants)
 //! * `LUMENDISK_CORRUPT_ONLY=name` only seeds whose name contains `name` (ext4, ntfs, fat12...)
 //! * `LUMENDISK_CORRUPT_VERBOSE=1` print every case before running it
@@ -35,8 +35,10 @@ use lumendisk_core::fuzzkit::{self, Budget, Driver, Seed};
 /// the case) up to [`ABORT_CAP`], and aborts above that.
 const HARD_CAP: usize = 1 << 30;
 const ABORT_CAP: usize = 64 << 30;
-/// Peak live bytes one case may add on its worker thread.
-const SOFT_CAP: isize = 512 << 20;
+/// Peak live bytes one case may add on its worker thread, on top of the image itself: what a
+/// driver legitimately caches (FAT, bitmaps, a directory, a 64 KiB read) is far below this.
+/// Anything above means an on-disk size sized a buffer.
+const SOFT_CAP: isize = 48 << 20;
 
 struct Counting;
 
@@ -180,6 +182,7 @@ struct Failure {
 
 /// One case on the current thread: Err(reason) on panic or allocation blow-up.
 fn run_case(driver: Driver, img: Vec<u8>, budget: &Budget) -> Result<fuzzkit::Stats, String> {
+    let cap = SOFT_CAP + 2 * img.len() as isize;
     let base = LIVE.with(|l| l.get());
     PEAK.with(|p| p.set(base));
     HUGE.with(|h| h.set(0));
@@ -189,11 +192,12 @@ fn run_case(driver: Driver, img: Vec<u8>, budget: &Budget) -> Result<fuzzkit::St
     match r {
         _ if huge > 0 => Err(format!("single allocation of {} MiB", huge >> 20)),
         Err(_) => Err(format!("panic: {}", PANIC_MSG.with(|m| m.borrow_mut().take()).unwrap_or_default())),
-        Ok(_) if peak > SOFT_CAP => Err(format!("allocated {} MiB at peak", peak >> 20)),
+        Ok(_) if peak > cap => Err(format!("allocated {} MiB at peak", peak >> 20)),
         Ok(st) => Ok(st),
     }
 }
 
+static RAN: AtomicU64 = AtomicU64::new(0);
 static COUNT_RO: AtomicU64 = AtomicU64::new(0);
 static COUNT_RW: AtomicU64 = AtomicU64::new(0);
 static COUNT_ENTRIES: AtomicU64 = AtomicU64::new(0);
@@ -201,6 +205,10 @@ static COUNT_ERRS: AtomicU64 = AtomicU64::new(0);
 
 /// Run `cases` mutants spread over `seeds` on all cores with a per-case time limit.
 fn run_mutants(seeds: Arc<Vec<Seed>>, first: u64, cases: u64, limit: Duration) -> Vec<Failure> {
+    // Unoptimized builds are ~10x slower: stop starting new cases after the time budget
+    // (the count actually run is reported).
+    let budget = Duration::from_secs(env_u64("LUMENDISK_CORRUPT_BUDGET_SECS", 240));
+    let start = Instant::now();
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
     let next = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(Mutex::new(Vec::<Failure>::new()));
@@ -215,9 +223,10 @@ fn run_mutants(seeds: Arc<Vec<Seed>>, first: u64, cases: u64, limit: Duration) -
             .spawn(move || {
                 loop {
                     let i = next.fetch_add(1, Ordering::SeqCst);
-                    if i >= cases {
+                    if i >= cases || start.elapsed() > budget {
                         break;
                     }
+                    RAN.fetch_add(1, Ordering::Relaxed);
                     let seed = &seeds[(i % seeds.len() as u64) as usize];
                     let case = first + i / seeds.len() as u64;
                     let (img, desc) = fuzzkit::mutate(seed, case);
@@ -309,14 +318,18 @@ fn corrupted_images_never_crash_hang_or_blow_up() {
         seeds.retain(|s| s.name.contains(o.as_str()));
     }
     assert!(!seeds.is_empty());
-    let cases = env_u64("LUMENDISK_CORRUPT_CASES", 4000);
+    let cases = env_u64("LUMENDISK_CORRUPT_CASES", 16000);
     let first = env_u64("LUMENDISK_CORRUPT_SEED", 0);
     let nseeds = seeds.len();
     let drivers: std::collections::HashSet<_> = seeds.iter().map(|s| s.driver).collect();
     let build = t0.elapsed();
     let failures = run_mutants(Arc::new(seeds), first, cases, Duration::from_secs(20));
+    let ran = RAN.load(Ordering::Relaxed);
+    if ran < cases {
+        println!("  (time budget reached: {ran} of {cases} cases run; set LUMENDISK_CORRUPT_BUDGET_SECS to run them all)");
+    }
     println!(
-        "corrupted images: {cases} cases, {} filesystems ({nseeds} seed images), {:.1} s (seeds built in {:.1} s), biggest single allocation {} KiB",
+        "corrupted images: {ran} cases, {} filesystems ({nseeds} seed images), {:.1} s (seeds built in {:.1} s), biggest single allocation {} KiB",
         drivers.len(),
         t0.elapsed().as_secs_f64(),
         build.as_secs_f64(),
@@ -419,31 +432,56 @@ fn must_survive(what: &str, driver: Driver, img: Vec<u8>) {
 }
 
 #[test]
-fn ext4_extent_tree_cycle_and_disorder() {
+fn ext4_extent_tree_fan_out_and_huge_offsets() {
     quiet_panics();
-    // frag-a.bin has more than 4 extents: a depth-1 tree with one leaf block.
-    let (s, off, _, _) = ext4_node("ext4", &["frag-a.bin"]);
+    let (s, off, _, ino) = ext4_node("ext4", &["frag-a.bin"]);
+    let (_, _, big, _) = ext4_node("ext4", &["big.bin"]);
     let ib = off as usize + 0x28;
-    assert_eq!(rd(&s.img, ib + 6, 2), 1, "seed layout changed: expected a depth-1 extent tree");
-    let leaf = rd(&s.img, ib + 12 + 4, 4) as usize;
-    let n = rd(&s.img, leaf * s.bs + 2, 2) as usize;
-    assert!(n >= 5);
-    // 1) the leaf turned into an index node whose entries all point back to itself: used to
-    //    recurse 6 levels deep with an n^6 fan-out (hang).
+    let per = (s.bs - 12) / 12;
+    // 1) A depth-5 tree whose every index entry at each level points to the same node: only
+    //    5 distinct blocks, but 4 * per^4 node visits and 4 * per^5 extents (hang, then OOM).
+    //    Each node is now visited once.
     let mut img = s.img.clone();
-    let lb = leaf * s.bs;
-    wr(&mut img, lb + 6, 2, 1);
-    for k in 0..n {
-        wr(&mut img, lb + 12 + k * 12 + 4, 4, leaf as u64);
-        wr(&mut img, lb + 12 + k * 12 + 8, 2, 0);
+    let node = |k: usize| big[k] as usize;
+    let header = |img: &mut Vec<u8>, at: usize, n: usize, max: usize, depth: u64| {
+        wr(img, at, 2, 0xF30A);
+        wr(img, at + 2, 2, n as u64);
+        wr(img, at + 4, 2, max as u64);
+        wr(img, at + 6, 2, depth);
+    };
+    header(&mut img, ib, 4, 4, 5);
+    for k in 0..4 {
+        wr(&mut img, ib + 12 + 12 * k + 4, 4, node(4) as u64);
+        wr(&mut img, ib + 12 + 12 * k + 8, 2, 0);
     }
-    must_survive("extent index cycle", Driver::Ext4, img);
-    // 2) unsorted extents: the hole walk in read_data went backwards (overflow / endless loop).
+    for d in (1..=4).rev() {
+        let at = node(d) * s.bs;
+        header(&mut img, at, per, per, d as u64);
+        for k in 0..per {
+            wr(&mut img, at + 12 + 12 * k, 4, k as u64);
+            wr(&mut img, at + 12 + 12 * k + 4, 4, node(d - 1) as u64);
+            wr(&mut img, at + 12 + 12 * k + 8, 2, 0);
+        }
+    }
+    let at = node(0) * s.bs;
+    header(&mut img, at, per, per, 0);
+    for k in 0..per {
+        wr(&mut img, at + 12 + 12 * k, 4, k as u64);
+        wr(&mut img, at + 12 + 12 * k + 4, 2, 1);
+        wr(&mut img, at + 12 + 12 * k + 8, 4, node(0) as u64);
+    }
+    must_survive("extent tree fan-out", Driver::Ext4, img);
+    // 2) i_size near 2^48 and a read at 4 TiB + 5 KiB: the block number wrapped to 5 in u32,
+    //    so an extent of the start of the file was "found" past the offset (subtract overflow).
     let mut img = s.img.clone();
-    let l1 = rd(&img, lb + 12 + 12, 4);
-    wr(&mut img, lb + 12, 4, l1 + 3);
-    wr(&mut img, lb + 12 + 12, 4, 0);
-    must_survive("unsorted extents", Driver::Ext4, img);
+    wr(&mut img, off as usize + 0x6C, 4, 0xFFFF);
+    let dev: Arc<dyn lumendisk_core::block::BlockDev> = Arc::new(lumendisk_core::block::MemDev::from_vec(img.clone()));
+    let mut fs = Driver::Ext4.open(dev, false).unwrap();
+    let r = fs.read(ino, (1 << 42) + 5 * 1024, 4096).unwrap();
+    assert!(r.iter().all(|&b| b == 0), "data mapped beyond 2^32 blocks");
+    let _ = fs.setattr(ino, &lumendisk_core::vfs::SetAttr { size: Some((1 << 42) + 5000), ..Default::default() });
+    drop(fs);
+    must_survive("huge offsets", Driver::Ext4, img);
 }
 
 #[test]
@@ -473,15 +511,17 @@ fn ext4_impossible_sizes_and_geometry() {
 fn ext2_indirect_block_cycle() {
     quiet_panics();
     // big.bin (150 KB, 1 KiB blocks) uses the single indirect block. Point the triple-indirect
-    // slot at it and make its first entry point to itself: the walk used to expand it to
-    // 256^3 mappings.
+    // slot at it and fill it with its own block number: the walk used to expand that into
+    // 256^3 mappings (hundreds of MB, seconds).
     let (s, off, _, _) = ext4_node("ext2", &["big.bin"]);
     let ib = off as usize + 0x28;
     let ind = rd(&s.img, ib + 48, 4);
     assert!(ind != 0);
     let mut img = s.img.clone();
     wr(&mut img, ib + 56, 4, ind);
-    wr(&mut img, ind as usize * s.bs, 4, ind);
+    for k in 0..s.bs / 4 {
+        wr(&mut img, ind as usize * s.bs + 4 * k, 4, ind);
+    }
     must_survive("indirect cycle", Driver::Ext4, img);
 }
 
@@ -563,47 +603,71 @@ fn ext4_dirent_naming_a_reserved_inode_is_not_unlinked() {
     let _ = jo;
 }
 
+/// Rewrite the entry set of `name` in the root directory of an exFAT image (checksum fixed).
+fn exfat_patch_root_entry(img: &mut [u8], name: &str, f: impl FnOnce(&mut [u8], u64, usize)) {
+    let bps = 1usize << img[108];
+    let cs = bps << img[109];
+    let heap = rd(img, 88, 4) as usize * bps;
+    let root = rd(img, 96, 4);
+    let root_off = heap + (root as usize - 2) * cs;
+    let mut i = root_off;
+    while i < root_off + cs {
+        if img[i] == 0x85 {
+            let sc = img[i + 1] as usize;
+            let end = i + (1 + sc) * 32;
+            let nl = img[i + 35] as usize;
+            let n: Vec<u16> = (0..nl).map(|k| rd(img, i + 64 + (k / 15) * 32 + 2 + (k % 15) * 2, 2) as u16).collect();
+            if String::from_utf16_lossy(&n) == name {
+                f(&mut img[i..end], root, cs);
+                let mut c: u16 = 0;
+                for (k, &b) in img[i..end].iter().enumerate() {
+                    if k != 2 && k != 3 {
+                        c = c.rotate_right(1).wrapping_add(b as u16);
+                    }
+                }
+                wr(img, i + 2, 2, c as u64);
+                return;
+            }
+            i = end;
+        } else {
+            i += 32;
+        }
+    }
+    panic!("seed layout changed: {name} not found in the exFAT root directory");
+}
+
 #[test]
 fn exfat_directory_loop_does_not_hang_the_doctor() {
     quiet_panics();
     // The "docs" subdirectory's stream entry pointed at the root directory's cluster: the
     // Doctor's usage scan walked the loop until its 1M-directory guard (minutes).
     let mut img = fuzzkit::seed_by_name("exfat", false).unwrap().image;
-    let bps = 1usize << img[108];
-    let spc = 1usize << img[109];
-    let heap = rd(&img, 88, 4) as usize * bps;
-    let root = rd(&img, 96, 4);
-    let root_off = heap + (root as usize - 2) * bps * spc;
-    let mut i = root_off;
-    let mut done = false;
-    while i < root_off + bps * spc {
-        if img[i] == 0x85 {
-            let sc = img[i + 1] as usize;
-            let set = i..i + (1 + sc) * 32;
-            let nl = img[i + 35] as usize;
-            let name: Vec<u16> = (0..nl).map(|k| rd(&img, i + 64 + (k / 15) * 32 + 2 + (k % 15) * 2, 2) as u16).collect();
-            if String::from_utf16_lossy(&name) == "docs" {
-                img[i + 33] = 0x01; // allocated, FAT chain (like the root)
-                wr(&mut img, i + 52, 4, root);
-                wr(&mut img, i + 56, 8, (bps * spc) as u64);
-                wr(&mut img, i + 40, 8, (bps * spc) as u64);
-                let mut c: u16 = 0;
-                for (k, &b) in img[set.clone()].iter().enumerate() {
-                    if k != 2 && k != 3 {
-                        c = c.rotate_right(1).wrapping_add(b as u16);
-                    }
-                }
-                wr(&mut img, i + 2, 2, c as u64);
-                done = true;
-                break;
-            }
-            i = set.end;
-        } else {
-            i += 32;
-        }
-    }
-    assert!(done, "seed layout changed: docs not found in the root directory");
+    exfat_patch_root_entry(&mut img, "docs", |set, root, cs| {
+        set[33] = 0x01; // allocated, FAT chain (like the root)
+        wr(set, 52, 4, root);
+        wr(set, 56, 8, cs as u64);
+        wr(set, 40, 8, cs as u64);
+    });
     must_survive("exFAT directory loop", Driver::ExFat, img);
+}
+
+#[test]
+fn exfat_impossible_stream_sizes() {
+    quiet_panics();
+    // DataLength = 2^64 - 1: allocation arithmetic (size.div_ceil(cs) * cs) overflowed in
+    // getattr / read / unlink; contiguous streams starting past the heap.
+    for (name, first, nofat) in [("big.bin", None, true), ("big.bin", None, false), ("hello.txt", Some(0xFFFF_FFF0u32), true)] {
+        let mut img = fuzzkit::seed_by_name("exfat", false).unwrap().image;
+        exfat_patch_root_entry(&mut img, name, |set, _, _| {
+            wr(set, 56, 8, u64::MAX);
+            wr(set, 40, 8, u64::MAX);
+            set[33] = if nofat { 0x03 } else { 0x01 };
+            if let Some(f) = first {
+                wr(set, 52, 4, f as u64);
+            }
+        });
+        must_survive("exFAT stream sizes", Driver::ExFat, img);
+    }
 }
 
 /// Seeds are reproducible (regression patches depend on it).
@@ -639,4 +703,29 @@ fn replay_image() {
     let img = std::fs::read(path).unwrap();
     let st = fuzzkit::exercise(driver, img, &Budget::default());
     println!("{st:?}");
+}
+
+/// MBR (incl. EBR chains) and GPT tables, mutated: the parser never panics, never loops on
+/// a cyclic EBR chain and never returns a partition outside the device.
+#[test]
+fn partition_tables_never_crash() {
+    quiet_panics();
+    let cases = env_u64("LUMENDISK_CORRUPT_CASES", 16000) / 2;
+    let seeds = [fuzzkit::partition_seed(false), fuzzkit::partition_seed(true)];
+    assert_eq!(fuzzkit::exercise_partitions(seeds[0].clone()), 4);
+    assert_eq!(fuzzkit::exercise_partitions(seeds[1].clone()), 3);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut failures = vec![];
+        for case in 0..cases {
+            let img = fuzzkit::mutate_partitions(&seeds[(case % 2) as usize], case);
+            if std::panic::catch_unwind(|| fuzzkit::exercise_partitions(img)).is_err() {
+                failures.push(Failure { what: format!("partition case {case}: {}", PANIC_MSG.with(|m| m.borrow_mut().take()).unwrap_or_default()) });
+            }
+        }
+        let _ = tx.send(failures);
+    });
+    let failures = rx.recv_timeout(Duration::from_secs(120)).expect("partition cases hung");
+    println!("partition tables: {cases} mutants");
+    report(&failures);
 }

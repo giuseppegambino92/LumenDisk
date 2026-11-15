@@ -178,6 +178,8 @@ impl AlignedDev {
 
 impl BlockDev for AlignedDev {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        // Validate before computing the aligned span (and allocating the bounce buffer).
+        bounds(offset, buf.len(), self.inner.size())?;
         let (s, e) = self.span(offset, buf.len());
         if s == offset && e == offset + buf.len() as u64 {
             return self.inner.read_at(offset, buf);
@@ -189,11 +191,12 @@ impl BlockDev for AlignedDev {
         Ok(())
     }
     fn write_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        bounds(offset, buf.len(), self.inner.size())?;
         let (s, e) = self.span(offset, buf.len());
         if s == offset && e == offset + buf.len() as u64 {
             return self.inner.write_at(offset, buf);
         }
-        let _g = self.lock.lock().unwrap();
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut tmp = vec![0u8; (e - s) as usize];
         self.inner.read_at(s, &mut tmp)?;
         let o = (offset - s) as usize;
@@ -223,7 +226,7 @@ pub struct PartitionDev {
 
 impl PartitionDev {
     pub fn new(inner: Arc<dyn BlockDev>, offset: u64, len: u64) -> io::Result<Self> {
-        if offset + len > inner.size() {
+        if offset.checked_add(len).map_or(true, |e| e > inner.size()) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "partition exceeds device"));
         }
         Ok(PartitionDev { inner, offset, len })
@@ -431,7 +434,12 @@ fn parse_gpt(dev: &dyn BlockDev, ss: u64) -> io::Result<Option<Vec<PartitionInfo
     if esz < 128 || esz > 4096 {
         return Ok(None);
     }
-    let table = dev.read_vec(entries_lba * ss, (n * esz) as usize)?;
+    // A header pointing its table outside the device is not a usable GPT (the backup header
+    // is not consulted): fall back to MBR / no table instead of failing the whole disk.
+    let Some(table_off) = entries_lba.checked_mul(ss).filter(|o| o.checked_add(n * esz).map_or(false, |e| e <= dev.size())) else {
+        return Ok(None);
+    };
+    let table = dev.read_vec(table_off, (n * esz) as usize)?;
     let mut out = vec![];
     for i in 0..n {
         let e = &table[(i * esz) as usize..((i + 1) * esz) as usize];
@@ -444,11 +452,18 @@ fn parse_gpt(dev: &dyn BlockDev, ss: u64) -> io::Result<Option<Vec<PartitionInfo
         if last < first {
             continue;
         }
+        // Entries must describe a range of the device (u64 arithmetic must not wrap).
+        let (Some(start), Some(size)) = (first.checked_mul(ss), (last - first).checked_add(1).and_then(|n| n.checked_mul(ss))) else {
+            continue;
+        };
+        if start.checked_add(size).map_or(true, |e| e > dev.size()) {
+            continue;
+        }
         let name_u16: Vec<u16> = (0..36).map(|k| le16(e, 56 + k * 2)).take_while(|&c| c != 0).collect();
         out.push(PartitionInfo {
             index: i as u32 + 1,
-            start: first * ss,
-            size: (last - first + 1) * ss,
+            start,
+            size,
             scheme: "GPT".into(),
             type_name: gpt_type_name(&type_guid).into(),
             type_id: type_guid,
@@ -483,12 +498,13 @@ fn parse_mbr(dev: &dyn BlockDev, mbr: &[u8]) -> io::Result<Vec<PartitionInfo>> {
             name: String::new(),
         });
     }
-    // Logical partitions (EBR chain).
+    // Logical partitions (EBR chain). A chain that loops back is cut at the first repeat.
     if let Some(base) = ext_base {
         let mut ebr_lba = base;
         let mut idx = 5;
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..128 {
-            if (ebr_lba + 1) * SECTOR > dev.size() {
+            if (ebr_lba + 1) * SECTOR > dev.size() || !seen.insert(ebr_lba) {
                 break;
             }
             let ebr = dev.read_vec(ebr_lba * SECTOR, 512)?;

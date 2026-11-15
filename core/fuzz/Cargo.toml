@@ -45,3 +45,10 @@ path = "fuzz_targets/exfat.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "partitions"
+path = "fuzz_targets/partitions.rs"
+test = false
+doc = false
+bench = false

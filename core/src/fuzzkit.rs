@@ -522,6 +522,82 @@ fn mutate_once(seed: &Seed, img: &mut Vec<u8>, r: &mut Rng) -> String {
     }
 }
 
+/// Make a mutant pass the integrity checks that would otherwise reject it at the door, so
+/// the corruption reaches the code behind them: exFAT boot-region, entry-set and up-case
+/// checksums, NTFS update-sequence fixups of MFT / index records. (ext4 checksums are not
+/// verified by the driver; FAT has none.)
+pub fn fix_checksums(img: &mut [u8]) {
+    if img.len() >= 512 && &img[3..11] == b"EXFAT   " {
+        fix_exfat(img);
+    }
+    if img.len() >= 512 && &img[3..11] == b"NTFS    " {
+        fix_ntfs_fixups(img);
+    }
+}
+
+fn fix_exfat(img: &mut [u8]) {
+    let (bps_sh, spc_sh) = (img[108] as usize, img[109] as usize);
+    if !(9..=12).contains(&bps_sh) || spc_sh > 25 - bps_sh {
+        return;
+    }
+    let bps = 1usize << bps_sh;
+    let cs = bps << spc_sh;
+    // boot regions (main + backup): 11 sectors checksummed into the 12th
+    for base in [0, 12 * bps] {
+        if base + 12 * bps <= img.len() {
+            let c = vfs::exfat_fs::boot_checksum(&img[base..base + 11 * bps]);
+            for k in 0..bps / 4 {
+                wr(img, base + 11 * bps + 4 * k, 4, c as u64);
+            }
+        }
+    }
+    let heap = rd(img, 88, 4) as usize * bps;
+    let end = (heap.saturating_add((rd(img, 92, 4) as usize).saturating_mul(cs))).min(img.len());
+    let mut i = heap;
+    while i + 64 <= end {
+        match img[i] {
+            0x85 => {
+                let sc = img[i + 1] as usize;
+                let n = (1 + sc) * 32;
+                if (2..=18).contains(&sc) && i + n <= end && img[i + 32] == 0xC0 {
+                    let c = vfs::exfat_fs::set_checksum(&img[i..i + n]);
+                    wr(img, i + 2, 2, c as u64);
+                }
+            }
+            0x82 => {
+                // up-case table: contiguous clusters from FirstCluster
+                let first = rd(img, i + 20, 4) as usize;
+                let len = rd(img, i + 24, 8) as usize;
+                let at = heap.saturating_add(first.saturating_sub(2).saturating_mul(cs));
+                if first >= 2 && len <= 128 << 10 && at.saturating_add(len) <= img.len() {
+                    let c = vfs::exfat_fs::table_checksum(&img[at..at + len]);
+                    wr(img, i + 4, 4, c as u64);
+                }
+            }
+            _ => {}
+        }
+        i += 32;
+    }
+}
+
+fn fix_ntfs_fixups(img: &mut [u8]) {
+    let mut i = 0;
+    while i + 512 <= img.len() {
+        let magic = &img[i..i + 4];
+        if magic == b"FILE" || magic == b"INDX" {
+            let usa = rd(img, i + 4, 2) as usize;
+            let count = rd(img, i + 6, 2) as usize;
+            if count >= 2 && count <= 129 && usa + 2 * count <= 512 && i + (count - 1) * 512 <= img.len() {
+                let usn = rd(img, i + usa, 2);
+                for k in 1..count {
+                    wr(img, i + k * 512 - 2, 2, usn);
+                }
+            }
+        }
+        i += 512;
+    }
+}
+
 /// Deterministically corrupt `seed` for case number `case`. Returns the mutant and a
 /// description of what was done.
 pub fn mutate(seed: &Seed, case: u64) -> (Vec<u8>, String) {
@@ -532,6 +608,10 @@ pub fn mutate(seed: &Seed, case: u64) -> (Vec<u8>, String) {
     let mut desc = vec![];
     for _ in 0..n {
         desc.push(mutate_once(seed, &mut img, &mut r));
+    }
+    if r.chance(60) {
+        fix_checksums(&mut img);
+        desc.push("checksums fixed".into());
     }
     (img, desc.join("; "))
 }
@@ -639,6 +719,9 @@ fn walk(fs: &mut dyn FileSystem, b: &Budget, st: &mut Stats, nodes: &mut Vec<Nod
                     let _ = fs.read(e.ino, attr.size.saturating_sub(100), 4096);
                     let _ = fs.read(e.ino, attr.size.saturating_add(1 << 20), 10);
                     let _ = fs.read(e.ino, u64::MAX - 10, 4096);
+                    // offsets whose block number no longer fits in 32 bits (16 / 64 TiB)
+                    let _ = fs.read(e.ino, (1 << 42) + 5000, 4096);
+                    let _ = fs.read(e.ino, (1 << 44) + 5000, 4096);
                 }
                 FileKind::Symlink => {
                     if fs.readlink(e.ino).is_err() {
@@ -754,13 +837,14 @@ pub fn exercise(driver: Driver, image: Vec<u8>, b: &Budget) -> Stats {
 /// Largest device a fuzz input may describe.
 pub const FUZZ_MAX_DEV: u64 = 64 << 20;
 
-/// Fuzz input format: `u32 LE device size in 512-byte sectors`, then the image prefix (the
-/// device is zero-filled past it). Lets a 34 MiB FAT32 volume be a ~1 MiB input.
+/// Fuzz input format: `u32 LE device size in 512-byte sectors` (bit 31: run
+/// [`fix_checksums`] on the image), then the image prefix (the device is zero-filled past
+/// it). Lets a 34 MiB FAT32 volume be a ~1 MiB input.
 pub fn decode_fuzz_input(data: &[u8]) -> Option<Vec<u8>> {
     if data.len() < 4 {
         return None;
     }
-    let want = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64 * 512;
+    let want = (u32::from_le_bytes(data[..4].try_into().unwrap()) & 0x7FFF_FFFF) as u64 * 512;
     let payload = &data[4..];
     let size = (payload.len() as u64).max(want.min(FUZZ_MAX_DEV));
     if size > FUZZ_MAX_DEV {
@@ -768,13 +852,18 @@ pub fn decode_fuzz_input(data: &[u8]) -> Option<Vec<u8>> {
     }
     let mut img = vec![0u8; size as usize];
     img[..payload.len()].copy_from_slice(payload);
+    if data[3] & 0x80 != 0 {
+        fix_checksums(&mut img);
+    }
     Some(img)
 }
 
 pub fn encode_fuzz_input(image: &[u8]) -> Vec<u8> {
     let used = image.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
     let used = used.div_ceil(512) * 512;
-    let mut out = ((image.len() as u64).div_ceil(512) as u32).to_le_bytes().to_vec();
+    // Bit 31 of the size word: repair checksums after mutation (set for seeds; the fuzzer
+    // can flip it to explore the integrity checks themselves).
+    let mut out = ((image.len() as u64).div_ceil(512) as u32 | 0x8000_0000).to_le_bytes().to_vec();
     out.extend_from_slice(&image[..used.min(image.len())]);
     out
 }
@@ -784,6 +873,113 @@ pub fn fuzz_one(driver: Driver, data: &[u8]) {
     if let Some(img) = decode_fuzz_input(data) {
         exercise(driver, img, &Budget { read_bytes: 8 << 20, entries: 5000, depth: 32, write: true });
     }
+}
+
+// ───────────────────────────── partition tables ─────────────────────────────
+
+/// What the app does with a whole disk before mounting anything: parse MBR / GPT (incl. the
+/// EBR chain), then probe and open every partition read-only. Panics if the parser returns a
+/// partition outside the device (it must filter those).
+pub fn exercise_partitions(image: Vec<u8>) -> usize {
+    let dev: Arc<dyn BlockDev> = Arc::new(MemDev::from_vec(image));
+    let Ok(parts) = block::parse_partitions(dev.as_ref()) else { return 0 };
+    for p in &parts {
+        let pd = block::PartitionDev::new(dev.clone(), p.start, p.size).unwrap_or_else(|e| panic!("partition {} outside the device: {e}", p.index));
+        let pd: Arc<dyn BlockDev> = Arc::new(pd);
+        if vfs::probe(pd.as_ref()).is_some() {
+            if let Ok(mut fs) = vfs::open_fs(pd, true, defaults()) {
+                let _ = fs.statfs();
+                let r = fs.root_ino();
+                let _ = fs.readdir(r);
+            }
+        }
+    }
+    parts.len()
+}
+
+/// A disk with an MBR (two primaries + an extended partition holding a 2-entry EBR chain)
+/// and, as `gpt`, a protective MBR + GPT with three entries. Partitions hold small FAT12
+/// volumes so probing finds something.
+pub fn partition_seed(gpt: bool) -> Vec<u8> {
+    const S: usize = 512;
+    let mut img = vec![0u8; 4 << 20];
+    let fat = |img: &mut Vec<u8>, lba: usize, sectors: usize| {
+        let dev = Arc::new(MemDev::new(sectors * S));
+        vfs::fat_fs::format(dev.clone(), FsType::Fat12, "PART").unwrap();
+        img[lba * S..(lba + sectors) * S].copy_from_slice(&dev.snapshot());
+    };
+    let put = |img: &mut Vec<u8>, at: usize, t: u8, lba: u32, n: u32| {
+        img[at + 4] = t;
+        img[at + 8..at + 12].copy_from_slice(&lba.to_le_bytes());
+        img[at + 12..at + 16].copy_from_slice(&n.to_le_bytes());
+    };
+    if gpt {
+        put(&mut img, 446, 0xEE, 1, 8191);
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        let mut h = vec![0u8; 92];
+        h[..8].copy_from_slice(b"EFI PART");
+        h[72..80].copy_from_slice(&2u64.to_le_bytes());
+        h[80..84].copy_from_slice(&128u32.to_le_bytes());
+        h[84..88].copy_from_slice(&128u32.to_le_bytes());
+        img[S..S + 92].copy_from_slice(&h);
+        for (k, (first, last)) in [(64u64, 2111u64), (2112, 4159), (4160, 8000)].iter().enumerate() {
+            let e = 2 * S + k * 128;
+            img[e] = 0xA2 + k as u8; // any non-zero type GUID
+            img[e + 32..e + 40].copy_from_slice(&first.to_le_bytes());
+            img[e + 40..e + 48].copy_from_slice(&last.to_le_bytes());
+            for (j, c) in "part".encode_utf16().enumerate() {
+                img[e + 56 + 2 * j..e + 58 + 2 * j].copy_from_slice(&c.to_le_bytes());
+            }
+            fat(&mut img, *first as usize, 1024);
+        }
+    } else {
+        put(&mut img, 446, 0x01, 64, 1024);
+        put(&mut img, 462, 0x83, 1100, 1024);
+        put(&mut img, 478, 0x05, 2200, 4000);
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        fat(&mut img, 64, 1024);
+        fat(&mut img, 1100, 1024);
+        // EBR 1 at 2200: logical at +64, next EBR at base+1200
+        let e1 = 2200 * S;
+        put(&mut img, e1 + 446, 0x01, 64, 1024);
+        put(&mut img, e1 + 462, 0x05, 1200, 1100);
+        img[e1 + 510] = 0x55;
+        img[e1 + 511] = 0xAA;
+        fat(&mut img, 2264, 1024);
+        let e2 = 3400 * S;
+        put(&mut img, e2 + 446, 0x01, 64, 1024);
+        img[e2 + 510] = 0x55;
+        img[e2 + 511] = 0xAA;
+        fat(&mut img, 3464, 1024);
+    }
+    img
+}
+
+/// Corrupt a partition seed: table sectors (MBR, GPT header + entries, EBRs) get most hits.
+pub fn mutate_partitions(seed: &[u8], case: u64) -> Vec<u8> {
+    let mut r = Rng::new(case ^ 0x7A87_1E5);
+    let mut img = seed.to_vec();
+    let table_secs = [0usize, 1, 2, 3, 2200, 3400];
+    let n = 1 + r.below(6);
+    for _ in 0..n {
+        let sec = table_secs[r.below(table_secs.len() as u64) as usize];
+        let w = [1usize, 2, 4, 8][r.below(4) as usize];
+        let off = sec * 512 + (r.below(512) as usize / w) * w;
+        let v = match r.below(4) {
+            0 => INTERESTING[r.below(INTERESTING.len() as u64) as usize],
+            1 => r.next(),
+            2 => rd(&img, off, w).wrapping_add(1 + r.below(4000)),
+            _ => [2200u64, 3400, 0, 1, 2][r.below(5) as usize], // EBR / table self-references
+        };
+        wr(&mut img, off, w, v);
+    }
+    if r.chance(10) {
+        let len = img.len() as u64;
+        img.truncate((r.below(len) as usize / 512 * 512).max(1024));
+    }
+    img
 }
 
 // ───────────────────────────── compact storage for regression inputs ─────────────────────────────

@@ -64,4 +64,11 @@ fn main() {
             write(&out, d, &format!("own-{}", s.name), &s.image);
         }
     }
+    let pd = out.join("partitions");
+    std::fs::create_dir_all(&pd).unwrap();
+    for (name, gpt) in [("mbr-ebr", false), ("gpt", true)] {
+        let input = fuzzkit::encode_fuzz_input(&fuzzkit::partition_seed(gpt));
+        println!("partitions {name:<34} {:>8} KiB input", input.len() >> 10);
+        std::fs::write(pd.join(name), input).unwrap();
+    }
 }

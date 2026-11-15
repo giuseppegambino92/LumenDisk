@@ -101,6 +101,10 @@ lumendisk inspect raspios.img
 lumendisk mount raspios.img --partition 2 --mode shadow
 ```
 
+### Fuzzing
+
+Una chiavetta USB o un'immagine possono essere costruite apposta per essere malformate, quindi ogni volume è trattato come un input non fidato. `scripts/fuzz.sh [secondi per target]` esegue i target libFuzzer guidati dalla copertura (`core/fuzz`: ext4, NTFS, FAT, exFAT e il parser MBR/GPT). Ogni input è un'immagine intera che viene montata in sola lettura e in lettura/scrittura, esplorata, modificata e riparata. I semi sono immagini create dal mkfs di LumenDisk e, se Docker è disponibile, da `mkfs.ext4 -d`, `mkfs.vfat` + `mcopy`, `mkntfs` + `ntfscp` e `mkfs.exfat`. Servono una toolchain nightly e cargo-fuzz (`rustup toolchain install nightly`, `cargo install cargo-fuzz`). Se mancano, lo script lo segnala e si salta. `build_and_verify.sh` lo esegue per 30 s per target quando sono installati (`SKIP_FUZZ=1` lo salta). I crash vengono salvati in `core/fuzz/artifacts/`. Una volta corretto un crash, `cargo run --example fuzz_seeds -- core/tests/corrupt_regressions --regression <target> <file>` lo trasforma in un piccolo caso di regressione che gira a ogni `cargo test`.
+
 ## Come funziona
 
 ```
@@ -127,9 +131,10 @@ mount_nfs 127.0.0.1:/<export casuale>  →  ~/Volumes/<Nome>
 
 | Suite | Cosa dimostra |
 |---|---|
-| Unitari (85) | ogni driver supera la stessa suite di conformità; replay del journal dopo un crash; Ghost Shield; Shadow; race della cache remota |
+| Unitari (89) | ogni driver supera la stessa suite di conformità; replay del journal dopo un crash; Ghost Shield; Shadow; race della cache remota; un panic di un driver mette fuori uso solo il suo volume, subito (EIO), senza avvelenare i lock |
 | ext4 contro e2fsprogs (5) | volumi creati con il vero `mkfs.ext4` (64bit, flex_bg, metadata_csum, orphan_file) modificati da LumenDisk restano puliti per `e2fsck`; replay jbd2 di una transazione reale |
 | End-to-end (24) | `mount_nfs` reale + client NFS del Finder su ext4 / FAT32 / exFAT / NTFS; Shadow; riparazione; immagine Raspberry Pi; symlink NTFS; sicurezza del loopback; immagini via HTTP Range; condivisione LAN offline; SFTP; blackout con un file da 64 MB; WebDAV Apache con coda offline tra riavvii; TLS attraverso un proxy intercettatore (niente in chiaro); un dispositivo a blocchi reale collegato |
+| Immagini corrotte (16.000 varianti + regressioni) | volumi validi e popolati (ext2/ext4 con extent, htree, symlink e una transazione del journal in sospeso; NTFS con blocchi di indice, liste di attributi, file compressi LZNT1 e reparse point; FAT12/16/32; exFAT) alterati privilegiando i metadati, più tabelle MBR/GPT alterate e un caso di regressione per ogni bug trovato: ogni variante viene montata in sola lettura e in lettura/scrittura, esplorata, modificata e riparata senza panic, senza blocchi (limite di 20 s) e senza allocazioni oltre 1 GiB. Un panic di un driver disattiva solo quel volume (da lì in poi EIO) e non lo blocca mai. `LUMENDISK_CORRUPT_CASES` aumenta il numero di casi |
 | Server LAN (21) · SFTP (4) | protocollo WebDAV/portale su TLS; autenticazione, timeout e riconnessioni con OpenSSH |
 | Interfaccia | ogni schermata guidata dal motore reale con volumi reali, in italiano e inglese |
 

@@ -1691,11 +1691,10 @@ impl Ext4Fs {
         let mut out = vec![0u8; len];
         let bs = self.bs;
         let mut pos = offset;
-        let end = offset + len as u64;
-        if end.div_ceil(bs) > 1 << 32 {
-            // Beyond the largest logical block: necessarily a hole.
-            return Ok(out);
-        }
+        // Logical blocks are u32: bytes at or beyond 2^32 blocks can only be a hole (a corrupt
+        // i_size can claim them). Without the clamp `pos / bs` would wrap and map them onto
+        // the first blocks of the file.
+        let end = (offset + len as u64).min((1u64 << 32) * bs);
         while pos < end {
             let lblk = (pos / bs) as u32;
             let in_blk = pos % bs;
@@ -1898,7 +1897,7 @@ impl Ext4Fs {
             }
         }
         // zero the tail of the new last block
-        if new_size % bs != 0 {
+        if new_size % bs != 0 && new_size / bs <= u32::MAX as u64 {
             let lblk = (new_size / bs) as u32;
             if let Some((_, pblk, uninit)) = Self::lookup_block(&out, lblk) {
                 if !uninit {

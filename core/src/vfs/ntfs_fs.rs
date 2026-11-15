@@ -474,7 +474,8 @@ impl NtfsFs {
         let m = self.load_inode(0)?;
         let bm = match self.stream(&m, AT_BITMAP, &[])? {
             Some(s) => {
-                let n = s.size().min(64 << 20);
+                // One bit per record: no larger than the records this device could hold.
+                let n = s.size().min(align8((self.dev.size() / rs as u64).div_ceil(8) as usize) as u64 + 8);
                 self.read_stream(&s, 0, n)?
             }
             None => return corrupt("$MFT has no $BITMAP"),

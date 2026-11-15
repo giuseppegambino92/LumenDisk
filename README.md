@@ -101,6 +101,10 @@ lumendisk inspect raspios.img
 lumendisk mount raspios.img --partition 2 --mode shadow
 ```
 
+### Fuzzing
+
+A USB stick or an image can be deliberately malformed, so every volume is treated as untrusted input. `scripts/fuzz.sh [seconds per target]` runs coverage-guided libFuzzer targets (`core/fuzz`: ext4, NTFS, FAT, exFAT and the MBR/GPT parser). Each input is a whole image that is mounted read-only and read-write, walked, modified and repaired. The seeds are images made by LumenDisk's own mkfs and, when Docker is available, by `mkfs.ext4 -d`, `mkfs.vfat` + `mcopy`, `mkntfs` + `ntfscp` and `mkfs.exfat`. It needs a nightly toolchain and cargo-fuzz (`rustup toolchain install nightly`, `cargo install cargo-fuzz`). If they're missing, it says so and skips. `build_and_verify.sh` runs it for 30 s per target when they are installed (`SKIP_FUZZ=1` skips it). Crashes are saved in `core/fuzz/artifacts/`. Once a crash is fixed, `cargo run --example fuzz_seeds -- core/tests/corrupt_regressions --regression <target> <file>` turns it into a small regression case that runs with every `cargo test`.
+
 ## How it works
 
 ```
@@ -127,9 +131,10 @@ mount_nfs 127.0.0.1:/<random export>  →  ~/Volumes/<Name>
 
 | Suite | What it proves |
 |---|---|
-| Unit (85) | every driver passes the same conformance suite; WAL crash replay; Ghost Shield; Shadow; remote cache races |
+| Unit (89) | every driver passes the same conformance suite; WAL crash replay; Ghost Shield; Shadow; remote cache races; a driver panic fails only its volume, fast (EIO), without poisoning locks |
 | ext4 vs e2fsprogs (5) | real `mkfs.ext4` volumes (64bit, flex_bg, metadata_csum, orphan_file) modified by LumenDisk stay `e2fsck`-clean; jbd2 replay of a real transaction |
 | End-to-end (24) | real `mount_nfs` + Finder's NFS client on ext4 / FAT32 / exFAT / NTFS; Shadow; Doctor; Raspberry Pi image; NTFS symlinks; loopback security; HTTP Range images; offline LAN shares; SFTP; power loss with a 64 MB file; Apache WebDAV with offline queue across restarts; TLS through a sniffing proxy (no plaintext); a real attached block device |
+| Corrupted images (16,000 mutants + regressions) | valid, populated volumes (ext2/ext4 with extents, htree, symlinks and a pending journal transaction; NTFS with index blocks, attribute lists, LZNT1-compressed files and reparse points; FAT12/16/32; exFAT) mutated with a bias towards metadata, plus mutated MBR/GPT tables and every bug found as a regression case: each mutant is mounted read-only and read-write, walked, modified and repaired with no panic, no hang (20 s limit) and no allocation over 1 GiB. A driver panic disables only that volume (EIO from then on) and never wedges it. `LUMENDISK_CORRUPT_CASES` raises the count |
 | LAN server (21) · SFTP (4) | WebDAV/portal protocol over TLS; OpenSSH auth, timeouts and reconnects |
 | UI | every screen driven with the real engine and real volumes, in English and Italian |
 

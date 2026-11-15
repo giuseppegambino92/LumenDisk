@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # LumenDisk — coverage-guided fuzzing of the filesystem drivers (libFuzzer via cargo-fuzz).
 #
-#   scripts/fuzz.sh                 60 s per target (ext4, ntfs, fat, exfat)
+#   scripts/fuzz.sh                 60 s per target (ext4, ntfs, fat, exfat, partitions)
 #   scripts/fuzz.sh 600             10 minutes per target
 #   scripts/fuzz.sh 300 ntfs fat    only some targets
 #   FUZZ_FORK=4 scripts/fuzz.sh 3600   4 worker processes per target (crashes don't stop the run)
@@ -24,7 +24,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 SECS="${1:-60}"
 shift || true
 TARGETS=("$@")
-[ ${#TARGETS[@]} -gt 0 ] || TARGETS=(ext4 ntfs fat exfat)
+[ ${#TARGETS[@]} -gt 0 ] || TARGETS=(ext4 ntfs fat exfat partitions)
 FORK="${FUZZ_FORK:-1}"
 
 if ! cargo +nightly --version >/dev/null 2>&1; then
