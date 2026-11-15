@@ -15,8 +15,12 @@
 //! * `LUMENDISK_CORRUPT_SEED=S`   start of the case-number range (explore other mutants)
 //! * `LUMENDISK_CORRUPT_ONLY=name` only seeds whose name contains `name` (ext4, ntfs, fat12...)
 //! * `LUMENDISK_CORRUPT_VERBOSE=1` print every case before running it
+//! * `LUMENDISK_CORRUPT_BUDGET_SECS=S` stop starting new mutants after S seconds (default 60;
+//!   an unoptimized `cargo test` build gets through fewer cases, the count run is printed)
+//! * `LUMENDISK_REPLAY=<driver>:<image>` replay one saved mutant (`replay_image`)
 //!
-//! Failing mutants are written to `target/tmp/corrupt-failures/` for reproduction.
+//! Failing mutants are written to `target/tmp/corrupt-failures/` for reproduction
+//! (`cargo test --profile robust --test corrupted_images replay_image` with LUMENDISK_REPLAY).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
@@ -207,7 +211,7 @@ static COUNT_ERRS: AtomicU64 = AtomicU64::new(0);
 fn run_mutants(seeds: Arc<Vec<Seed>>, first: u64, cases: u64, limit: Duration) -> Vec<Failure> {
     // Unoptimized builds are ~10x slower: stop starting new cases after the time budget
     // (the count actually run is reported).
-    let budget = Duration::from_secs(env_u64("LUMENDISK_CORRUPT_BUDGET_SECS", 240));
+    let budget = Duration::from_secs(env_u64("LUMENDISK_CORRUPT_BUDGET_SECS", 60));
     let start = Instant::now();
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
     let next = Arc::new(AtomicU64::new(0));

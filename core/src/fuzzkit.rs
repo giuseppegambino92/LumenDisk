@@ -1062,6 +1062,76 @@ pub fn apply_patch(enc: &[u8]) -> Option<(Driver, Vec<u8>)> {
     Some((seed.driver, img))
 }
 
+/// Like [`regression_file`], but delta-minimized: byte runs that differ from the closest small
+/// seed are dropped while the image still makes `exercise` panic in this process (build with
+/// overflow checks, e.g. `--profile robust`, and before the fix). None if it doesn't
+/// reproduce in-process (hangs, allocation failures, or already fixed).
+pub fn minimized_regression(driver: Driver, fuzz_input: &[u8]) -> Option<Vec<u8>> {
+    let img = decode_fuzz_input(fuzz_input)?;
+    let budget = Budget { read_bytes: 8 << 20, entries: 5000, depth: 32, write: true };
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let crashes = |i: &Vec<u8>| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exercise(driver, i.clone(), &budget))).is_err();
+    let result = (|| {
+        if !crashes(&img) {
+            return None;
+        }
+        let diff_runs = |base: &[u8]| -> Vec<(usize, Vec<u8>)> {
+            let mut runs = vec![];
+            let mut i = 0;
+            while i < img.len() {
+                if base.get(i) == Some(&img[i]) {
+                    i += 1;
+                    continue;
+                }
+                let s = i;
+                while i < img.len() && base.get(i) != Some(&img[i]) {
+                    i += 1;
+                }
+                runs.push((s, img[s..i].to_vec()));
+            }
+            runs
+        };
+        let seed = seeds_for(driver, true).into_iter().min_by_key(|s| diff_runs(&s.image).len())?;
+        let build = |runs: &[(usize, Vec<u8>)]| {
+            let mut v = seed.image.clone();
+            v.resize(img.len(), 0);
+            for (o, b) in runs {
+                v[*o..*o + b.len()].copy_from_slice(b);
+            }
+            v
+        };
+        let mut runs = diff_runs(&seed.image);
+        let mut n = 2usize;
+        while runs.len() >= 2 {
+            let chunk = runs.len().div_ceil(n);
+            let mut removed = false;
+            for k in 0..n {
+                let (a, b) = (k * chunk, ((k + 1) * chunk).min(runs.len()));
+                if a >= b {
+                    continue;
+                }
+                let rest: Vec<_> = runs[..a].iter().chain(&runs[b..]).cloned().collect();
+                if crashes(&build(&rest)) {
+                    runs = rest;
+                    n = (n - 1).max(2);
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed {
+                if n >= runs.len() {
+                    break;
+                }
+                n = (n * 2).min(runs.len());
+            }
+        }
+        Some(make_patch(&seed, true, &build(&runs)))
+    })();
+    std::panic::set_hook(prev);
+    result
+}
+
 /// Turn a crashing fuzz input into a regression file: a patch against the closest small seed
 /// when that is compact, the zero-run-encoded input otherwise. Returns (extension, bytes).
 pub fn regression_file(driver: Driver, fuzz_input: &[u8]) -> Option<(&'static str, Vec<u8>)> {

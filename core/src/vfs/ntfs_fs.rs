@@ -2531,6 +2531,13 @@ impl FileSystem for NtfsFs {
         if self.logfile_state()?.is_some() {
             let lf = self.load_inode(2)?;
             if let Some(Stream::NonRes { runs, size, .. }) = self.stream(&lf, AT_DATA, &[])? {
+                // A corrupt $LogFile must not make the reset overwrite the boot sector or
+                // the MFT (or its mirror): those runs would be cross-linked.
+                let hits = |l: u64, n: u64, other: &[Run]| other.iter().any(|r| r.lcn.map_or(false, |o| l < o.saturating_add(r.len) && o < l.saturating_add(n)));
+                if runs.iter().any(|r| r.lcn.map_or(false, |l| l == 0 || hits(l, r.len, &self.mft_runs) || hits(l, r.len, &self.mirr_runs))) {
+                    return corrupt("$LogFile is cross-linked with the boot sector or the MFT; run chkdsk");
+                }
+                let size = size.min(runs_end(&runs).saturating_mul(self.cluster));
                 let chunk = vec![0xFFu8; 1 << 20];
                 let mut p = 0;
                 while p < size {

@@ -1110,7 +1110,7 @@ impl Ext4Fs {
             let fi = self.gd_free_inodes(g) - 1;
             self.set_gd_u32(g, 0xE, 0x2E, fi);
             if is_dir {
-                let d = self.gd_used_dirs(g) + 1;
+                let d = self.gd_used_dirs(g).saturating_add(1);
                 self.set_gd_u32(g, 0x10, 0x30, d);
             }
             if self.uninit_bg() {
@@ -2252,7 +2252,7 @@ impl Ext4Fs {
         if i.kind() == FileKind::Dir && (l >= 64999 || l == 1) && self.ro_compat & RO_DIR_NLINK != 0 {
             i.set_links(1);
         } else {
-            i.set_links(l + 1);
+            i.set_links(l.saturating_add(1));
         }
     }
 
