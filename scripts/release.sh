@@ -26,8 +26,9 @@ BUILD=$($PB -c 'Print CFBundleVersion' "$SRC/Contents/Info.plist")
 BUNDLE_ID=$($PB -c 'Print CFBundleIdentifier' "$SRC/Contents/Info.plist")
 W="$(mktemp -d -t lumendisk-release)"
 cleanup() {
+  local rc=$?
   mount | grep -q "$W/mounttest/mnt" && /sbin/umount -f "$W/mounttest/mnt/RELCHECK" 2>/dev/null
-  rm -rf "$W"
+  if [ "$rc" = 0 ]; then rm -rf "$W"; else echo "  (work files kept for inspection in $W)"; fi
 }
 trap cleanup EXIT
 ok() { printf '  ✓ %s\n' "$*"; }
@@ -55,6 +56,11 @@ for VAR in $VARIANTS; do
     for b in "$APP/Contents/MacOS/LumenDisk" "$APP/Contents/Helpers/lumendisk"; do
       lipo -thin "$VAR" "$b" -output "$b.thin" && mv "$b.thin" "$b" && chmod +x "$b"
     done
+    # Without this a thin bundle would be byte-identical to that slice of the universal one, so
+    # both would share a cdhash. The notary service looks tickets up by cdhash, and the universal
+    # app could then be stapled with the thin variant's ticket, which lacks the other slice.
+    # Gatekeeper rejects such an app.
+    $PB -c "Add :LSArchitecturePriority array" -c "Add :LSArchitecturePriority:0 string $VAR" "$APP/Contents/Info.plist"
   fi
   codesign --force --options runtime --sign - "$APP/Contents/Helpers/lumendisk" 2>/dev/null
   codesign --force --options runtime --sign - "$APP" 2>/dev/null
@@ -78,9 +84,17 @@ for VAR in $VARIANTS; do
 <key>SchemeName</key><string>LumenDisk</string>
 </dict></plist>
 EOF
-  xcodebuild -exportArchive -archivePath "$A" -exportOptionsPlist "$W/export.plist" -exportPath "$W/$VAR-upload" \
-    -allowProvisioningUpdates > "$W/$VAR-upload.log" 2>&1 || { tail -20 "$W/$VAR-upload.log"; die "$VAR: upload failed"; }
-  grep -q 'EXPORT SUCCEEDED' "$W/$VAR-upload.log" || { tail -20 "$W/$VAR-upload.log"; die "$VAR: upload failed"; }
+  # Apple's services drop connections now and then: retry the upload a few times.
+  for try in 1 2 3 4; do
+    rm -rf "$W/$VAR-upload"
+    if xcodebuild -exportArchive -archivePath "$A" -exportOptionsPlist "$W/export.plist" -exportPath "$W/$VAR-upload" \
+         -allowProvisioningUpdates > "$W/$VAR-upload.log" 2>&1 && grep -q 'EXPORT SUCCEEDED' "$W/$VAR-upload.log"; then
+      break
+    fi
+    [ "$try" = 4 ] && { tail -20 "$W/$VAR-upload.log"; die "$VAR: upload failed"; }
+    echo "    · $VAR: upload failed ($(grep -m1 -o 'error: .*' "$W/$VAR-upload.log" || echo unknown error)), retrying in 30 s"
+    sleep 30
+  done
   ok "$VAR ($ARCHS) signed and uploaded"
 done
 
@@ -109,9 +123,21 @@ for VAR in $VARIANTS; do
   [[ "$SIG" == *"Authority=Developer ID Application: "*"($TEAM_ID)"* ]] || die "$VAR: not Developer ID signed"
   [[ "$SIG" =~ flags=[^[:space:]]*runtime ]] || die "$VAR: hardened runtime missing"
   xcrun stapler validate "$APP" >/dev/null || die "$VAR: no stapled ticket"
-  for i in $(seq 1 36); do
+  # The stapled ticket must cover every slice of both executables.
+  TICKET=$(xxd -p "$APP/Contents/CodeResources" | tr -d '\n')
+  for b in Contents/MacOS/LumenDisk Contents/Helpers/lumendisk; do
+    for a in $(lipo -archs "$APP/$b"); do
+      H=$(codesign -dvvv --arch "$a" "$APP/$b" 2>&1 | sed -n 's/^CDHash=//p')
+      [[ -n "$H" && "$TICKET" == *"$H"* ]] || die "$VAR: stapled ticket does not cover $b ($a, cdhash ${H:-?})"
+    done
+  done
+  # Right after notarization Gatekeeper may still answer from a cached "not notarized" lookup
+  # (seen lasting 5-10 minutes); retry for up to GATEKEEPER_WAIT_MIN (20) minutes before failing.
+  GK_TRIES=$(( ${GATEKEEPER_WAIT_MIN:-20} * 6 ))
+  for i in $(seq 1 $GK_TRIES); do
     spctl -a -t exec "$APP" 2>/dev/null && break
-    [ "$i" = 36 ] && { spctl -a -vv -t exec "$APP"; die "$VAR: rejected by Gatekeeper"; }
+    [ "$i" = "$GK_TRIES" ] && { spctl -a -vv -t exec "$APP" || true; die "$VAR: rejected by Gatekeeper"; }
+    [ "$i" = 1 ] && echo "    · $VAR: waiting for Gatekeeper to see the notarization ticket…"
     sleep 10
   done
   [ "$(lipo -archs "$APP/Contents/MacOS/LumenDisk")" = "$( [ $VAR = universal ] && echo 'x86_64 arm64' || echo $VAR)" ] || die "$VAR: wrong architectures"

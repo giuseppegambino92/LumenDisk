@@ -4,11 +4,6 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>it</string>
-	<key>CFBundleLocalizations</key>
-	<array>
-		<string>it</string>
-		<string>en</string>
-	</array>
 	<key>CFBundleDisplayName</key>
 	<string>LumenDisk</string>
 	<key>CFBundleExecutable</key>
@@ -19,6 +14,11 @@
 	<string>com.lumendisk.app</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>it</string>
+		<string>en</string>
+	</array>
 	<key>CFBundleName</key>
 	<string>LumenDisk</string>
 	<key>CFBundlePackageType</key>
@@ -26,7 +26,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.0.1</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>3</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
@@ -35,12 +35,12 @@
 	<array>
 		<string>_lumendisk._tcp</string>
 	</array>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>LumenDisk finds other Macs sharing disks on your network, shares your volumes when you ask it to, and lets your phone send and receive files over Wi-Fi.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>© 2026 LumenDisk. Tutti i diritti riservati.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>LumenDisk finds other Macs sharing disks on your network, shares your volumes when you ask it to, and lets your phone send and receive files over Wi-Fi.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
