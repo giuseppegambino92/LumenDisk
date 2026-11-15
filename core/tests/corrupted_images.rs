@@ -713,11 +713,30 @@ fn replay_image() {
 /// a cyclic EBR chain and never returns a partition outside the device.
 #[test]
 fn partition_tables_never_crash() {
-    quiet_panics();
     let cases = env_u64("LUMENDISK_CORRUPT_CASES", 16000) / 2;
     let seeds = [fuzzkit::partition_seed(false), fuzzkit::partition_seed(true)];
     assert_eq!(fuzzkit::exercise_partitions(seeds[0].clone()), 4);
     assert_eq!(fuzzkit::exercise_partitions(seeds[1].clone()), 3);
+    // The last EBR linking back to itself: its logical partition is listed once (it used to
+    // be repeated until the 128-step guard).
+    let mut ebr_loop = seeds[0].clone();
+    let e2 = 3400 * 512 + 462;
+    ebr_loop[e2 + 4] = 0x05;
+    wr(&mut ebr_loop, e2 + 8, 4, 1200);
+    wr(&mut ebr_loop, e2 + 12, 4, 1100);
+    assert_eq!(fuzzkit::exercise_partitions(ebr_loop), 4);
+    // GPT arithmetic on hostile values: table LBA * sector size and entry LBAs overflowed
+    // u64; an entry past the end of the disk made inspecting the whole disk fail.
+    let mut gpt = seeds[1].clone();
+    wr(&mut gpt, 512 + 72, 8, u64::MAX / 256);
+    // (unusable GPT: only the protective MBR entry remains)
+    assert_eq!(std::panic::catch_unwind(|| fuzzkit::exercise_partitions(gpt)).ok(), Some(1));
+    let mut gpt = seeds[1].clone();
+    wr(&mut gpt, 2 * 512 + 32, 8, u64::MAX / 4);
+    wr(&mut gpt, 2 * 512 + 40, 8, u64::MAX / 2);
+    wr(&mut gpt, 2 * 512 + 128 + 40, 8, 1 << 40);
+    assert_eq!(std::panic::catch_unwind(|| fuzzkit::exercise_partitions(gpt)).ok(), Some(1));
+    quiet_panics();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut failures = vec![];
