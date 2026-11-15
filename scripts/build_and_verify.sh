@@ -193,7 +193,7 @@ if [ "$HAVE_DOCKER" = 1 ]; then
     local out
     out=$(cargo test --release -p lumendisk-core --test "$target" -- --ignored --test-threads=1 "$@" 2>&1) || { echo "$out" | grep -E '^test |panicked|assert|left|right' | tail -40; die "$name failed"; }
     echo "$out" | grep -E '^test ' | sed 's/^/  /'
-    echo "$out" | grep -E 'fsck BEFORE|over HTTP Range|served [0-9]+ bytes|offline: slowest|offline write|overhead\)|fsck right after|speed test on|TLS: |after kill -9|killed during the commit' | sed 's/^/    · /' || true
+    echo "$out" | grep -E 'fsck BEFORE|over HTTP Range|served [0-9]+ bytes|offline: slowest|offline write|overhead\)|fsck right after|speed test on|TLS: |after kill -9|killed during the commit|kept [0-9]+ changes, endpoint|drift: ' | sed 's/^/    · /' || true
     ok "$(summary_of "$out")"; record "$name" "$(summary_of "$out")"
   }
   run_suite "ext2/3/4 vs real e2fsprogs (mke2fs defaults, htree, journal replay)" ext4_real_tools
@@ -202,6 +202,7 @@ if [ "$HAVE_DOCKER" = 1 ]; then
   run_suite "SFTP backend vs real OpenSSH (auth, timeouts, reconnect, range source)" sftp_real
   run_suite "Phase 3 end-to-end: ordered WAL 64 MB power loss, Apache WebDAV RFC 4918 + persistent offline queue, TLS LAN share, physical device + speed test" phase3_e2e --nocapture
   run_suite "Persistent Shadow sessions: kill -9 with staged changes and during a commit, resume, e2fsck" shadow_persist_e2e --nocapture
+  run_suite "Remote Shadow sessions: SFTP / WebDAV / LAN share, kill -9, restore, commit to the server, drift on server-side edits" remote_shadow_e2e --nocapture
 
   if [ -n "${FULL:-}" ]; then
     bold "Long driver suites (ntfs-3g / kernel ntfs3 / vfat / exfat / fsck_msdos / fsck_exfat)"

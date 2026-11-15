@@ -4,6 +4,9 @@
 //!   lumendisk mkfs <ext4|ext3|ext2|ntfs|fat32|fat16|fat12|exfat> <image> <size-MiB> [label]
 //!   lumendisk mount <image|/dev/diskNsM> [--partition N] [--mode readWrite|shadow|readOnly]
 //!                   [--no-ghost] [--root DIR] [--name NAME] [--control SOCKET]
+//!   lumendisk mount-remote <REQUEST.json> [--control SOCKET]
+//!                   SFTP / WebDAV / LAN share; the file holds a RemoteMountRequest (kind, url,
+//!                   mode, credentials…), so passwords never appear in the process list
 //!   lumendisk ctl <SOCKET> <status|changes|commit|rollback|ghost|unmount>
 //!   lumendisk repair <image> [--partition N]
 //!   lumendisk locks <mountpoint>
@@ -18,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use lumendisk_core::lock_inspector;
-use lumendisk_core::volume::{runtime, MountMode, MountRequest};
+use lumendisk_core::volume::{runtime, MountMode, MountRequest, RemoteMountRequest, VolumeStatus};
 use serde_json::json;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -29,7 +32,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  lumendisk inspect <path>\n  lumendisk mkfs <fs> <path> <MiB> [label]\n  lumendisk mount <path> [--partition N] [--mode readWrite|shadow|readOnly] [--no-ghost] [--root DIR] [--name NAME] [--control SOCK]\n  lumendisk ctl <SOCK> <status|changes|commit|rollback|ghost|unmount>\n  lumendisk repair <path> [--partition N]\n  lumendisk locks <mountpoint>\n  lumendisk shadow-sessions\n  lumendisk shadow-discard <KEY>"
+        "usage:\n  lumendisk inspect <path>\n  lumendisk mkfs <fs> <path> <MiB> [label]\n  lumendisk mount <path> [--partition N] [--mode readWrite|shadow|readOnly] [--no-ghost] [--root DIR] [--name NAME] [--control SOCK]\n  lumendisk mount-remote <request.json> [--control SOCK]\n  lumendisk ctl <SOCK> <status|changes|commit|rollback|ghost|unmount>\n  lumendisk repair <path> [--partition N]\n  lumendisk locks <mountpoint>\n  lumendisk shadow-sessions\n  lumendisk shadow-discard <KEY>"
     );
     std::process::exit(2)
 }
@@ -150,61 +153,79 @@ fn main() {
                 media_uuid: None,
                 expect_session: None,
             };
-            // Bind the control socket first so a bad path can't leave an orphaned mount.
-            let listener = opt(&args, "--control").map(|sock| {
-                let _ = std::fs::remove_file(&sock);
-                UnixListener::bind(&sock).unwrap_or_else(|e| fail(format!("{sock}: {e}")))
-            });
+            let listener = bind_control(&args);
             let st = rt.mount(req).unwrap_or_else(|e| fail(e));
-            let id = st.id.clone();
-            print(json!({"mounted": st}));
-            // SAFETY: installing a trivial async-signal-safe handler.
-            unsafe {
-                libc::signal(libc::SIGINT, on_signal as *const () as usize);
-                libc::signal(libc::SIGTERM, on_signal as *const () as usize);
-            }
-            if let Some(listener) = listener {
-                let id = Arc::new(id.clone());
-                std::thread::spawn(move || {
-                    for conn in listener.incoming().flatten() {
-                        let id = id.clone();
-                        std::thread::spawn(move || {
-                            let mut r = BufReader::new(conn.try_clone().unwrap());
-                            let mut line = String::new();
-                            if r.read_line(&mut line).is_ok() {
-                                let v = handle_ctl(line.trim(), &id);
-                                let mut w = conn;
-                                let _ = writeln!(w, "{}", serde_json::to_string(&v).unwrap());
-                            }
-                        });
-                    }
-                });
-            }
-            eprintln!("lumendisk: mounted at {} (Ctrl-C to unmount)", st.mountpoint);
-            while !STOP.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                if !lumendisk_core::nfs_loopback::is_mountpoint(std::path::Path::new(&st.mountpoint)) {
-                    eprintln!("lumendisk: mount disappeared");
-                    break;
-                }
-            }
-            let mut tries = 0;
-            loop {
-                match rt.unmount(&id, tries >= 10) {
-                    Ok(()) => break,
-                    Err(e) if tries < 10 => {
-                        eprintln!("lumendisk: unmount retry: {e}");
-                        tries += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(e) => fail(e),
-                }
-            }
-            if let Some(sock) = opt(&args, "--control") {
-                let _ = std::fs::remove_file(sock);
-            }
-            eprintln!("lumendisk: unmounted cleanly");
+            serve(st, listener, &args);
+        }
+        "mount-remote" => {
+            let p = args.get(1).unwrap_or_else(|| usage());
+            let raw = std::fs::read(p).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+            let req: RemoteMountRequest = serde_json::from_slice(&raw).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+            let listener = bind_control(&args);
+            let st = rt.mount_remote(req).unwrap_or_else(|e| fail(e));
+            serve(st, listener, &args);
         }
         _ => usage(),
     }
+}
+
+/// Bind the control socket before mounting, so a bad path can't leave an orphaned mount.
+fn bind_control(args: &[String]) -> Option<UnixListener> {
+    opt(args, "--control").map(|sock| {
+        let _ = std::fs::remove_file(&sock);
+        UnixListener::bind(&sock).unwrap_or_else(|e| fail(format!("{sock}: {e}")))
+    })
+}
+
+/// Serve a mounted volume until Ctrl-C / SIGTERM / `ctl unmount`, then unmount it.
+fn serve(st: VolumeStatus, listener: Option<UnixListener>, args: &[String]) {
+    let rt = runtime();
+    let id = st.id.clone();
+    print(json!({"mounted": st}));
+    // SAFETY: installing a trivial async-signal-safe handler.
+    unsafe {
+        libc::signal(libc::SIGINT, on_signal as *const () as usize);
+        libc::signal(libc::SIGTERM, on_signal as *const () as usize);
+    }
+    if let Some(listener) = listener {
+        let id = Arc::new(id.clone());
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let id = id.clone();
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(conn.try_clone().unwrap());
+                    let mut line = String::new();
+                    if r.read_line(&mut line).is_ok() {
+                        let v = handle_ctl(line.trim(), &id);
+                        let mut w = conn;
+                        let _ = writeln!(w, "{}", serde_json::to_string(&v).unwrap());
+                    }
+                });
+            }
+        });
+    }
+    eprintln!("lumendisk: mounted at {} (Ctrl-C to unmount)", st.mountpoint);
+    while !STOP.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if !lumendisk_core::nfs_loopback::is_mountpoint(std::path::Path::new(&st.mountpoint)) {
+            eprintln!("lumendisk: mount disappeared");
+            break;
+        }
+    }
+    let mut tries = 0;
+    loop {
+        match rt.unmount(&id, tries >= 10) {
+            Ok(()) => break,
+            Err(e) if tries < 10 => {
+                eprintln!("lumendisk: unmount retry: {e}");
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => fail(e),
+        }
+    }
+    if let Some(sock) = opt(args, "--control") {
+        let _ = std::fs::remove_file(sock);
+    }
+    eprintln!("lumendisk: unmounted cleanly");
 }

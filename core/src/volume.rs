@@ -166,7 +166,10 @@ pub struct ShadowSessionInfo {
     pub uuid: String,
     pub source_path: String,
     pub partition: u32,
+    /// "local", "image_url", "sftp", "webdav" or "lan".
     pub kind: String,
+    /// Remote servers: canonical endpoint of the session (no credentials).
+    pub endpoint: Option<String>,
     pub media_uuid: Option<String>,
     pub size: u64,
     pub created: i64,
@@ -332,6 +335,31 @@ pub struct Prepared {
     pub remote: Option<RemoteHandle>,
     pub range: Option<Arc<CachedRangeDev>>,
     pub part: Option<block::PartitionInfo>,
+    /// Remote servers: who they are, for persistent Shadow sessions.
+    pub remote_id: Option<RemoteId>,
+}
+
+/// Canonical identity of a remote server's export (see `canonical_endpoint` in the SFTP and
+/// WebDAV backends). Never contains credentials.
+#[derive(Clone, Debug)]
+pub struct RemoteId {
+    pub endpoint: String,
+    /// `user@host:/path`, the URL, or the LAN share name.
+    pub display: String,
+}
+
+/// `scheme://user:password@host/…` → `scheme://user@host/…`.
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let end = rest.find('/').unwrap_or(rest.len());
+    let (auth, path) = rest.split_at(end);
+    match auth.rfind('@') {
+        Some(at) => {
+            let user = auth[..at].split(':').next().unwrap_or("");
+            format!("{scheme}://{user}@{}{path}", &auth[at + 1..])
+        }
+        None => url.to_string(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -559,7 +587,7 @@ impl Runtime {
         }
         let mut layered: Box<dyn FileSystem> = if forced_ro.is_some() || want_ro { Box::new(ReadOnlyGuard { inner: driver }) } else { driver };
         let shared_map = Self::bridge(&mut layered, &info, req.uid_map.clone(), defaults);
-        Ok(Prepared { layered, info, forced_ro, uid_map: shared_map, kind: VolumeKind::Local, wal, remote: None, range: None, part })
+        Ok(Prepared { layered, info, forced_ro, uid_map: shared_map, kind: VolumeKind::Local, wal, remote: None, range: None, part, remote_id: None })
     }
 
     /// Feature 3 (UID/GID bridge) for POSIX filesystems.
@@ -589,11 +617,11 @@ impl Runtime {
     /// Wrap a prepared stack in Shadow/Ghost Shield, serve it over loopback NFS and mount it.
     pub fn publish(&self, req: MountRequest, p: Prepared) -> Result<VolumeStatus, String> {
         let defaults = MountDefaults::default();
-        let Prepared { layered, info, forced_ro, uid_map, kind, wal, remote, range, part } = p;
+        let Prepared { layered, info, forced_ro, uid_map, kind, wal, remote, range, part, remote_id } = p;
         let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
         let support = self.support();
         let mut layered = layered;
-        let identity = Self::shadow_identity(kind, &req, &info, layered.as_mut());
+        let identity = Self::shadow_identity(kind, &req, &info, layered.as_mut(), remote_id.as_ref());
         let mut session_key = None;
         let lower = if req.mode == MountMode::Shadow {
             match identity {
@@ -740,7 +768,7 @@ impl Runtime {
 
     // ───────────── Phase 2: remote volumes ─────────────
 
-    fn remote_backend(&self, r: &RemoteMountRequest) -> Result<(Arc<dyn RemoteBackend>, VolumeKind, String), String> {
+    fn remote_backend(&self, r: &RemoteMountRequest) -> Result<(Arc<dyn RemoteBackend>, VolumeKind, String, RemoteId), String> {
         match r.kind.as_str() {
             "sftp" => {
                 let mut cfg = crate::remote::sftp::SftpConfig::from_url(&r.url).map_err(|e| e.to_string())?;
@@ -755,7 +783,8 @@ impl Runtime {
                 cfg.extra_ssh_options.extend(r.extra_ssh_options.iter().cloned());
                 let host = cfg.host.clone();
                 let b = crate::remote::sftp::SftpBackend::connect(cfg).map_err(|e| format!("SFTP: {e}"))?;
-                Ok((Arc::new(b), VolumeKind::Sftp, host))
+                let id = RemoteId { endpoint: b.canonical_endpoint(), display: b.display_name() };
+                Ok((Arc::new(b), VolumeKind::Sftp, host, id))
             }
             "webdav" | "lan" => {
                 let lan = r.kind == "lan";
@@ -774,7 +803,13 @@ impl Runtime {
                 };
                 let b = crate::remote::webdav::WebDavBackend::connect(cfg).map_err(|e| format!("WebDAV: {e}"))?;
                 let host = r.url.split("://").nth(1).unwrap_or(&r.url).split(['/', ':']).next().unwrap_or("Server").to_string();
-                Ok((Arc::new(b), if lan { VolumeKind::Lan } else { VolumeKind::Webdav }, host))
+                let display = if lan {
+                    b.share_name().or_else(|| r.name.clone().filter(|n| !n.trim().is_empty())).unwrap_or_else(|| host.clone())
+                } else {
+                    redact_url(&r.url)
+                };
+                let id = RemoteId { endpoint: b.canonical_endpoint(), display };
+                Ok((Arc::new(b), if lan { VolumeKind::Lan } else { VolumeKind::Webdav }, host, id))
             }
             o => Err(crate::i18n::t(&format!("tipo di server sconosciuto: {o}"), &format!("unknown server type: {o}"))),
         }
@@ -788,14 +823,14 @@ impl Runtime {
     }
 
     pub fn probe_remote(&self, r: &RemoteMountRequest) -> Result<(u32, u32), String> {
-        let (b, _, _) = self.remote_backend(r)?;
+        let (b, _, _, _) = self.remote_backend(r)?;
         let lat = b.ping().map_err(|e| e.to_string())?;
         let n = b.list("/").map_err(|e| e.to_string())?.len() as u32;
         Ok((lat.as_millis() as u32, n))
     }
 
     pub fn mount_remote(&self, r: RemoteMountRequest) -> Result<VolumeStatus, String> {
-        let (backend, kind, host) = self.remote_backend(&r)?;
+        let (backend, kind, host, remote_id) = self.remote_backend(&r)?;
         let defaults = MountDefaults::default();
         let label = r.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
             let tail = r.url.trim_end_matches('/').rsplit('/').next().unwrap_or("");
@@ -832,7 +867,7 @@ impl Runtime {
             media_uuid: None,
             expect_session: None,
         };
-        let p = Prepared { layered, info, forced_ro: None, uid_map, kind, wal: None, remote: Some(handle), range: None, part: None };
+        let p = Prepared { layered, info, forced_ro: None, uid_map, kind, wal: None, remote: Some(handle), range: None, part: None, remote_id: Some(remote_id) };
         self.publish(req, p)
     }
 
@@ -908,6 +943,7 @@ impl Runtime {
             remote: None,
             range: Some(range),
             part,
+            remote_id: None,
         };
         self.publish(req, p)
     }
@@ -1233,7 +1269,7 @@ impl Runtime {
             expect_session: None,
         };
         let info = fs.volume_info();
-        if let Some(id) = Self::shadow_identity(VolumeKind::Local, &req, &info, fs.as_mut()) {
+        if let Some(id) = Self::shadow_identity(VolumeKind::Local, &req, &info, fs.as_mut(), None) {
             let dir = shadow_store::sessions_root(&self.support()).join(shadow_store::session_key(&id));
             if let Some(m) = Manifest::load(&dir) {
                 return Err(Self::pending_session_message(&m));
@@ -1286,14 +1322,32 @@ impl Runtime {
 }
 
 impl Runtime {
-    /// Identity of a volume for persistent Shadow sessions (None: remote filesystems, whose
-    /// Shadow changes stay in memory).
-    fn shadow_identity(kind: VolumeKind, req: &MountRequest, info: &VolumeInfo, fs: &mut dyn FileSystem) -> Option<Identity> {
+    /// Identity of a volume for persistent Shadow sessions. Remote servers are identified by
+    /// their canonical endpoint (`remote`); without one their Shadow changes stay in memory.
+    fn shadow_identity(kind: VolumeKind, req: &MountRequest, info: &VolumeInfo, fs: &mut dyn FileSystem, remote: Option<&RemoteId>) -> Option<Identity> {
         let kind = match kind {
             VolumeKind::Local => "local",
             VolumeKind::ImageUrl => "image_url",
-            _ => return None,
+            VolumeKind::Sftp => "sftp",
+            VolumeKind::Webdav => "webdav",
+            VolumeKind::Lan => "lan",
         };
+        if !matches!(kind, "local" | "image_url") {
+            let id = remote?;
+            return Some(Identity {
+                kind: kind.into(),
+                fs_type: kind.to_ascii_uppercase(),
+                uuid: String::new(),
+                label: info.label.clone(),
+                // What the user typed, minus any password: never the credentials.
+                source_path: redact_url(&req.path),
+                partition: 0,
+                size: 0,
+                media_uuid: None,
+                endpoint: Some(id.endpoint.clone()),
+                display: Some(id.display.clone()),
+            });
+        }
         Some(Identity {
             kind: kind.into(),
             fs_type: info.fs_type.label().into(),
@@ -1304,10 +1358,18 @@ impl Runtime {
             partition: req.partition,
             size: fs.statfs().map(|s| s.total_bytes).unwrap_or(0),
             media_uuid: req.media_uuid.clone(),
+            endpoint: None,
+            display: None,
         })
     }
 
     fn session_display_name(m: &Manifest) -> String {
+        if m.identity.is_remote() {
+            if let Some(d) = m.identity.display.as_ref().filter(|d| !d.trim().is_empty()) {
+                return d.clone();
+            }
+            return if m.identity.label.trim().is_empty() { m.identity.source_path.clone() } else { m.identity.label.trim().to_string() };
+        }
         let l = m.identity.label.trim();
         if l.is_empty() {
             format!("{} Volume", m.identity.fs_type)
@@ -1357,7 +1419,9 @@ impl Runtime {
             if mounted_id.is_none() && state == "committing" {
                 applied = shadow_store::checkpointed_steps(&dir).unwrap_or(applied).max(applied);
             }
-            let connected = m.identity.kind == "local" && Path::new(&m.identity.source_path).exists();
+            // Remote servers: credentials aren't kept, so a session can only be checked and
+            // resumed by mounting the server again in Shadow mode; until then "not connected".
+            let connected = if m.identity.is_remote() { mounted_id.is_some() } else { m.identity.kind == "local" && Path::new(&m.identity.source_path).exists() };
             let (fingerprint_ok, fingerprint_problem) = match (&m.drift, mounted_id.is_some()) {
                 (Some(d), _) => (Some(false), Some(d.clone())),
                 (None, true) => (Some(true), None),
@@ -1377,6 +1441,7 @@ impl Runtime {
                 source_path: m.identity.source_path.clone(),
                 partition: m.identity.partition,
                 kind: m.identity.kind.clone(),
+                endpoint: m.identity.endpoint.clone(),
                 media_uuid: m.identity.media_uuid.clone(),
                 size: m.identity.size,
                 created: m.created,

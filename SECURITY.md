@@ -80,6 +80,8 @@ A panic in a driver is contained: the call returns an I/O error and the volume i
 
 Pending Shadow changes are stored in `~/Library/Application Support/LumenDisk/Shadow`, with your user's permissions. They are as private as the rest of your home folder. They are not encrypted beyond FileVault.
 
+Sessions of SFTP, WebDAV and LAN volumes are named after a hash of the server's canonical address (protocol, host, port, path and user name; for a LAN share, the shared volume's identity). Passwords, pairing codes and tokens are never written there: the address is stored without them.
+
 ---
 
 ## Italiano

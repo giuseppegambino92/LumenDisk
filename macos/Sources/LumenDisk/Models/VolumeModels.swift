@@ -203,7 +203,7 @@ struct ShadowSession: Codable, Sendable, Hashable, Identifiable {
     var uuid: String
     var sourcePath: String
     var partition: UInt32
-    /// `"local"` or `"image_url"`.
+    /// `"local"`, `"image_url"`, or a server: `"sftp"`, `"webdav"`, `"lan"`.
     var kind: String
     var mediaUUID: String?
     var size: UInt64
@@ -219,7 +219,8 @@ struct ShadowSession: Codable, Sendable, Hashable, Identifiable {
     var commitTotal: UInt64
     var commitError: String?
     /// The source path exists right now (image file or device node). For physical disks the app
-    /// also checks the media UUID: see `AppModel.isConnected(_:)`.
+    /// also checks the media UUID: see `AppModel.isConnected(_:)`. Server sessions: only while
+    /// mounted (credentials aren't kept, so the core can't reach the server on its own).
     var connected: Bool
     var mountedVolumeID: String?
     /// nil = not verified, false = the disk was modified elsewhere (only Discard is possible).
@@ -278,8 +279,18 @@ struct ShadowSession: Codable, Sendable, Hashable, Identifiable {
 
     var filesystem: FilesystemKind { FilesystemKind(coreName: fsType) }
     var isImageURL: Bool { kind == "image_url" }
+    /// SFTP / WebDAV server or another Mac's share: resumed by connecting to it in Shadow Mode.
+    var remoteKind: VolumeKind? {
+        switch kind {
+        case "sftp": .sftp
+        case "webdav": .webdav
+        case "lan": .lan
+        default: nil
+        }
+    }
+    var isRemote: Bool { remoteKind != nil }
     /// Physical partition (`/dev/diskNsM`), as opposed to an image file.
-    var deviceBSDName: String? { isImageURL ? nil : DeviceNode.bsdName(fromPath: sourcePath) }
+    var deviceBSDName: String? { isImageURL || isRemote ? nil : DeviceNode.bsdName(fromPath: sourcePath) }
     var isPhysical: Bool { deviceBSDName != nil }
     var isCommitInterrupted: Bool { state == ShadowSessionState.committing }
     /// The disk was modified elsewhere since the session started: only Discard is possible.

@@ -35,6 +35,30 @@
 //!   applied. After an error or a crash, `commit()` continues from the last checkpoint —
 //!   re-finding objects by path, so it also works on filesystems whose inode numbers are not
 //!   stable across mounts (FAT, exFAT).
+//!
+//! ## Remote servers (SFTP, WebDAV, LAN shares)
+//!
+//! The lower volume is a [`crate::remote::cache::RemoteVfs`]; the session is keyed by the
+//! server's canonical endpoint (`shadow_store::session_key`). Differences from local volumes:
+//!
+//! * **Paths only.** Remote inode numbers are handed out per process, so journal records and
+//!   the commit plan name lower objects by path (as on FAT / exFAT), never by number.
+//! * **Base fingerprints.** There is no volume-wide fingerprint. Every lower object a record
+//!   reads is noted as a `Seen` fact: kind, size and mtime, plus the server's content version
+//!   when it has one ([`FileSystem::version_tag`], a WebDAV ETag; SFTP v3 has none, LAN shares
+//!   report mtime in nanoseconds). Directories also note a digest of their entries.
+//! * **Checked against the server.** Recovery re-checks those facts against the server
+//!   itself ([`FileSystem::revalidate`] drops the metadata cache); if the server can't be
+//!   reached — or stops answering during the check — the session is left untouched and the
+//!   mount fails, without calling it a drift. Because the server can also change while the
+//!   volume is mounted, a commit re-checks every fact first; a difference marks the session as
+//!   drifted (only Discard is left), exactly as recovery does.
+//! * **Commit = applied by the server.** The remote layer applies changes locally and uploads
+//!   them from an offline queue. Each commit checkpoint first waits for that queue to drain
+//!   ([`FileSystem::commit_barrier`]); if the server is unreachable or refuses a change the
+//!   commit stops with an error and stays resumable, so it never reports success while data
+//!   only sits in the queue. A resumed commit drains whatever an interrupted window left in the
+//!   (persistent) queue before re-applying that window.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -116,6 +140,9 @@ pub struct ShadowSummary {
     pub commit_applied: u64,
     pub commit_total: u64,
     pub commit_error: Option<String>,
+    /// The source was changed elsewhere since the session started (found while mounted, by
+    /// the check a commit makes on remote servers): only Discard is possible.
+    pub drift: Option<String>,
 }
 
 // ───────────────────────────── journal records ─────────────────────────────
@@ -143,10 +170,19 @@ enum JOp {
     Write { i: JRef, off: u64, len: u64 },
 }
 
-/// What a record read from the lower volume (drift detection on replay).
+/// What a record read from the lower volume (drift detection on replay). On remote servers
+/// this is the base fingerprint of every object the session touched.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Seen {
-    Attr { r: JRef, kind: FileKind, size: u64, mtime: Timestamp },
+    Attr {
+        r: JRef,
+        kind: FileKind,
+        size: u64,
+        mtime: Timestamp,
+        /// Content version from the source ([`FileSystem::version_tag`], a WebDAV ETag).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+    },
     Dir { r: JRef, digest: String },
 }
 
@@ -378,10 +414,24 @@ impl FlushJob {
     }
 }
 
-fn drift_message(detail: &str) -> String {
+fn drift_message(detail: &str, remote: bool) -> String {
+    if remote {
+        return crate::i18n::t(
+            &format!("Sul server è stato modificato qualcosa che la sessione Shadow aveva già letto: le modifiche salvate non possono più essere applicate in sicurezza e si possono solo scartare. ({detail})"),
+            &format!("Something the Shadow session had already read was changed on the server: the saved changes can no longer be applied safely and can only be discarded. ({detail})"),
+        );
+    }
     crate::i18n::t(
         &format!("Il disco è stato modificato altrove (per esempio su Linux o Windows) dopo l'inizio della sessione Shadow: le modifiche salvate non possono più essere applicate in sicurezza e si possono solo scartare. ({detail})"),
         &format!("The disk was modified elsewhere (for example on Linux or Windows) after the Shadow session started: the saved changes can no longer be applied safely and can only be discarded. ({detail})"),
+    )
+}
+
+/// The saved changes of a remote session can't be checked right now (not a drift).
+fn unverifiable_message(why: &str) -> String {
+    crate::i18n::t(
+        &format!("Le modifiche Shadow salvate non si possono verificare sul server in questo momento ({why}): riprova quando il server è raggiungibile."),
+        &format!("The saved Shadow changes can't be checked against the server right now ({why}): try again when the server is reachable."),
     )
 }
 
@@ -423,10 +473,14 @@ pub struct ShadowOverlay {
     commit: Option<CommitRun>,
     /// Group-commit interval (tests raise it to control when frames are written).
     flush_interval: Duration,
+    /// Set when a commit found the source changed elsewhere (remote servers): the session can
+    /// only be inspected and discarded.
+    drift: Option<String>,
 }
 
 impl ShadowOverlay {
-    /// In-memory overlay (changes are lost when it is dropped). Used for remote volumes.
+    /// In-memory overlay (changes are lost when it is dropped). Used for volumes without a
+    /// session identity.
     pub fn new(lower: Box<dyn FileSystem>, stage_path: PathBuf) -> FsResult<Self> {
         if let Some(d) = stage_path.parent() {
             std::fs::create_dir_all(d)?;
@@ -461,6 +515,7 @@ impl ShadowOverlay {
             restored: false,
             commit: None,
             flush_interval: FLUSH_INTERVAL,
+            drift: None,
         }
     }
 
@@ -475,6 +530,7 @@ impl ShadowOverlay {
         let manifest = Manifest::load(&dir);
         let mut lower = lower;
         let fingerprint = lower.fingerprint();
+        let remote = identity.is_remote();
         let Some(mut manifest) = manifest else {
             // New session. Anything left here without a valid manifest never held a durable
             // change (the manifest is written before the first journal frame): set it aside.
@@ -488,21 +544,31 @@ impl ShadowOverlay {
             }
             let stage = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&stage_path).map_err(|x| e(&x))?;
             let sess = Session::fresh(dir, identity, fingerprint, 1);
-            return Ok(Self::build(lower, stage, stage_path, Some(sess)));
+            let mut ov = Self::build(lower, stage, stage_path, Some(sess));
+            ov.stable_inos &= !remote;
+            return Ok(ov);
         };
         if let Some(d) = &manifest.drift {
-            return Err(drift_message(d));
+            return Err(drift_message(d, remote));
         }
         // Keep what the app knows about the device up to date.
         if identity.media_uuid.is_some() {
             manifest.identity.media_uuid = identity.media_uuid.clone();
         }
         manifest.identity.source_path = identity.source_path.clone();
+        if remote {
+            // Same endpoint (that's the key), maybe a new address / name (LAN shares).
+            manifest.identity.label = identity.label.clone();
+            manifest.identity.display = identity.display.clone();
+        }
         let stage = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&stage_path).map_err(|x| e(&x))?;
         let mut sess = Session::fresh(dir.clone(), manifest.identity.clone(), manifest.fingerprint.clone(), 1);
         sess.manifest = manifest.clone();
         sess.armed = false;
         let mut ov = Self::build(lower, stage, stage_path, Some(sess));
+        // Remote inode numbers are handed out per process: the journal names lower objects by
+        // path only (as on FAT / exFAT).
+        ov.stable_inos &= !remote;
 
         if manifest.state == "committing" {
             let plan: Plan = std::fs::read(dir.join(store::PLAN))
@@ -533,6 +599,13 @@ impl ShadowOverlay {
         if manifest.fingerprint.is_some() && fingerprint != manifest.fingerprint {
             return Err(ov.mark_drift(crate::i18n::t("impronta del volume diversa", "volume fingerprint changed")));
         }
+        // Remote servers: the recorded bases are checked against the server itself, never
+        // against the local cache; if it can't be reached the session is left as it is.
+        let gen = match ov.lower.revalidate() {
+            None => None,
+            Some(Ok(g)) => Some(g),
+            Some(Err(x)) => return Err(unverifiable_message(&x.to_string())),
+        };
         let (journal, frames) = RecordLog::open(&dir.join(store::JOURNAL)).map_err(|x| e(&x))?;
         let mut records = 0usize;
         for (i, f) in frames.iter().enumerate() {
@@ -548,12 +621,18 @@ impl ShadowOverlay {
                 Frame::Batch(recs) => {
                     for r in recs {
                         if let Err(d) = ov.replay_record(r) {
+                            if let Some(why) = ov.connection_lost(gen) {
+                                return Err(unverifiable_message(&why));
+                            }
                             return Err(ov.mark_drift(d));
                         }
                         records += 1;
                     }
                 }
             }
+        }
+        if let Some(why) = ov.connection_lost(gen) {
+            return Err(unverifiable_message(&why));
         }
         ov.path_cache.clear();
         ov.rebuild_free_list();
@@ -566,12 +645,61 @@ impl ShadowOverlay {
     }
 
     fn mark_drift(&mut self, detail: String) -> String {
+        let mut remote = false;
         if let Some(s) = &mut self.sess {
             s.armed = false;
             s.manifest.drift = Some(detail.clone());
             let _ = s.manifest.save(&s.dir, true);
+            remote = s.manifest.identity.is_remote();
         }
-        drift_message(&detail)
+        drift_message(&detail, remote)
+    }
+
+    /// Remote sources: why a check started at connection generation `gen` may have looked at
+    /// cached data instead of the server (it was or is unreachable). None: it saw the server
+    /// (or the source is local, `gen` None).
+    fn connection_lost(&mut self, gen: Option<u64>) -> Option<String> {
+        let g = gen?;
+        match self.lower.revalidate() {
+            Some(Ok(now)) if now == g => None,
+            Some(Err(e)) => Some(e.to_string()),
+            _ => Some(crate::i18n::t("la connessione si è interrotta durante il controllo", "the connection dropped during the check")),
+        }
+    }
+
+    /// Before a commit on a remote server: re-check every base the session recorded (the
+    /// `Seen` facts of the journal) against the server, which may have been changed while the
+    /// volume was mounted. A difference marks the session as drifted: only Discard is left.
+    fn verify_bases(&mut self) -> FsResult<()> {
+        let gen = match self.lower.revalidate() {
+            None => return Ok(()),
+            Some(r) => Some(r?),
+        };
+        let Some(s) = &self.sess else { return Ok(()) };
+        let frames = if s.journal.is_some() { RecordLog::read(&s.dir.join(store::JOURNAL)).map_err(io)? } else { vec![] };
+        let mut seen: Vec<Seen> = vec![];
+        let mut dedup: HashSet<String> = HashSet::new();
+        for f in &frames {
+            if let Ok(Frame::Batch(recs)) = serde_json::from_slice::<Frame>(f) {
+                for x in recs.into_iter().flat_map(|r| r.seen) {
+                    if dedup.insert(serde_json::to_string(&x).unwrap_or_default()) {
+                        seen.push(x);
+                    }
+                }
+            }
+        }
+        self.path_cache.clear();
+        let bad = seen.iter().find_map(|x| self.verify_seen(x).err());
+        self.path_cache.clear();
+        if let Some(why) = self.connection_lost(gen) {
+            return Err(FsError::Io(unverifiable_message(&why)));
+        }
+        if let Some(d) = bad {
+            let msg = self.mark_drift(d.clone());
+            self.drift = Some(d);
+            return Err(FsError::Io(msg));
+        }
+        Ok(())
     }
 
     /// Persistent session key, if this overlay is journaled on disk.
@@ -606,7 +734,7 @@ impl ShadowOverlay {
     }
 
     fn check_mutable(&self) -> FsResult<()> {
-        if self.commit.is_some() {
+        if self.commit.is_some() || self.drift.is_some() {
             return Err(FsError::ReadOnly);
         }
         Ok(())
@@ -718,11 +846,12 @@ impl ShadowOverlay {
         let (parent, name) = self.known_parent.get(&ino).cloned().unwrap_or((self.lower.root_ino(), String::new()));
         let target = if attr.kind == FileKind::Symlink { self.lower.readlink(ino).ok() } else { None };
         let (kind, size, mtime) = (attr.kind, attr.size, attr.mtime);
+        let tag = if self.rec.is_some() && self.recording() { self.lower.version_tag(ino) } else { None };
         self.nodes.insert(
             ino,
             SNode { attr, lower: Some(ino), data: None, children: None, target, parent, name, alive: true, attr_dirty: false },
         );
-        self.note_seen(|s| Seen::Attr { r: s.jref_or_ino(ino), kind, size, mtime });
+        self.note_seen(|s| Seen::Attr { r: s.jref_or_ino(ino), kind, size, mtime, tag });
         Ok(())
     }
 
@@ -1082,10 +1211,11 @@ impl ShadowOverlay {
             JRef::O(i) | JRef::I(i) => format!("inode {i}"),
         };
         match s {
-            Seen::Attr { r, kind, size, mtime } => {
+            Seen::Attr { r, kind, size, mtime, tag } => {
                 let i = self.resolve_ref(r).map_err(|_| crate::i18n::t(&format!("{} non c'è più", what(r)), &format!("{} is gone", what(r))))?;
                 let a = self.lower.getattr(i).map_err(|e| e.to_string())?;
-                if a.kind != *kind || a.size != *size || a.mtime != *mtime {
+                let tag_changed = tag.is_some() && self.lower.version_tag(i) != *tag;
+                if a.kind != *kind || a.size != *size || a.mtime != *mtime || tag_changed {
                     return Err(crate::i18n::t(&format!("{} è cambiato", what(r)), &format!("{} changed", what(r))));
                 }
             }
@@ -1329,6 +1459,7 @@ impl ShadowOverlay {
         s.session_key = self.session_key();
         s.restored = self.restored;
         s.state = if self.commit.is_some() { "committing" } else { "pending" };
+        s.drift = self.drift.clone();
         if let Some(c) = &self.commit {
             s.commit_applied = c.done as u64;
             s.commit_total = c.plan.total() as u64;
@@ -1373,6 +1504,7 @@ impl ShadowOverlay {
         // Overlay-only ids become stale; that's what a rollback means.
         self.clear();
         self.restored = false;
+        self.drift = None;
         self.restart_session();
         n
     }
@@ -1445,7 +1577,12 @@ impl ShadowOverlay {
     /// the volume is mounted again in Shadow mode — continues from the last checkpoint.
     pub fn commit(&mut self) -> FsResult<u64> {
         if self.commit.is_none() {
+            if let Some(d) = &self.drift {
+                return Err(FsError::Io(drift_message(d, true)));
+            }
             self.flush()?;
+            // Remote servers can change while mounted: the bases must still match.
+            self.verify_bases()?;
             let changes = self.changes().len() as u64;
             let plan = self.build_plan(changes)?;
             if plan.total() == 0 {
@@ -1474,7 +1611,9 @@ impl ShadowOverlay {
             self.commit = Some(CommitRun { plan, done: 0, map: HashMap::new(), stale: false, error: None, progress, overlay_valid: true });
         }
         let mut run = self.commit.take().unwrap();
-        let res = self.run_commit(&mut run);
+        // Resuming: a remote server first applies what an interrupted window left in its
+        // offline queue, so the redo below sees the server as it really is.
+        let res = if run.stale { self.lower.commit_barrier() } else { Ok(()) }.and_then(|_| self.run_commit(&mut run));
         match res {
             Ok(()) => {
                 let applied = run.plan.changes;
@@ -1549,7 +1688,8 @@ impl ShadowOverlay {
     }
 
     fn checkpoint(&mut self, run: &mut CommitRun, step: usize) -> FsResult<()> {
-        self.lower.sync()?;
+        // Remote servers: everything up to here is applied on the server, not just queued.
+        self.lower.commit_barrier()?;
         if let Some(p) = &mut run.progress {
             let b = serde_json::to_vec(&Checkpoint { step: step as u64 }).map_err(json_err)?;
             p.append(&b).map_err(io)?;
@@ -2151,6 +2291,10 @@ impl FileSystem for ShadowOverlay {
 #[cfg(test)]
 #[path = "shadow_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "shadow_remote_tests.rs"]
+mod remote_tests;
 
 /// Crash tests only: `LUMENDISK_TEST_STALL_COMMIT_AFTER=N` parks the committing thread forever
 /// once the N-th checkpoint of this process is durable, so a test can SIGKILL the server at a
