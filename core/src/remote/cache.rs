@@ -123,6 +123,11 @@ struct State {
     epoch: u64,
     /// Per-path data version, part of the chunk-cache key.
     ver: HashMap<String, u64>,
+    /// What the uploader is doing. `Op`: applying `queue.front()` on the server, which may
+    /// already be past it although it is still queued.
+    upload: Upload,
+    /// Reads resolving a server path through queued renames: no op may start meanwhile.
+    pins: u32,
 }
 
 pub struct Shared {
@@ -136,6 +141,9 @@ pub struct Shared {
     last_error: Mutex<Option<String>>,
     stop: AtomicBool,
     wake: (Mutex<bool>, Condvar),
+    /// Paired with `st`: notified whenever the uploader finishes a unit of work or a pinned
+    /// read ends.
+    settled: Condvar,
     url: String,
 }
 
@@ -314,9 +322,17 @@ impl Shared {
         if !self.online.load(Ordering::SeqCst) {
             return Some(false);
         }
+        // One unit of work at a time (`sync_now` runs beside the uploader thread), and no
+        // structural op while a read resolves a server path through the queue (`read_chunk`).
+        let mut st = self.st.lock().unwrap();
+        while st.pins > 0 || st.upload != Upload::Idle {
+            st = self.settled.wait(st).unwrap();
+        }
         // 1) structural ops, in order
-        let op = self.st.lock().unwrap().queue.front().cloned();
-        if let Some((op_id, op)) = op {
+        if let Some((op_id, op)) = st.queue.front().cloned() {
+            st.upload = Upload::Op;
+            drop(st);
+            let _busy = Busy(self);
             self.backend.set_timeout(self.cfg.data_timeout);
             let b = self.backend.as_ref();
             let r = match &op {
@@ -334,31 +350,32 @@ impl Shared {
                 Op::Rename { from, to } => b.rename(from, to),
                 Op::SetPerm { path, perm } => b.set_perm(path, *perm),
             };
-            match r {
-                Err(e) if e.is_network() => {
-                    self.set_offline(&e);
-                    return Some(false);
-                }
-                Err(e) => {
+            let offline = matches!(&r, Err(e) if e.is_network());
+            if let Err(e) = &r {
+                if offline {
+                    self.set_offline(e);
+                } else {
                     eprintln!("lumendisk: remote op {op:?} failed permanently: {e}; dropping");
                     *self.last_error.lock().unwrap() = Some(format!("{}: {e}", op.path()));
                 }
-                Ok(()) => {}
             }
-            {
+            if !offline {
+                // (before `_busy` ends: a reader seeing the op still queued must see it in flight)
                 let mut st = self.st.lock().unwrap();
                 if let Some(i) = st.queue.iter().position(|(id, _)| *id == op_id) {
                     st.queue.remove(i);
                 }
                 st.epoch += 1;
             }
+            if offline {
+                return Some(false);
+            }
             self.last_sync.store(now_secs() as u64, Ordering::SeqCst);
             return Some(true);
         }
-        // 2) dirty file contents (only when all structural ops are applied: remote paths
-        //    then equal local paths)
+        // 2) dirty file contents, only when all structural ops are applied (checked under the
+        //    same lock): remote paths then equal local paths
         let snap = {
-            let st = self.st.lock().unwrap();
             let (ino, d) = st.dirty.iter().next().map(|(i, d)| (*i, d.clone()))?;
             let path = st.paths.get(&ino).cloned()?;
             let mut chunks = vec![];
@@ -376,6 +393,9 @@ impl Shared {
             }
             (ino, path, d, chunks)
         };
+        st.upload = Upload::Data;
+        drop(st);
+        let _busy = Busy(self);
         let (ino, path, d, chunks) = snap;
         self.backend.set_timeout(self.cfg.data_timeout);
         let b = self.backend.as_ref();
@@ -445,6 +465,33 @@ impl Shared {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Upload {
+    Idle,
+    Op,
+    Data,
+}
+
+/// A unit of upload work in progress (ends on every path, panics included).
+struct Busy<'a>(&'a Shared);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.st.lock().unwrap().upload = Upload::Idle;
+        self.0.settled.notify_all();
+    }
+}
+
+/// A read holding the uploader off structural ops (see `RemoteVfs::read_chunk`).
+struct Pin<'a>(&'a Shared);
+
+impl Drop for Pin<'_> {
+    fn drop(&mut self) {
+        self.0.st.lock().unwrap().pins -= 1;
+        self.0.settled.notify_all();
+    }
+}
+
 fn dir_size(p: &std::path::Path) -> u64 {
     let mut n = 0;
     if let Ok(rd) = std::fs::read_dir(p) {
@@ -482,6 +529,8 @@ impl RemoteVfs {
             db_dirty: false,
             epoch: 0,
             ver: HashMap::new(),
+            upload: Upload::Idle,
+            pins: 0,
         };
         if let Some(q) = restored {
             eprintln!("lumendisk: restored {} queued change(s) for {url}", q.ops.len() + q.dirty.len());
@@ -528,6 +577,7 @@ impl RemoteVfs {
             last_error: Mutex::new(None),
             stop: AtomicBool::new(false),
             wake: (Mutex::new(false), Condvar::new()),
+            settled: Condvar::new(),
             url,
         });
         // First contact (bounded); failing is fine if we have a cache.
@@ -855,10 +905,21 @@ impl RemoteVfs {
 
     fn enqueue(&self, op: Op) {
         let mut st = self.sh.st.lock().unwrap();
+        Self::push_op(&mut st, op);
+        drop(st);
+        self.queued();
+    }
+
+    /// Queue `op` in the same critical section as the local change it mirrors: the uploader
+    /// treats an empty queue as "server paths equal local paths" and must never see one half.
+    fn push_op(st: &mut State, op: Op) {
         let id = st.next_op;
         st.next_op += 1;
         st.queue.push_back((id, op));
-        drop(st);
+    }
+
+    /// After [`Self::push_op`] (lock released): save the queue and wake the uploader.
+    fn queued(&self) {
         let _ = self.sh.persist_queue_opt(false);
         self.sh.kick();
     }
@@ -916,27 +977,47 @@ impl RemoteVfs {
         if !self.sh.online.load(Ordering::SeqCst) {
             return Err(FsError::Io(crate::i18n::t("offline: contenuto non ancora in cache", "offline: content not cached yet")));
         }
-        // fetch this chunk plus read-ahead (up to 4 chunks) in one request
-        let (rpath, renamed) = {
-            let st = self.sh.st.lock().unwrap();
-            let rp = Self::remote_path_of(&st, path);
-            let r = rp != path;
-            (rp, r)
-        };
-        let cacheable = !has_dirty && !renamed;
-        let ahead = if !cacheable { 1 } else { ((limit - start).div_ceil(CHUNK)).min(4) };
-        self.sh.backend.set_timeout(self.sh.cfg.data_timeout);
-        let data = match self.sh.backend.read(&rpath, start, (ahead * CHUNK).min(limit - start) as u32) {
-            Ok(d) => d,
-            Err(err) => {
-                if err.is_network() {
-                    self.sh.set_offline(&err);
+        // Fetch this chunk plus read-ahead (up to 4 chunks) in one request. Queued renames say
+        // where the data still is on the server, so while we read there the uploader must not
+        // start another op (pin). An op it was already applying may have moved the data before
+        // we looked: then read again once that op has landed.
+        let mut pin = None;
+        let mut attempt = 0;
+        let (renamed, data) = loop {
+            attempt += 1;
+            let (rpath, inflight) = {
+                let mut st = self.sh.st.lock().unwrap();
+                let rp = Self::remote_path_of(&st, path);
+                if rp != path && pin.is_none() {
+                    st.pins += 1;
+                    pin = Some(Pin(&self.sh));
                 }
-                return Err(map_err(err));
+                (rp, st.upload == Upload::Op)
+            };
+            let renamed = rpath != path;
+            let ahead = if has_dirty || renamed { 1 } else { ((limit - start).div_ceil(CHUNK)).min(4) };
+            self.sh.backend.set_timeout(self.sh.cfg.data_timeout);
+            let r = self.sh.backend.read(&rpath, start, (ahead * CHUNK).min(limit - start) as u32);
+            if renamed && inflight && attempt < 3 {
+                let st = self.sh.st.lock().unwrap();
+                let _ = self.sh.settled.wait_timeout_while(st, self.sh.cfg.data_timeout * 2, |s| s.upload == Upload::Op);
+                continue;
+            }
+            match r {
+                Ok(d) => break (renamed, d),
+                Err(err) => {
+                    if err.is_network() {
+                        self.sh.set_offline(&err);
+                    }
+                    return Err(map_err(err));
+                }
             }
         };
+        drop(pin);
+        let cacheable = !has_dirty && !renamed;
+        let ahead = if cacheable { ((limit - start).div_ceil(CHUNK)).min(4) } else { 0 };
         self.sh.fetched.fetch_add(data.len() as u64, Ordering::SeqCst);
-        for k in 0..if cacheable { ahead } else { 0 } {
+        for k in 0..ahead {
             let s = (k * CHUNK) as usize;
             if s >= data.len() {
                 break;
@@ -1193,8 +1274,9 @@ impl FileSystem for RemoteVfs {
             let mut st = self.sh.st.lock().unwrap();
             let d = Self::dirty_entry(&mut st, ino, &join(&pp, name), 0);
             d.base_limit = 0;
+            Self::push_op(&mut st, Op::Create { path: join(&pp, name), perm });
         }
-        self.enqueue(Op::Create { path: join(&pp, name), perm });
+        self.queued();
         Ok(ino)
     }
 
@@ -1289,21 +1371,26 @@ impl FileSystem for RemoteVfs {
         if e.kind == FileKind::Dir && (to.starts_with(&format!("{from}/"))) {
             return Err(FsError::Invalid("cannot move a directory inside itself".into()));
         }
-        if let Ok(d) = self.meta(&to) {
-            match (e.kind == FileKind::Dir, d.kind == FileKind::Dir) {
-                (true, false) => return Err(FsError::NotDir),
-                (false, true) => return Err(FsError::IsDir),
-                (true, true) if !self.list(&to)?.is_empty() => return Err(FsError::NotEmpty),
-                _ => {}
+        let replaces = match self.meta(&to) {
+            Ok(d) => {
+                match (e.kind == FileKind::Dir, d.kind == FileKind::Dir) {
+                    (true, false) => return Err(FsError::NotDir),
+                    (false, true) => return Err(FsError::IsDir),
+                    (true, true) if !self.list(&to)?.is_empty() => return Err(FsError::NotEmpty),
+                    _ => {}
+                }
+                true
             }
-            let mut st = self.sh.st.lock().unwrap();
+            Err(_) => false,
+        };
+        let mut st = self.sh.st.lock().unwrap();
+        if replaces {
             if let Some(ino) = st.inos.remove(&to) {
                 st.paths.remove(&ino);
                 st.dirty.remove(&ino);
             }
             st.meta.remove(&to);
         }
-        let mut st = self.sh.st.lock().unwrap();
         // Move the subtree's path ↔ ino mappings and cached metadata.
         let prefix = format!("{from}/");
         let moved: Vec<(String, Ino)> = st.inos.iter().filter(|(p, _)| **p == from || p.starts_with(&prefix)).map(|(p, i)| (p.clone(), *i)).collect();
@@ -1337,8 +1424,9 @@ impl FileSystem for RemoteVfs {
             }
         }
         st.db_dirty = true;
+        Self::push_op(&mut st, Op::Rename { from, to });
         drop(st);
-        self.enqueue(Op::Rename { from, to });
+        self.queued();
         Ok(())
     }
 
@@ -1362,6 +1450,7 @@ impl FileSystem for RemoteVfs {
 pub mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
 
     /// In-memory remote with a "stall" switch that simulates a dead network.
     #[derive(Default)]
@@ -1371,6 +1460,11 @@ pub mod tests {
         pub timeout: Mutex<Duration>,
         pub calls: AtomicU64,
         pub mtimes: Mutex<HashMap<String, Timestamp>>,
+        /// Hook: the next `rename` applies the change, reports it on `.0` and then holds the
+        /// caller (the uploader, with the op still queued) until `.1` fires.
+        pub park_rename: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+        /// Hook: the next `read` fires this first (releasing a parked rename).
+        pub release_on_read: Mutex<Option<mpsc::Sender<()>>>,
     }
 
     impl MemBackend {
@@ -1424,6 +1518,9 @@ pub mod tests {
         }
         fn read(&self, path: &str, offset: u64, len: u32) -> RResult<Vec<u8>> {
             self.gate()?;
+            if let Some(go) = self.release_on_read.lock().unwrap().take() {
+                let _ = go.send(());
+            }
             let f = self.files.lock().unwrap();
             let v = &f.get(path).ok_or(RemoteError::NotFound)?.1;
             let s = (offset as usize).min(v.len());
@@ -1496,6 +1593,11 @@ pub mod tests {
                 let v = f.remove(&old).unwrap();
                 f.insert(format!("{to}{}", &old[from.len()..]), v);
             }
+            drop(f);
+            if let Some((parked, go)) = self.park_rename.lock().unwrap().take() {
+                let _ = parked.send(());
+                let _ = go.recv_timeout(Duration::from_secs(20)); // (bound: never hang a failing test)
+            }
             Ok(())
         }
         fn symlink(&self, path: &str, target: &str) -> RResult<()> {
@@ -1540,12 +1642,21 @@ pub mod tests {
         }
     }
 
-    fn wait_synced(v: &RemoteVfs) {
+    /// Until the uploader has applied everything (woken by each unit it finishes).
+    pub fn wait_synced(v: &RemoteVfs) {
+        let sh = v.handle();
+        let st = sh.st.lock().unwrap();
+        let (st, _) = sh.settled.wait_timeout_while(st, Duration::from_secs(20), |s| !s.queue.is_empty() || !s.dirty.is_empty() || s.upload != Upload::Idle).unwrap();
+        assert!(st.queue.is_empty() && st.dirty.is_empty(), "queue did not drain");
+    }
+
+    /// Until the health thread has noticed the dead network.
+    pub fn wait_offline(v: &RemoteVfs) {
         let t0 = Instant::now();
-        while v.handle().pending() > 0 && t0.elapsed() < Duration::from_secs(20) {
-            std::thread::sleep(Duration::from_millis(20));
+        while v.handle().health().online {
+            assert!(t0.elapsed() < Duration::from_secs(20), "never went offline");
+            std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(v.handle().pending(), 0, "queue did not drain");
     }
 
     #[test]
@@ -1561,6 +1672,29 @@ pub mod tests {
         assert!(!f.contains_key("/big.bin") && !f.contains_key("/a.txt"));
     }
 
+    /// A read of a renamed file while the uploader is applying that rename on the server: the
+    /// server already has the new name, but the op is still queued (in flight).
+    #[test]
+    fn read_while_its_rename_is_being_applied() {
+        let be = MemBackend::new();
+        let mut v = RemoteVfs::new(be.clone(), cfg("inflight")).unwrap();
+        let root = v.root_ino();
+        let x = v.mkdir(root, "x", 0o755, 0, 0).unwrap();
+        let m = v.create(x, "m.txt", 0o644, 0, 0).unwrap();
+        v.write(m, 0, b"move me").unwrap();
+        wait_synced(&v); // the data is on the server only now, nothing is staged locally
+        let (parked_tx, parked) = mpsc::channel();
+        let (go, go_rx) = mpsc::channel();
+        *be.park_rename.lock().unwrap() = Some((parked_tx, go_rx));
+        *be.release_on_read.lock().unwrap() = Some(go);
+        v.rename(x, "m.txt", x, "n.txt").unwrap();
+        parked.recv().unwrap(); // server: /x/n.txt; local queue: still Rename(/x/m.txt → /x/n.txt)
+        let n = v.lookup(x, "n.txt").unwrap();
+        assert_eq!(v.read(n, 0, 100).unwrap(), b"move me");
+        wait_synced(&v);
+        assert_eq!(be.files.lock().unwrap().get("/x/n.txt").unwrap().1, b"move me");
+    }
+
     #[test]
     fn offline_never_blocks_and_flushes_on_reconnect() {
         let be = MemBackend::new();
@@ -1574,8 +1708,7 @@ pub mod tests {
         assert!(names.contains(&"dir".to_string()));
         // network dies
         be.stalled.store(true, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(600)); // health ping notices
-        assert!(!v.handle().health().online);
+        wait_offline(&v); // the health ping notices
         let mut worst = Duration::ZERO;
         for _ in 0..50 {
             let t0 = Instant::now();
@@ -1632,8 +1765,7 @@ pub mod tests {
             let o = v.lookup(docs, "vecchio.txt").unwrap();
             assert_eq!(v.read(o, 0, 10).unwrap(), b"v1"); // opened once while online
             be.stalled.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(600));
-            assert!(!v.handle().health().online);
+            wait_offline(&v);
             let f = v.create(docs, "nuovo offline.bin", 0o644, 0, 0).unwrap();
             v.write(f, 0, &big).unwrap();
             let o = v.lookup(docs, "vecchio.txt").unwrap();
@@ -1687,6 +1819,42 @@ pub mod tests {
 mod stress {
     use super::tests::*;
     use super::*;
+
+    /// Local changes racing the uploader: write a file and rename it at once, many times. Each
+    /// rename moves the local paths and queues the op; the uploader must never see one without
+    /// the other (it would upload the staged data to a name the server doesn't have yet).
+    #[test]
+    fn write_then_rename_while_uploading() {
+        let be = MemBackend::new();
+        let mut v = RemoteVfs::new(be.clone(), cfg("wrstress")).unwrap();
+        // "Sync now" from the app, beside the uploader thread
+        let stop = Arc::new(AtomicBool::new(false));
+        let syncer = {
+            let (h, stop) = (v.handle(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    h.sync_now(Duration::from_millis(5));
+                }
+            })
+        };
+        let root = v.root_ino();
+        let d = v.mkdir(root, "d", 0o755, 0, 0).unwrap();
+        for i in 0..600 {
+            let f = v.create(d, &format!("tmp{i}"), 0o644, 0, 0).unwrap();
+            v.write(f, 0, format!("data {i}").as_bytes()).unwrap();
+            v.rename(d, &format!("tmp{i}"), d, &format!("f{i}")).unwrap();
+            let f = v.lookup(d, &format!("f{i}")).unwrap();
+            assert_eq!(v.read(f, 0, 100).unwrap(), format!("data {i}").as_bytes(), "file {i}");
+        }
+        wait_synced(&v);
+        stop.store(true, Ordering::SeqCst);
+        syncer.join().unwrap();
+        let files = be.files.lock().unwrap();
+        for i in 0..600 {
+            assert_eq!(files.get(&format!("/d/f{i}")).map(|x| x.1.clone()), Some(format!("data {i}").into_bytes()), "file {i} on the server");
+        }
+        assert!(v.handle().health().last_error.is_none(), "{:?}", v.handle().health().last_error);
+    }
 
     #[test]
     fn big_sequential_write_while_uploading() {

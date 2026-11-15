@@ -97,6 +97,16 @@ bold "Unit tests (drivers, WAL, Ghost Shield, Shadow, UID bridge, remote cache, 
 OUT=$(cargo test -q --release -p lumendisk-core --lib 2>&1) || { echo "$OUT" | tail -30; die "unit tests failed"; }
 ok "$(summary_of "$OUT")"; record "Unit tests" "$(summary_of "$OUT")"
 
+bold "Remote cache race check: conformance + upload test 100× in a row (stops at the first failure)"
+# Runs the already-built unit-test binary directly (no cargo start-up per run): ~10 s.
+UNIT_BIN=$(cargo test -q --release -p lumendisk-core --lib --no-run --message-format=json 2>/dev/null | grep -o '"executable":"[^"]*"' | tail -1 | cut -d'"' -f4)
+[ -x "$UNIT_BIN" ] || die "unit-test binary not found"
+for i in $(seq 1 100); do
+  OUT=$("$UNIT_BIN" --exact remote::cache::tests::remote_vfs_conformance_and_upload 2>&1) && grep -q '1 passed' <<<"$OUT" \
+    || { echo "$OUT" | tail -20; die "remote_vfs_conformance_and_upload failed on run $i of 100"; }
+done
+ok "100 of 100 runs passed"; record "Remote cache race check" "100/100 runs"
+
 bold "Corrupted images: mutated ext4 / NTFS / FAT / exFAT volumes and partition tables (no panic, hang or runaway allocation)"
 OUT=$(cargo test --profile robust -p lumendisk-core --test corrupted_images -- --nocapture 2>&1) || { echo "$OUT" | grep -E '✗|panicked|FAILED|HANG' | head -40; die "corrupted-image suite failed"; }
 LINE=$(grep -E '^corrupted images:' <<<"$OUT" | head -1)
