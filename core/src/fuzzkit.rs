@@ -73,7 +73,7 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
     }
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -82,7 +82,7 @@ impl Rng {
     }
     /// Uniform in `0..n` (`n > 0`).
     pub fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
+        self.next_u64() % n.max(1)
     }
     pub fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
@@ -464,7 +464,7 @@ fn mutate_once(seed: &Seed, img: &mut Vec<u8>, r: &mut Rng) -> String {
             let off = hot(r) * 512 + r.below(512) as usize;
             let n = 1 + r.below(16) as usize;
             for i in 0..n {
-                let v = r.next() as u8;
+                let v = r.next_u64() as u8;
                 if let Some(b) = img.get_mut(off + i) {
                     *b = v;
                 }
@@ -969,7 +969,7 @@ pub fn mutate_partitions(seed: &[u8], case: u64) -> Vec<u8> {
         let off = sec * 512 + (r.below(512) as usize / w) * w;
         let v = match r.below(4) {
             0 => INTERESTING[r.below(INTERESTING.len() as u64) as usize],
-            1 => r.next(),
+            1 => r.next_u64(),
             2 => rd(&img, off, w).wrapping_add(1 + r.below(4000)),
             _ => [2200u64, 3400, 0, 1, 2][r.below(5) as usize], // EBR / table self-references
         };
@@ -1105,19 +1105,15 @@ pub fn minimized_regression(driver: Driver, fuzz_input: &[u8]) -> Option<Vec<u8>
         let mut n = 2usize;
         while runs.len() >= 2 {
             let chunk = runs.len().div_ceil(n);
-            let mut removed = false;
-            for k in 0..n {
+            let smaller = (0..n).find_map(|k| {
                 let (a, b) = (k * chunk, ((k + 1) * chunk).min(runs.len()));
-                if a >= b {
-                    continue;
-                }
-                let rest: Vec<_> = runs[..a].iter().chain(&runs[b..]).cloned().collect();
-                if crashes(&build(&rest)) {
-                    runs = rest;
-                    n = (n - 1).max(2);
-                    removed = true;
-                    break;
-                }
+                let rest: Vec<_> = runs[..a.min(b)].iter().chain(&runs[b..]).cloned().collect();
+                (a < b && crashes(&build(&rest))).then_some(rest)
+            });
+            let removed = smaller.is_some();
+            if let Some(rest) = smaller {
+                runs = rest;
+                n = (n - 1).max(2);
             }
             if !removed {
                 if n >= runs.len() {
