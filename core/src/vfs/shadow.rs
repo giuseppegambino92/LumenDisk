@@ -2300,7 +2300,9 @@ impl Drop for ShadowOverlay {
                 }
                 if self.commit.is_none() && self.changes().is_empty() {
                     if let Some(s) = &self.sess {
-                        let _ = store::remove_session_dir(&s.dir);
+                        if let Err(e) = store::remove_session_dir(&s.dir) {
+                            eprintln!("lumendisk: removing the empty Shadow session: {e}");
+                        }
                     }
                 } else {
                     let _ = self.update_manifest(true);

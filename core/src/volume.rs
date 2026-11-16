@@ -775,15 +775,24 @@ impl Runtime {
         let fs2 = fs.clone();
         let sync_task = self.rt.spawn(async move {
             let mut n: u32 = 0;
+            let mut last_err: Option<String> = None;
             loop {
                 tokio::time::sleep(crate::vfs::shadow::FLUSH_INTERVAL).await;
                 n = n.wrapping_add(1);
                 let fs3 = fs2.clone();
                 if n % 30 == 0 {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = lock_stack(&fs3).sync();
-                    })
-                    .await;
+                    let r = tokio::task::spawn_blocking(move || lock_stack(&fs3).sync().map_err(|e| e.to_string())).await;
+                    // Nobody waits on this background sync: log a failure (once per distinct
+                    // error) instead of dropping it. Stable writes and COMMITs report their own.
+                    let err = match r {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(e),
+                        Err(e) => Some(e.to_string()),
+                    };
+                    if err.is_some() && err != last_err {
+                        eprintln!("lumendisk: background sync: {}", err.as_deref().unwrap_or_default());
+                    }
+                    last_err = err;
                     continue;
                 }
                 // Group commit of what was written UNSTABLE meanwhile (and not COMMITted yet),
@@ -936,7 +945,7 @@ impl Runtime {
         let v = self.get(id)?;
         let h = v.remote.clone().ok_or_else(|| crate::i18n::t("non è un volume remoto", "not a remote volume"))?;
         // make sure the stack pushed its latest state down first
-        let _ = lock_stack(&v.fs).sync();
+        lock_stack(&v.fs).sync().map_err(|e| e.to_string())?;
         let n = h.sync_now(std::time::Duration::from_secs(20));
         Ok((n, h.pending()))
     }

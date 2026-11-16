@@ -78,11 +78,22 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     if cfg!(test) {
         return Ok(()); // see `full_sync`
     }
-    let d = File::open(dir)?;
     // F_FULLFSYNC is not supported on directories everywhere; a plain fsync orders the entry.
-    // SAFETY: plain fsync on a valid descriptor.
-    unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&d)) };
-    Ok(())
+    fsync_fd(&File::open(dir)?)
+}
+
+/// `fsync(2)` that reports failure: callers promise durability on the strength of this call.
+fn fsync_fd(f: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+    loop {
+        // SAFETY: plain fsync on a valid descriptor.
+        if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 /// Write `data` to `path` atomically (temp file + full sync + rename + dir sync).
@@ -316,10 +327,11 @@ pub fn remove_session_dir(dir: &Path) -> io::Result<()> {
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::rename(dir, &trash)?;
-    if let Some(p) = dir.parent() {
-        let _ = sync_dir(p);
-    }
-    std::fs::remove_dir_all(&trash)
+    // The session is gone from its name either way; delete it, then report a failed dir sync
+    // (the removal may not survive a crash: the caller must not claim it is durable).
+    let synced = dir.parent().map_or(Ok(()), sync_dir);
+    std::fs::remove_dir_all(&trash)?;
+    synced
 }
 
 /// Leftovers of interrupted deletions.
@@ -436,5 +448,23 @@ mod tests {
         assert!(!m.identity.is_remote());
         let s = serde_json::to_string(&m.identity).unwrap();
         assert!(!s.contains("endpoint"), "local identities serialize as before: {s}");
+    }
+
+    /// A failed fsync is an error, not a silent success (here: fsync on a pipe → EINVAL).
+    #[test]
+    fn fsync_failure_is_reported() {
+        let mut fds = [0; 2];
+        // SAFETY: pipe() fills two descriptors, owned below.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: freshly created descriptors, each owned once.
+        let (r, w) = unsafe {
+            use std::os::fd::FromRawFd;
+            (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1]))
+        };
+        let e = fsync_fd(&w).expect_err("fsync on a pipe must fail");
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+        drop(r);
+        let f = File::open(std::env::temp_dir()).unwrap();
+        fsync_fd(&f).expect("fsync on a directory succeeds");
     }
 }
