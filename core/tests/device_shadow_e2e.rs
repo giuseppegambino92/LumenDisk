@@ -9,9 +9,9 @@
 //! hdiutil-attached nodes belong to the user who attached them, so no authorisation
 //! (authopen) is involved: LumenDisk opens them like any file.
 //!
-//! `LUMENDISK_STRICT_DURABILITY=1` requires every operation acknowledged before the
-//! zero-delay SIGKILL to survive it (see `survived_prefix`). Without it the test only asks for
-//! what the current group-committed journal guarantees: a consistent prefix.
+//! Every operation acknowledged before the zero-delay SIGKILL must survive it (see
+//! `survived_prefix`): metadata replies wait until the journal has the record, and close()
+//! COMMITs the file's data.
 mod common;
 use common::*;
 
@@ -365,10 +365,6 @@ fn sessions(dir: &Path) -> Vec<serde_json::Value> {
     serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout).unwrap()
 }
 
-fn strict_durability() -> bool {
-    std::env::var("LUMENDISK_STRICT_DURABILITY").map(|v| v == "1").unwrap_or(false)
-}
-
 /// What a restarted server shows of one acknowledged operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Seen {
@@ -388,14 +384,10 @@ fn written(got: &Option<Vec<u8>>, want: &[u8], what: &str) -> Seen {
     }
 }
 
-/// How many of the acknowledged operations (in order) survived the SIGKILL.
-///
-/// The Shadow journal is group-committed (`shadow::FLUSH_INTERVAL`, 100 ms; under write load
-/// the timer flush may not get the volume lock for longer), so on the current code the last
-/// acknowledged operations can be lost; what survives must be a consistent prefix of them.
-/// **STRICT DURABILITY ASSERTION**: with `LUMENDISK_STRICT_DURABILITY=1` every acknowledged
-/// operation must survive. Enable it by default once journal records are durable before the
-/// NFS reply.
+/// How many of the acknowledged operations (in order) survived the SIGKILL: all of them.
+/// A metadata reply comes only once the journal has the record (written, so it survives the
+/// process), and close() COMMITs the data (synced); what survives must anyway be a consistent
+/// prefix, which is checked first for a clearer message.
 fn survived_prefix(ops: &[(String, Seen)]) -> usize {
     let done = ops.iter().take_while(|o| o.1 == Seen::Done).count();
     let mut rest = &ops[done..];
@@ -405,9 +397,7 @@ fn survived_prefix(ops: &[(String, Seen)]) -> usize {
     if let Some(o) = rest.iter().find(|o| o.1 != Seen::Lost) {
         panic!("not a consistent prefix: {done} operations survived, then {:?} {:?} although an earlier one was lost", o.0, o.1);
     }
-    if strict_durability() {
-        assert_eq!(done, ops.len(), "LUMENDISK_STRICT_DURABILITY: acknowledged operation {:?} lost after kill -9", ops.get(done).map(|o| &o.0));
-    }
+    assert_eq!(done, ops.len(), "acknowledged operation {:?} lost after kill -9", ops.get(done).map(|o| &o.0));
     done
 }
 
@@ -487,14 +477,6 @@ fn e2e_device_node_shadow_survives_kill9_then_commit_is_fsck_clean() {
         f.write_all(b"PATCHED IN SHADOW").unwrap();
     }
     std::fs::create_dir(mp.join("burst")).unwrap();
-    let prologue = 8; // operations so far
-    if !strict_durability() {
-        // Current code: nothing tells the client when the journal has the operations, and a
-        // SIGKILL before the first group commit leaves no session at all. Let the timer flush
-        // (≤ 100 ms on an idle volume; the full sync runs every 3 s) make the prologue durable,
-        // so that the restore path is always exercised; only the burst races the SIGKILL.
-        std::thread::sleep(Duration::from_millis(1500));
-    }
     let t_burst = t0.elapsed();
     for (i, data) in burst.iter().enumerate() {
         std::fs::write(mp.join(format!("burst/f{i:03}.txt")), data).unwrap();
@@ -507,8 +489,6 @@ fn e2e_device_node_shadow_survives_kill9_then_commit_is_fsck_clean() {
     assert_eq!(sha_reader(&raw, img_len), before, "Shadow Mode must not touch the device");
     drop(raw);
     let s = sessions(&dir);
-    // (with LUMENDISK_STRICT_DURABILITY=1, the current code may fail here: a SIGKILL before the
-    // first group commit leaves no session at all)
     assert_eq!(s.len(), 1, "no saved session after kill -9: {s:?}");
     let s0 = &s[0];
     assert_eq!(s0["key"], key.as_str());
@@ -566,13 +546,11 @@ fn e2e_device_node_shadow_survives_kill9_then_commit_is_fsck_clean() {
     }
     assert_eq!((f[3].as_deref(), f[5].as_deref()), if d[2] { (None, Some(&b"bravo"[..])) } else { (Some(&b"bravo"[..]), None) });
     let n = survived_prefix(&ops);
-    assert!(n >= prologue, "the operations made durable before the burst were lost ({n} survived)");
     println!(
-        "    kill -9 with zero delay: {n} of {} acknowledged operations restored (writes took {:?}, the 200-file burst the last {:?}){}",
+        "    kill -9 with zero delay: {n} of {} acknowledged operations restored (writes took {:?}, the 200-file burst the last {:?})",
         ops.len(),
         t_all,
         t_all - t_burst,
-        if strict_durability() { "" } else { "; strict check off (LUMENDISK_STRICT_DURABILITY unset)" }
     );
     let applied = ctl(&dir, "commit");
     println!("    committed {} change(s) to {node}", applied["applied"]);
