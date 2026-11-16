@@ -72,22 +72,32 @@ impl ChangeTracker {
 
 // ───────────────────────────── durability ─────────────────────────────
 
-/// Makes every operation answered so far durable on the Mac (journal / WAL written and
-/// `F_FULLFSYNC`ed). It is called without the volume lock and takes it only for its short
-/// phases, so the volume keeps serving requests while the cache flushes run.
+/// One durability step of a volume's stack, called without the volume lock (it takes the
+/// lock itself, briefly).
 pub type DurableFn = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
 
-/// Group-commit coordinator, one per volume (RFC 1813 stable replies: metadata operations,
-/// FILE_SYNC / DATA_SYNC writes and COMMIT are answered only once their effect is durable).
+/// Durability of acknowledged operations, one per volume ("hybrid"):
 ///
-/// A request needs the first round that *starts* after it finished its operation. When no
-/// round is running it runs one itself; otherwise it waits for the running round to end,
-/// and then the next round — run by one of the waiters — covers every request that arrived
-/// meanwhile: one `F_FULLFSYNC` for all of them. Rounds are cumulative (each one covers
-/// everything done before it started), so a later successful round also satisfies a
+/// * **written** ([`GroupCommit::written`]) — metadata operations (CREATE, MKDIR, SYMLINK,
+///   REMOVE, RMDIR, RENAME, SETATTR) are answered once their journal / WAL record is handed to
+///   the kernel with `write()`: they survive SIGKILL, a crash or a force-quit of LumenDisk
+///   (the page cache does), with no `F_FULLFSYNC` in the reply path;
+/// * **durable** ([`GroupCommit::wait`]) — FILE_SYNC / DATA_SYNC writes and COMMIT (what the
+///   macOS client sends on close() and fsync()) are answered only once everything answered
+///   so far, data and metadata, is `F_FULLFSYNC`ed: it survives a power cut too. The volume's
+///   timer runs the same group commit every 100 ms, so after a power cut only changes younger
+///   than that (and never closed / fsynced) can be missing.
+///
+/// Group commit: a request needs the first round that *starts* after it finished its
+/// operation. When no round is running it runs one itself; otherwise it waits for the running
+/// round to end, and then the next round — run by one of the waiters — covers every request
+/// that arrived meanwhile: one `F_FULLFSYNC` for all of them. Rounds are cumulative (each one
+/// covers everything done before it started), so a later successful round also satisfies a
 /// request whose own round failed.
 pub struct GroupCommit {
     make_durable: DurableFn,
+    make_written: DurableFn,
+    writes: std::sync::atomic::AtomicU64,
     st: Mutex<GcState>,
     notify: tokio::sync::Notify,
 }
@@ -103,8 +113,27 @@ struct GcState {
 }
 
 impl GroupCommit {
-    pub fn new(make_durable: DurableFn) -> Arc<GroupCommit> {
-        Arc::new(GroupCommit { make_durable, st: Mutex::new(GcState::default()), notify: tokio::sync::Notify::new() })
+    /// `make_durable`: write and `F_FULLFSYNC` everything; `make_written`: hand everything to
+    /// the kernel (no cache flush).
+    pub fn new(make_durable: DurableFn, make_written: DurableFn) -> Arc<GroupCommit> {
+        Arc::new(GroupCommit {
+            make_durable,
+            make_written,
+            writes: Default::default(),
+            st: Mutex::new(GcState::default()),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Return once everything done before the call is written to the journal / WAL (survives
+    /// a crash of this process; the next round makes it survive a power cut).
+    pub fn written(&self) -> Result<(), String> {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::task::block_in_place(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.make_written)()))
+                .unwrap_or_else(|p| Err(crate::vfs::fence::panic_message(p.as_ref())))
+        })
+        .inspect_err(|e| eprintln!("lumendisk: writing changes to the journal failed: {e}"))
     }
 
     /// Return once everything done before the call is durable.
@@ -155,10 +184,11 @@ impl GroupCommit {
         }
     }
 
-    /// (rounds run, requests that waited) — for tests and diagnostics.
-    pub fn stats(&self) -> (u64, u64) {
+    /// (durable rounds run, requests that waited for one, write-throughs) — for tests and
+    /// diagnostics.
+    pub fn stats(&self) -> (u64, u64, u64) {
         let s = self.st.lock().unwrap_or_else(|e| e.into_inner());
-        (s.finished, s.waits)
+        (s.finished, s.waits, self.writes.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -243,6 +273,19 @@ impl<S: FileSystem + 'static> NfsBridge<S> {
         let t0 = std::time::Instant::now();
         let r = g.wait().await.map_err(|_| nfsstat3::NFS3ERR_IO);
         trace(format_args!("durable {what} in {:.2} ms", t0.elapsed().as_secs_f64() * 1000.0));
+        r
+    }
+
+    /// Wait until every operation answered so far (this one included) is written to the
+    /// journal / WAL: it survives a crash of this process (see [`GroupCommit`]).
+    fn written(&self, what: &str) -> Result<(), nfsstat3> {
+        let Some(g) = &self.durable else { return Ok(()) };
+        if self.tracker.failure().is_some() {
+            return Err(nfsstat3::NFS3ERR_IO);
+        }
+        let t0 = std::time::Instant::now();
+        let r = g.written().map_err(|_| nfsstat3::NFS3ERR_IO);
+        trace(format_args!("written {what} in {:.2} ms", t0.elapsed().as_secs_f64() * 1000.0));
         r
     }
 
@@ -436,7 +479,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
         // times per file). Those have nothing to make durable (apart from ctime) and don't
         // wait for a group commit; the next one covers them.
         if changed {
-            self.durable("SETATTR").await?;
+            self.written("SETATTR")?;
         }
         if s.mtime.is_some() || s.atime.is_some() {
             let mut ex = self.tracker.exact.lock().unwrap_or_else(|e| e.into_inner());
@@ -517,7 +560,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
                 fs.setattr(ino, &s)
             }
         })?;
-        self.durable("CREATE").await?;
+        self.written("CREATE")?;
         self.touch(&[dirid, a.ino]);
         Ok((a.ino, self.fattr(&a)))
     }
@@ -527,7 +570,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
         let name = name_of(filename)?;
         let (uid, gid) = (self.owner_uid, self.owner_gid);
         let ino = self.with(|fs| fs.create(dirid, &name, 0o644, uid, gid))?;
-        self.durable("CREATE").await?;
+        self.written("CREATE")?;
         self.touch(&[dirid, ino]);
         Ok(ino)
     }
@@ -540,7 +583,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
             let ino = fs.mkdir(dirid, &name, 0o755, uid, gid)?;
             fs.getattr(ino)
         })?;
-        self.durable("MKDIR").await?;
+        self.written("MKDIR")?;
         self.touch(&[dirid, a.ino]);
         Ok((a.ino, self.fattr(&a)))
     }
@@ -557,7 +600,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
             }
             Ok(ino)
         })?;
-        self.durable("REMOVE").await?;
+        self.written("REMOVE")?;
         self.touch(&[dirid]);
         self.touch_meta(ino, false);
         Ok(())
@@ -571,7 +614,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
             fs.rename(from_dirid, &a, to_dirid, &b)?;
             Ok(m)
         })?;
-        self.durable("RENAME").await?;
+        self.written("RENAME")?;
         self.touch(&[from_dirid, to_dirid]);
         self.touch_meta(moved, false);
         Ok(())
@@ -608,7 +651,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
             let ino = fs.symlink(dirid, &name, &target, uid, gid)?;
             fs.getattr(ino)
         })?;
-        self.durable("SYMLINK").await?;
+        self.written("SYMLINK")?;
         self.touch(&[dirid, a.ino]);
         Ok((a.ino, self.fattr(&a)))
     }
@@ -1111,7 +1154,7 @@ mod group_commit_tests {
             } else {
                 Ok(())
             }
-        }));
+        }), Box::new(|| Ok(())));
         rt.block_on(async {
             let mut tasks = vec![];
             for _ in 0..64 {
@@ -1124,12 +1167,67 @@ mod group_commit_tests {
         });
         let rounds = calls.load(Ordering::SeqCst);
         assert!((1..=3).contains(&rounds), "64 concurrent requests took {rounds} rounds");
-        assert_eq!(g.stats(), (rounds as u64, 64));
+        assert_eq!(g.stats(), (rounds as u64, 64, 0));
         // A failing round reports the error to its waiters; the next request succeeds again.
         fail_next.store(true, Ordering::SeqCst);
         rt.block_on(async {
             assert_eq!(g.wait().await, Err("disk unplugged".to_string()));
             assert_eq!(g.wait().await, Ok(()));
+        });
+    }
+
+    /// The reply contract of every RPC: metadata operations are *written* (one write-through
+    /// each, no full sync), FILE_SYNC / DATA_SYNC writes and COMMIT wait for a durable round,
+    /// UNSTABLE writes for nothing.
+    #[test]
+    fn metadata_is_written_stable_writes_and_commit_are_durable() {
+        use crate::block::MemDev;
+        use crate::vfs::{FsType, MountDefaults};
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let dev = Arc::new(MemDev::new(8 << 20));
+        crate::vfs::fat_fs::format(dev.clone(), FsType::Fat16, "RPC").unwrap();
+        let fs = Arc::new(Mutex::new(crate::vfs::fat_fs::FatFs::open(dev, false, MountDefaults { uid: 501, gid: 20, file_perm: 0o644, dir_perm: 0o755 }).unwrap()));
+        let (full, wr) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let (f2, w2) = (full.clone(), wr.clone());
+        let g = GroupCommit::new(
+            Box::new(move || {
+                f2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            Box::new(move || {
+                w2.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+        let bridge = NfsBridge::new(fs, false, 1, Arc::new(ChangeTracker::default())).with_durability(Some(g));
+        let counts = || (full.load(Ordering::SeqCst), wr.load(Ordering::SeqCst));
+        let name = |n: &str| -> filename3 { n.as_bytes().into() };
+        rt.block_on(async {
+            let root = bridge.root_dir();
+            let (d, _) = bridge.mkdir(root, &name("d")).await.unwrap();
+            assert_eq!(counts(), (0, 1), "MKDIR: written, no full sync");
+            let mode = |m| sattr3 { mode: set_mode3::mode(m), ..Default::default() };
+            let (f, _) = bridge.create(d, &name("f"), mode(0o644)).await.unwrap();
+            assert_eq!(counts(), (0, 2), "CREATE");
+            bridge.setattr(f, sattr3 { size: set_size3::size(10), ..Default::default() }).await.unwrap();
+            assert_eq!(counts(), (0, 3), "SETATTR that changes something");
+            bridge.setattr(f, sattr3 { size: set_size3::size(10), ..Default::default() }).await.unwrap();
+            assert_eq!(counts(), (0, 3), "SETATTR that changes nothing");
+            let (_, how) = bridge.write_stable(f, 0, b"unstable", stable_how::UNSTABLE).await.unwrap();
+            assert_eq!((how, counts()), (stable_how::UNSTABLE, (0, 3)), "UNSTABLE WRITE waits for nothing");
+            bridge.commit(f, 0, 0).await.unwrap();
+            assert_eq!(counts(), (1, 3), "COMMIT: one durable round");
+            for stable in [stable_how::FILE_SYNC, stable_how::DATA_SYNC] {
+                let before = counts().0;
+                let (_, how) = bridge.write_stable(f, 0, b"stable", stable).await.unwrap();
+                assert_eq!((how, counts().0), (stable_how::FILE_SYNC, before + 1), "{stable:?} WRITE: durable before the reply");
+            }
+            bridge.rename(d, &name("f"), d, &name("g")).await.unwrap();
+            bridge.remove(d, &name("g")).await.unwrap();
+            bridge.remove(root, &name("d")).await.unwrap();
+            bridge.symlink(root, &name("l"), &b"x".as_slice().into(), &sattr3::default()).await.ok(); // FAT: unsupported
+            assert_eq!(counts(), (3, 6), "RENAME, REMOVE, RMDIR: written");
+            assert_eq!(bridge.write_verifier(), bridge.write_verifier());
         });
     }
 }

@@ -101,10 +101,15 @@ impl FileSystem for Lower {
 
 pub type Stack = GhostShield<Lower>;
 
-/// Group commit of a persistent Shadow session: stage barrier and journal `F_FULLFSYNC` run
-/// without the volume lock (see [`ShadowOverlay::durable_begin`]).
+/// Durability of a persistent Shadow session: the group commit's stage barrier and journal
+/// `F_FULLFSYNC` run without the volume lock (see [`ShadowOverlay::durable_begin`]); the
+/// write-through only writes the journal frame (see [`ShadowOverlay::write_through`]).
 fn shadow_group_commit(fs: &Arc<Mutex<Stack>>) -> Arc<GroupCommit> {
-    let fs = fs.clone();
+    let (fs, fs2) = (fs.clone(), fs.clone());
+    let written: nfs_loopback::DurableFn = Box::new(move || match &mut lock_stack(&fs2).inner {
+        Lower::Shadow(s) => s.write_through().map_err(|e| format!("Shadow journal: {e}")),
+        Lower::Direct(_) => Ok(()),
+    });
     GroupCommit::new(Box::new(move || {
         let e = |e: FsError| format!("Shadow journal: {e}");
         let mut step = match &mut lock_stack(&fs).inner {
@@ -131,7 +136,7 @@ fn shadow_group_commit(fs: &Arc<Mutex<Stack>>) -> Arc<GroupCommit> {
                 }
             }
         }
-    }))
+    }), written)
 }
 
 // ───────────────────────────── requests / status ─────────────────────────────
@@ -734,7 +739,13 @@ impl Runtime {
         } else if persistent_shadow {
             Some(shadow_group_commit(&fs))
         } else if req.mode != MountMode::Shadow {
-            wal.clone().map(|w| GroupCommit::new(Box::new(move || w.make_durable().map_err(|e| format!("journal: {e}")))))
+            wal.clone().map(|w| {
+                let w2 = w.clone();
+                GroupCommit::new(
+                    Box::new(move || w.make_durable().map_err(|e| format!("journal: {e}"))),
+                    Box::new(move || w2.make_written().map_err(|e| format!("journal: {e}"))),
+                )
+            })
         } else {
             None // in-memory Shadow overlay: nothing is meant to survive
         };

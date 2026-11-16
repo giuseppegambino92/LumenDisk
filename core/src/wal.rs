@@ -68,6 +68,10 @@ pub struct WalStats {
     pub transactions: u64,
     pub replayed_at_mount: u64,
     pub flushes: u64,
+    /// Records written to the log ahead of their sync (`make_written`).
+    pub records_written: u64,
+    /// `F_FULLFSYNC`s of the log by group commits.
+    pub log_syncs: u64,
     /// Bytes appended to the redo log (metadata records).
     pub wal_bytes: u64,
     /// File payload written in place (not journaled).
@@ -100,6 +104,10 @@ struct State {
     /// lock): reads and new transactions see them until they are in place.
     flushing: BTreeMap<u64, Box<[u8]>>,
     freed_flushing: std::collections::HashSet<u64>,
+    /// Blocks of records written to the log but not yet synced (`make_written`): they stay
+    /// out of place until a group commit syncs the log.
+    written: BTreeMap<u64, Box<[u8]>>,
+    freed_written: std::collections::HashSet<u64>,
 }
 
 pub struct WalDev {
@@ -163,6 +171,8 @@ impl WalDev {
                 freed_committed: Default::default(),
                 flushing: BTreeMap::new(),
                 freed_flushing: Default::default(),
+                written: BTreeMap::new(),
+                freed_written: Default::default(),
             }),
         }))
     }
@@ -272,9 +282,86 @@ impl WalDev {
         self.flush_round(false, true)
     }
 
-    /// One group commit: (1) under `st`, take the complete transactions as one record;
-    /// (2) without it, flush the payload written in place (ordered mode), append the record
-    /// and `F_FULLFSYNC` the log, write the blocks in place; (3) checkpoint if asked or due.
+    /// Write every complete transaction to the log, *without* syncing it: from the moment
+    /// this returns the transactions survive a crash of this process (the page cache does),
+    /// and the next [`WalDev::make_durable`] (the volume's timer, or a COMMIT) makes them
+    /// survive a power loss. Nothing is written in place before then — the blocks stay in the
+    /// overlay — so a power loss can only lose whole transactions, never tear one. Payload
+    /// the record refers to is ordered before it (barrier, or a flush on another device).
+    pub fn make_written(&self) -> io::Result<()> {
+        let _round = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (rec, keys, data_dirty, at) = {
+            let mut s = self.st.lock().unwrap();
+            if s.dead || s.committed.is_empty() {
+                return Ok(());
+            }
+            if s.fault == Some(Fault::CrashBeforeWal) {
+                s.dead = true;
+                return Ok(());
+            }
+            let blocks = std::mem::take(&mut s.committed);
+            let rec = Self::record(s.seq, &blocks);
+            let keys: Vec<u64> = blocks.keys().copied().collect();
+            for k in &keys {
+                s.wal_blocks.insert(*k);
+            }
+            let freed = std::mem::take(&mut s.freed_committed);
+            s.freed_written.extend(freed);
+            s.written.extend(blocks); // newer versions replace older written ones
+            let at = s.log_len;
+            s.log_len += rec.len() as u64;
+            s.seq += 1;
+            (rec, keys, std::mem::take(&mut s.data_dirty), at)
+        };
+        let r = (|| {
+            if data_dirty && !self.inner.barrier_before(&self.log)? {
+                self.inner.flush()?;
+            }
+            self.log.write_all_at(&rec, at)
+        })();
+        let mut s = self.st.lock().unwrap();
+        match r {
+            Ok(()) => {
+                s.stats.wal_bytes += rec.len() as u64;
+                s.stats.records_written += 1;
+                Ok(())
+            }
+            Err(e) => {
+                // Not in the log: journal these blocks again with the next record.
+                for k in keys {
+                    if let Some(v) = s.written.remove(&k) {
+                        s.committed.entry(k).or_insert(v);
+                    }
+                }
+                s.data_dirty |= data_dirty;
+                s.log_len = at;
+                s.seq -= 1;
+                let _ = self.log.set_len(at);
+                Err(e)
+            }
+        }
+    }
+
+    fn record(seq: u64, blocks: &BTreeMap<u64, Box<[u8]>>) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(blocks.len() * (8 + BS as usize));
+        for (k, v) in blocks {
+            payload.extend_from_slice(&k.to_le_bytes());
+            payload.extend_from_slice(v);
+        }
+        let mut rec = Vec::with_capacity(REC_HDR + payload.len());
+        rec.extend_from_slice(REC_MAGIC);
+        rec.extend_from_slice(&seq.to_le_bytes());
+        rec.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        rec.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        rec.extend_from_slice(&crc32c(&payload).to_le_bytes());
+        rec.extend_from_slice(&payload);
+        rec
+    }
+
+    /// One group commit: (1) under `st`, take the complete transactions as one record, plus
+    /// the records already written by [`WalDev::make_written`]; (2) without it, flush the
+    /// payload written in place (ordered mode), append the record and `F_FULLFSYNC` the log,
+    /// write the blocks in place; (3) checkpoint if asked or due.
     /// `wait`: wait for a flush already running instead of leaving the work to it.
     fn flush_round(&self, checkpoint: bool, wait: bool) -> io::Result<()> {
         let _round = if wait {
@@ -286,7 +373,7 @@ impl WalDev {
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
             }
         };
-        let (rec, data_dirty, at) = {
+        let (rec, apply, unsynced, data_dirty, at) = {
             let mut s = self.st.lock().unwrap();
             if s.dead {
                 return Ok(());
@@ -296,44 +383,44 @@ impl WalDev {
                 return Ok(());
             }
             let data_dirty = std::mem::take(&mut s.data_dirty);
-            if s.committed.is_empty() {
-                (None, data_dirty, 0)
+            // Written but not yet synced records: this round's sync covers them too.
+            let mut flushing = std::mem::take(&mut s.written);
+            let unsynced = !flushing.is_empty();
+            let freed = std::mem::take(&mut s.freed_written);
+            s.freed_flushing.extend(freed);
+            let (rec, at) = if s.committed.is_empty() {
+                (None, 0)
             } else {
                 let blocks = std::mem::take(&mut s.committed);
-                let mut payload = Vec::with_capacity(blocks.len() * (8 + BS as usize));
-                for (k, v) in &blocks {
-                    payload.extend_from_slice(&k.to_le_bytes());
-                    payload.extend_from_slice(v);
-                }
-                let mut rec = Vec::with_capacity(REC_HDR + payload.len());
-                rec.extend_from_slice(REC_MAGIC);
-                rec.extend_from_slice(&s.seq.to_le_bytes());
-                rec.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
-                rec.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-                rec.extend_from_slice(&crc32c(&payload).to_le_bytes());
-                rec.extend_from_slice(&payload);
+                let rec = Self::record(s.seq, &blocks);
                 for k in blocks.keys() {
                     s.wal_blocks.insert(*k);
                 }
                 let freed = std::mem::take(&mut s.freed_committed);
                 s.freed_flushing.extend(freed);
-                s.flushing = blocks;
+                flushing.extend(blocks); // the newest version of each block wins
                 let at = s.log_len;
                 s.log_len += rec.len() as u64;
                 s.seq += 1;
-                (Some(rec), data_dirty, at)
-            }
+                (Some(rec), at)
+            };
+            let apply: Vec<(u64, Box<[u8]>)> = flushing.iter().map(|(k, v)| (*k, v.clone())).collect();
+            s.flushing = flushing;
+            (rec, apply, unsynced, data_dirty, at)
         };
+        let sync_log = rec.is_some() || unsynced;
         // Ordered mode: payload referenced by this metadata is durable before the record. When
         // the image lives on the same device as the log, a barrier suffices: the log's full
         // sync below flushes the drive cache for both.
         let r = (|| {
-            if data_dirty && (rec.is_none() || !self.inner.barrier_before(&self.log)?) {
+            if data_dirty && (!sync_log || !self.inner.barrier_before(&self.log)?) {
                 self.inner.flush()?;
             }
             if let Some(rec) = &rec {
                 self.log.write_all_at(rec, at)?;
-                log_sync(&self.log)?; // the record is durable before anything is written in place
+            }
+            if sync_log {
+                log_sync(&self.log)?; // the records are durable before anything is written in place
             }
             Ok(())
         })();
@@ -341,25 +428,26 @@ impl WalDev {
             self.undo_round(rec.is_some(), data_dirty, at);
             return Err(e);
         }
-        if let Some(rec) = rec {
+        if sync_log {
             let limit = {
                 let mut s = self.st.lock().unwrap();
-                s.stats.wal_bytes += rec.len() as u64;
+                if let Some(rec) = &rec {
+                    s.stats.wal_bytes += rec.len() as u64;
+                }
                 s.stats.flushes += 1;
+                s.stats.log_syncs += 1;
                 match s.fault {
                     Some(Fault::CrashAfterWal { apply_blocks }) => Some(apply_blocks),
                     _ => None,
                 }
             };
-            let payload = &rec[REC_HDR..];
-            for (i, b) in payload.chunks_exact(8 + BS as usize).enumerate() {
+            for (i, (k, v)) in apply.iter().enumerate() {
                 if limit.map(|l| i >= l).unwrap_or(false) {
                     break;
                 }
-                let k = u64::from_le_bytes(b[..8].try_into().unwrap());
-                if let Err(e) = Self::write_block_clipped(self.inner.as_ref(), k, &b[8..]) {
-                    // The record is durable (a replay would apply it): keep the blocks in the
-                    // overlay so that the next flush journals them again.
+                if let Err(e) = Self::write_block_clipped(self.inner.as_ref(), *k, v) {
+                    // The records are durable (a replay would apply them): keep the blocks in
+                    // the overlay so that the next flush journals them again.
                     let mut s = self.st.lock().unwrap();
                     Self::requeue(&mut s);
                     return Err(e);
@@ -375,7 +463,8 @@ impl WalDev {
         }
         let mut s = self.st.lock().unwrap();
         if checkpoint || s.log_len > CHECKPOINT_BYTES {
-            // Under `st`: nothing is written in place while the device is flushed.
+            // Under `st` (and the flush lock: no record is written but unsynced): nothing is
+            // written in place while the device is flushed.
             self.inner.flush()?;
             if s.log_len > HDR_LEN {
                 self.log.set_len(HDR_LEN)?;
@@ -388,12 +477,12 @@ impl WalDev {
         Ok(())
     }
 
-    /// A flush failed before its record was durable: put everything back for the next one.
+    /// A flush failed before its records were durable: put everything back for the next one.
     fn undo_round(&self, had_record: bool, data_dirty: bool, at: u64) {
         let mut s = self.st.lock().unwrap();
         s.data_dirty |= data_dirty;
+        Self::requeue(&mut s);
         if had_record {
-            Self::requeue(&mut s);
             s.log_len = at;
             s.seq -= 1;
             let _ = self.log.set_len(at);
@@ -422,7 +511,7 @@ impl WalDev {
     }
 
     fn overlay_block(s: &State, blk: u64) -> Option<&[u8]> {
-        s.txn.get(&blk).or_else(|| s.committed.get(&blk)).or_else(|| s.flushing.get(&blk)).map(|b| &b[..])
+        s.txn.get(&blk).or_else(|| s.committed.get(&blk)).or_else(|| s.written.get(&blk)).or_else(|| s.flushing.get(&blk)).map(|b| &b[..])
     }
 }
 
@@ -473,7 +562,7 @@ impl BlockDev for WalDev {
         for b in first..=last {
             let bstart = b * BS;
             if !s.txn.contains_key(&b) {
-                let base: Box<[u8]> = match s.committed.get(&b).or_else(|| s.flushing.get(&b)) {
+                let base: Box<[u8]> = match s.committed.get(&b).or_else(|| s.written.get(&b)).or_else(|| s.flushing.get(&b)) {
                     Some(c) => c.clone(),
                     None => {
                         let mut v = vec![0u8; BS as usize];
@@ -524,6 +613,8 @@ impl BlockDev for WalDev {
                 let j = s.txn.contains_key(&b)
                     || s.committed.contains_key(&b)
                     || s.flushing.contains_key(&b)
+                    || s.written.contains_key(&b)
+                    || s.freed_written.contains(&b)
                     || s.wal_blocks.contains(&b)
                     || s.freed_txn.contains(&b)
                     || s.freed_committed.contains(&b)
@@ -898,5 +989,68 @@ mod tests {
             }
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    /// `make_written` (behind metadata replies) puts the record in the log without syncing it
+    /// and without writing anything in place; a crash of the process keeps it, and the next
+    /// `make_durable` syncs the log once.
+    #[test]
+    fn make_written_logs_without_syncing_or_writing_in_place() {
+        let mem = Arc::new(MemDev::new(32 << 20));
+        let dev: Arc<dyn BlockDev> = mem.clone();
+        format(dev.clone(), FsType::Ext4, "WT").unwrap();
+        let p = tmp("written");
+        {
+            let wal = WalDev::open(dev.clone(), &p, "x").unwrap();
+            let drv = open_fs(wal.clone(), false, MountDefaults::default()).unwrap();
+            let mut j = Journaled { inner: drv, wal: wal.clone() };
+            let root = j.root_ino();
+            let d = j.mkdir(root, "scritto", 0o755, 0, 0).unwrap();
+            let f = j.create(d, "f.txt", 0o644, 0, 0).unwrap();
+            j.write(f, 0, b"written, not synced").unwrap();
+            let before = wal.stats();
+            wal.make_written().unwrap();
+            let after = wal.stats();
+            assert_eq!(after.log_syncs, before.log_syncs, "no F_FULLFSYNC");
+            assert_eq!(after.records_written, before.records_written + 1);
+            // nothing in place yet: the device alone doesn't know the directory
+            let mut plain = ext4_fs::Ext4Fs::open(Arc::new(MemDev::from_vec(mem.snapshot())), true).unwrap();
+            assert_eq!(plain.lookup(plain.root_ino(), "scritto"), Err(FsError::NotFound));
+            // but the volume does
+            assert_eq!(j.read(f, 0, 100).unwrap(), b"written, not synced");
+            wal.inject_fault(Fault::CrashBeforeWal);
+            std::mem::forget(j);
+            std::mem::forget(wal);
+        }
+        let wal = WalDev::open(dev.clone(), &p, "x").unwrap();
+        assert!(wal.stats().replayed_at_mount >= 1);
+        drop(wal);
+        let mut fs = ext4_fs::Ext4Fs::open(dev.clone(), false).unwrap();
+        let d = fs.lookup(fs.root_ino(), "scritto").unwrap();
+        let f = fs.lookup(d, "f.txt").unwrap();
+        assert_eq!(fs.read(f, 0, 100).unwrap(), b"written, not synced");
+        assert_eq!(fs.dirty_state(), DirtyState::Clean);
+        let _ = std::fs::remove_file(&p);
+
+        // A group commit after write-throughs syncs once and writes everything in place.
+        let p = tmp("written2");
+        let wal = WalDev::open(dev.clone(), &p, "x").unwrap();
+        let drv = open_fs(wal.clone(), false, MountDefaults::default()).unwrap();
+        let mut j = Journaled { inner: drv, wal: wal.clone() };
+        let root = j.root_ino();
+        for i in 0..5 {
+            j.mkdir(root, &format!("m{i}"), 0o755, 0, 0).unwrap();
+            wal.make_written().unwrap();
+        }
+        let syncs = wal.stats().log_syncs;
+        wal.make_durable().unwrap();
+        assert_eq!(wal.stats().log_syncs, syncs + 1);
+        let mut plain = ext4_fs::Ext4Fs::open(Arc::new(MemDev::from_vec(mem.snapshot())), true).unwrap();
+        for i in 0..5 {
+            assert!(plain.lookup(plain.root_ino(), &format!("m{i}")).is_ok(), "m{i} in place after the group commit");
+        }
+        drop(j);
+        drop(wal);
+        let _ = std::fs::remove_file(&p);
     }
 }
