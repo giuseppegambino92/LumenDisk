@@ -294,15 +294,17 @@ fn changes(mp: &Path, m: &mut Model, it: usize, last: Last) -> Option<std::fs::F
     None
 }
 
-fn run(name: &str, mode: &str) {
+fn run(name: &str, mode: &str, fs: &str) {
     let dir = workdir(name);
     std::fs::create_dir_all(dir.join("mnt")).unwrap();
-    let out = cli(&dir).args(["mkfs", "ext4", "vol.img", "256", "DURABLE"]).output().unwrap();
+    let out = cli(&dir).args(["mkfs", fs, "vol.img", "256", "DURABLE"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let mut model = Model::default();
     for (it, last) in LASTS.iter().enumerate() {
         let mut m = mount(&dir, "vol.img", mode);
         let mp = m.mp.clone();
+        let st = ctl(&dir, "status");
+        assert!(st["forced_read_only_reason"].is_null(), "{mode} {fs} after restart #{it}: {st}");
         model.check(&mp, &format!("{mode}: after restart #{it}"));
         let t0 = Instant::now();
         let open = changes(&mp, &mut model, it, *last);
@@ -324,20 +326,35 @@ fn run(name: &str, mode: &str) {
         model.check(&m.mp, "shadow: after the commit");
     }
     unmount(&dir, m);
-    let (code, out) = docker(&dir, "e2fsck -fn /w/vol.img");
-    assert_eq!(code, 0, "e2fsck: {out}");
-    println!("    {mode}: e2fsck -fn clean: {}", out.lines().find(|l| l.contains(" files ")).unwrap_or(""));
+    let fsck = if fs == "ext4" { "e2fsck -fn /w/vol.img" } else { "fsck.fat -n /w/vol.img" };
+    let (code, out) = docker(&dir, fsck);
+    assert_eq!(code, 0, "{fsck}: {out}");
+    println!("    {mode} {fs}: {fsck} clean: {}", out.lines().find(|l| l.contains(" files")).unwrap_or(""));
     model.check_image(&dir.join("vol.img"));
 }
 
 #[test]
 #[ignore]
 fn e2e_shadow_acknowledged_changes_survive_sigkill() {
-    run("durability_shadow", "shadow");
+    run("durability_shadow", "shadow", "ext4");
+}
+
+#[test]
+#[ignore]
+fn e2e_shadow_fat32_acknowledged_changes_survive_sigkill() {
+    run("durability_shadow_fat", "shadow", "fat32");
 }
 
 #[test]
 #[ignore]
 fn e2e_direct_acknowledged_changes_survive_sigkill() {
-    run("durability_direct", "readWrite");
+    run("durability_direct", "readWrite", "ext4");
+}
+
+/// FAT marks itself "not unmounted cleanly" while written: after the SIGKILL the next mount
+/// replays the WAL and must clear that mark (it is LumenDisk's own) instead of going read-only.
+#[test]
+#[ignore]
+fn e2e_direct_fat32_acknowledged_changes_survive_sigkill() {
+    run("durability_direct_fat", "readWrite", "fat32");
 }

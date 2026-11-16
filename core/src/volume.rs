@@ -582,6 +582,20 @@ impl Runtime {
         }
         let info = driver.volume_info();
         let mut forced_ro = driver.read_only_reason();
+        let replayed = wal.as_ref().map(|w| w.stats().replayed_at_mount).unwrap_or(0);
+        if !want_ro && forced_ro.is_none() && replayed > 0 && matches!(info.fs_type, FsType::Fat12 | FsType::Fat16 | FsType::Fat32 | FsType::ExFat) {
+            // FAT and exFAT carry a "not unmounted cleanly" mark while LumenDisk writes. Our own
+            // journal was just replayed, so the mark is ours (we only write to volumes that were
+            // clean when mounted) and the structures are consistent again: clear it, recompute
+            // the free counts, instead of refusing to write — which would also leave an
+            // interrupted Shadow commit unable to finish.
+            if let DirtyState::Dirty(_) = driver.dirty_state() {
+                match driver.repair() {
+                    Ok(rep) => eprintln!("lumendisk: after replaying {replayed} journal record(s): {}", rep.replace('\n', " ")),
+                    Err(e) => eprintln!("lumendisk: clearing the dirty mark after the journal replay: {e}"),
+                }
+            }
+        }
         if !want_ro && forced_ro.is_none() {
             if let DirtyState::Dirty(r) = driver.dirty_state() {
                 forced_ro = Some(crate::i18n::t(&format!("Volume da riparare: {r}"), &format!("Volume needs repair: {r}")));
