@@ -1561,6 +1561,10 @@ impl ShadowOverlay {
     fn restart_session(&mut self) {
         let Some(old) = self.sess.take() else { return };
         if let Err(e) = store::remove_session_dir(&old.dir) {
+            // Not durable (see its error contract): until a later directory sync succeeds, a
+            // crash may bring the old session back whole, never half deleted. After a commit it
+            // is still "committing" and resumes from its last checkpoint (every redo step is
+            // idempotent); after a discard its changes are simply offered again.
             eprintln!("lumendisk: removing Shadow session: {e}");
         }
         let fp = self.lower.fingerprint();

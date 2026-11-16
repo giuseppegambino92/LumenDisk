@@ -1569,7 +1569,17 @@ impl Runtime {
         }
         let dir = shadow_store::sessions_root(&self.support()).join(key);
         let m = Manifest::load(&dir).ok_or_else(|| crate::i18n::t("sessione Shadow non trovata", "Shadow session not found"))?;
-        shadow_store::remove_session_dir(&dir).map_err(|e| e.to_string())?;
+        if let Err(e) = shadow_store::remove_session_dir(&dir) {
+            // See remove_session_dir's error contract: gone from the list but not durable.
+            return Err(if dir.exists() {
+                e.to_string()
+            } else {
+                crate::i18n::t(
+                    &format!("sessione scartata, ma il disco non ha confermato la modifica ({e}): dopo un crash potrebbe ricomparire intatta"),
+                    &format!("session discarded, but the disk did not confirm it ({e}): after a crash it may reappear intact"),
+                )
+            });
+        }
         Ok(if m.state == "committing" { m.commit_total.saturating_sub(m.commit_applied) } else { m.counts.changes })
     }
 }

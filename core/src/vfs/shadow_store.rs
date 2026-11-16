@@ -316,7 +316,17 @@ pub fn session_key(id: &Identity) -> String {
     format!("{}-{hex}", id.fs_type.to_ascii_lowercase())
 }
 
-/// Remove a session directory: renamed away first (one atomic step), then deleted.
+/// Remove a session directory: renamed away to a `.trash-` name (one atomic step), the rename
+/// made durable, then the files deleted.
+///
+/// Error contract — after a crash a session comes back whole or not at all, never half deleted:
+/// - `Ok`: the session is gone for good. If deleting its files failed, they wait in a
+///   `.trash-` directory for [`clean_trash`].
+/// - `Err` and the directory still exists: nothing changed.
+/// - `Err` and the directory no longer exists: the rename happened but the directory sync
+///   failed, so the removal is **not durable**. The files are kept intact under the `.trash-`
+///   name: a crash may bring the session back whole. Callers must not report the removal as
+///   durable; [`clean_trash`] deletes the files once a later sync succeeds.
 pub fn remove_session_dir(dir: &Path) -> io::Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -327,21 +337,29 @@ pub fn remove_session_dir(dir: &Path) -> io::Result<()> {
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::rename(dir, &trash)?;
-    // The session is gone from its name either way; delete it, then report a failed dir sync
-    // (the removal may not survive a crash: the caller must not claim it is durable).
-    let synced = dir.parent().map_or(Ok(()), sync_dir);
-    std::fs::remove_dir_all(&trash)?;
-    synced
+    // Delete nothing before the rename is durable: if the rename could still be undone by a
+    // crash, deleting files now could bring the session back half deleted.
+    dir.parent().map_or(Ok(()), sync_dir)?;
+    if let Err(e) = std::fs::remove_dir_all(&trash) {
+        eprintln!("lumendisk: deleting a discarded Shadow session (cleaned up later): {e}");
+    }
+    Ok(())
 }
 
-/// Leftovers of interrupted deletions.
+/// Leftovers of interrupted or failed deletions. The `.trash-` renames are made durable first;
+/// if that sync fails nothing is deleted (see [`remove_session_dir`]).
 pub fn clean_trash(root: &Path) {
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten() {
-            if e.file_name().to_string_lossy().starts_with(".trash-") {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
-        }
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let trash: Vec<PathBuf> = rd.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".trash-")).map(|e| e.path()).collect();
+    if trash.is_empty() {
+        return;
+    }
+    if let Err(e) = sync_dir(root) {
+        eprintln!("lumendisk: Shadow sessions folder sync failed, discarded sessions kept for now: {e}");
+        return;
+    }
+    for t in trash {
+        let _ = std::fs::remove_dir_all(t);
     }
 }
 
@@ -466,5 +484,25 @@ mod tests {
         drop(r);
         let f = File::open(std::env::temp_dir()).unwrap();
         fsync_fd(&f).expect("fsync on a directory succeeds");
+    }
+
+    /// A removed session leaves neither its name nor a `.trash-` directory behind, and
+    /// `clean_trash` finishes deletions left over by a crash or a failed sync.
+    #[test]
+    fn session_removal_and_trash_cleanup() {
+        let root = std::env::temp_dir().join(format!("ld-trash-{}", uuid::Uuid::new_v4().simple()));
+        let dir = root.join("ext4-abc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MANIFEST), b"{}").unwrap();
+        remove_session_dir(&dir).unwrap();
+        assert!(!dir.exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "no .trash- leftovers");
+        remove_session_dir(&dir).unwrap(); // already gone: Ok, nothing to do
+        let left = root.join(".trash-ext4-def-0123");
+        std::fs::create_dir_all(left.join("sub")).unwrap();
+        std::fs::write(left.join("stage.bin"), b"x").unwrap();
+        clean_trash(&root);
+        assert!(!left.exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
