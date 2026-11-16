@@ -97,6 +97,16 @@ bold "Unit tests (drivers, WAL, Ghost Shield, Shadow, UID bridge, remote cache, 
 OUT=$(cargo test -q --release -p lumendisk-core --lib 2>&1) || { echo "$OUT" | tail -30; die "unit tests failed"; }
 ok "$(summary_of "$OUT")"; record "Unit tests" "$(summary_of "$OUT")"
 
+bold "Remote cache race check: conformance + upload test 100× in a row (stops at the first failure)"
+# Runs the already-built unit-test binary directly (no cargo start-up per run): ~10 s.
+UNIT_BIN=$(cargo test -q --release -p lumendisk-core --lib --no-run --message-format=json 2>/dev/null | grep -o '"executable":"[^"]*"' | tail -1 | cut -d'"' -f4)
+[ -x "$UNIT_BIN" ] || die "unit-test binary not found"
+for i in $(seq 1 100); do
+  OUT=$("$UNIT_BIN" --exact remote::cache::tests::remote_vfs_conformance_and_upload 2>&1) && grep -q '1 passed' <<<"$OUT" \
+    || { echo "$OUT" | tail -20; die "remote_vfs_conformance_and_upload failed on run $i of 100"; }
+done
+ok "100 of 100 runs passed"; record "Remote cache race check" "100/100 runs"
+
 bold "Corrupted images: mutated ext4 / NTFS / FAT / exFAT volumes and partition tables (no panic, hang or runaway allocation)"
 OUT=$(cargo test --profile robust -p lumendisk-core --test corrupted_images -- --nocapture 2>&1) || { echo "$OUT" | grep -E '✗|panicked|FAILED|HANG' | head -40; die "corrupted-image suite failed"; }
 LINE=$(grep -E '^corrupted images:' <<<"$OUT" | head -1)
@@ -193,7 +203,7 @@ if [ "$HAVE_DOCKER" = 1 ]; then
     local out
     out=$(cargo test --release -p lumendisk-core --test "$target" -- --ignored --test-threads=1 "$@" 2>&1) || { echo "$out" | grep -E '^test |panicked|assert|left|right' | tail -40; die "$name failed"; }
     echo "$out" | grep -E '^test ' | sed 's/^/  /'
-    echo "$out" | grep -E 'fsck BEFORE|over HTTP Range|served [0-9]+ bytes|offline: slowest|offline write|overhead\)|fsck right after|speed test on|TLS: |after kill -9|killed during the commit|kept [0-9]+ changes, endpoint|drift: ' | sed 's/^/    · /' || true
+    echo "$out" | grep -E 'fsck BEFORE|over HTTP Range|served [0-9]+ bytes|offline: slowest|offline write|overhead\)|fsck right after|speed test on|TLS: |after kill -9|killed during the commit|kill -9 with zero delay|byte-granular ops|kept [0-9]+ changes, endpoint|drift: ' | sed 's/^/    · /' || true
     ok "$(summary_of "$out")"; record "$name" "$(summary_of "$out")"
   }
   run_suite "ext2/3/4 vs real e2fsprogs (mke2fs defaults, htree, journal replay)" ext4_real_tools
@@ -203,6 +213,7 @@ if [ "$HAVE_DOCKER" = 1 ]; then
   run_suite "Phase 3 end-to-end: ordered WAL 64 MB power loss, Apache WebDAV RFC 4918 + persistent offline queue, TLS LAN share, physical device + speed test" phase3_e2e --nocapture
   run_suite "Persistent Shadow sessions: kill -9 with staged changes and during a commit, resume, e2fsck" shadow_persist_e2e --nocapture
   run_suite "Remote Shadow sessions: SFTP / WebDAV / LAN share, kill -9, restore, commit to the server, drift on server-side edits" remote_shadow_e2e --nocapture
+  run_suite "Persistent Shadow on an attached block device (/dev/diskNs1, /dev/rdiskN): kill -9, resume, commit, e2fsck; raw-node I/O" device_shadow_e2e --nocapture
 
   if [ -n "${FULL:-}" ]; then
     bold "Long driver suites (ntfs-3g / kernel ntfs3 / vfat / exfat / fsck_msdos / fsck_exfat)"
