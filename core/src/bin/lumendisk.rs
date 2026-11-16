@@ -12,6 +12,11 @@
 //!   lumendisk locks <mountpoint>
 //!   lumendisk shadow-sessions                 saved Shadow sessions (pending changes per volume)
 //!   lumendisk shadow-discard <KEY>            delete a saved Shadow session
+//!   lumendisk forge <REQUEST.json|->         run a forge request (flash, hash, format…) in the
+//!                   foreground, printing phase / progress / speed / ETA, then the result
+//!   lumendisk disks                           candidate disks and whether LumenDisk may write them
+//!   lumendisk inspect-image <path> [--deep]   format, size, partitions, ISO / OS, write mode
+//!   lumendisk hash <path|diskN> [--algo sha256,sha1,md5] [--decompressed] [--offset N] [--length N]
 //!
 //! State lives in ~/Library/Application Support/LumenDisk, or in $LUMENDISK_SUPPORT_DIR.
 
@@ -20,6 +25,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use lumendisk_core::forge::{self, plan::Request};
 use lumendisk_core::lock_inspector;
 use lumendisk_core::volume::{runtime, MountMode, MountRequest, RemoteMountRequest, VolumeStatus};
 use serde_json::json;
@@ -32,7 +38,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  lumendisk inspect <path>\n  lumendisk mkfs <fs> <path> <MiB> [label]\n  lumendisk mount <path> [--partition N] [--mode readWrite|shadow|readOnly] [--no-ghost] [--root DIR] [--name NAME] [--control SOCK] [--media-uuid UUID] [--expect-session KEY]\n  lumendisk mount-remote <request.json> [--control SOCK]\n  lumendisk ctl <SOCK> <status|changes|commit|rollback|ghost|unmount>\n  lumendisk repair <path> [--partition N]\n  lumendisk locks <mountpoint>\n  lumendisk shadow-sessions\n  lumendisk shadow-discard <KEY>"
+        "usage:\n  lumendisk inspect <path>\n  lumendisk mkfs <fs> <path> <MiB> [label]\n  lumendisk mount <path> [--partition N] [--mode readWrite|shadow|readOnly] [--no-ghost] [--root DIR] [--name NAME] [--control SOCK] [--media-uuid UUID] [--expect-session KEY]\n  lumendisk mount-remote <request.json> [--control SOCK]\n  lumendisk ctl <SOCK> <status|changes|commit|rollback|ghost|unmount>\n  lumendisk repair <path> [--partition N]\n  lumendisk locks <mountpoint>\n  lumendisk shadow-sessions\n  lumendisk shadow-discard <KEY>\n  lumendisk forge <request.json|->\n  lumendisk disks\n  lumendisk inspect-image <path> [--deep]\n  lumendisk hash <path|diskN> [--algo sha256,sha1,md5] [--decompressed] [--offset N] [--length N]"
     );
     std::process::exit(2)
 }
@@ -113,6 +119,51 @@ fn main() {
                 Ok(n) => print(json!({"discarded": n})),
                 Err(e) => fail(e),
             }
+        }
+        "forge" => {
+            let p = args.get(1).unwrap_or_else(|| usage());
+            let raw = if p == "-" {
+                let mut v = vec![];
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut v).unwrap_or_else(|e| fail(e));
+                v
+            } else {
+                std::fs::read(p).unwrap_or_else(|e| fail(format!("{p}: {e}")))
+            };
+            let req: Request = serde_json::from_slice(&raw).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+            run_forge(req);
+        }
+        "disks" => match forge::target::list_disks() {
+            Ok(disks) => {
+                for d in disks {
+                    let verdict = if d.allowed { "allowed".to_string() } else { format!("refused: {}", d.refusal.unwrap_or_default()) };
+                    let mounted = if d.mounted.is_empty() { String::new() } else { format!("  [{}]", d.mounted.join(", ")) };
+                    println!("{:<8} {:>10}  {:<14} {:<28} {verdict}{mounted}", d.bsd, forge::flash::human(d.size), d.protocol, d.media_name);
+                }
+            }
+            Err(e) => fail(e),
+        },
+        "inspect-image" => {
+            let p = args.get(1).unwrap_or_else(|| usage()).clone();
+            if args.iter().any(|a| a == "--deep") {
+                run_forge(Request::Inspect { source: p });
+            } else {
+                match forge::image::inspect_quick(&p) {
+                    Ok(v) => print(v),
+                    Err(e) => fail(e),
+                }
+            }
+        }
+        "hash" => {
+            let p = args.get(1).unwrap_or_else(|| usage()).clone();
+            let algorithms = opt(&args, "--algo").map(|a| a.split(',').map(str::to_string).collect()).unwrap_or_default();
+            let num = |name: &str| opt(&args, name).map(|v| v.parse::<u64>().unwrap_or_else(|_| fail(format!("{name}: not a number"))));
+            run_forge(Request::Hash(forge::plan::HashRequest {
+                source: p,
+                algorithms,
+                decompressed: args.iter().any(|a| a == "--decompressed"),
+                offset: num("--offset"),
+                length: num("--length"),
+            }));
         }
         "locks" => {
             let p = args.get(1).unwrap_or_else(|| usage());
@@ -230,4 +281,56 @@ fn serve(st: VolumeStatus, listener: Option<UnixListener>, args: &[String]) {
         let _ = std::fs::remove_file(sock);
     }
     eprintln!("lumendisk: unmounted cleanly");
+}
+
+/// Run a forge request as a job in the foreground: phase / progress / speed / ETA lines on
+/// stderr, the result as JSON on stdout. Ctrl-C cancels the job (it stops at its next check).
+fn run_forge(req: Request) -> ! {
+    // SAFETY: installing a trivial async-signal-safe handler.
+    unsafe {
+        libc::signal(libc::SIGINT, on_signal as *const () as usize);
+        libc::signal(libc::SIGTERM, on_signal as *const () as usize);
+    }
+    let id = forge::plan::start(req);
+    let mut seen = 0u64;
+    let mut cancelled = false;
+    let mut last_line = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    let mut last_phase = None;
+    loop {
+        if STOP.load(Ordering::SeqCst) && !cancelled {
+            eprintln!("lumendisk: cancelling…");
+            forge::job::cancel(id);
+            cancelled = true;
+        }
+        let Some(s) = forge::job::status(id, seen) else { fail("job vanished") };
+        for l in &s.logs {
+            eprintln!("  [{:>7.1}s] {:?}: {}", l.ms as f64 / 1000.0, l.level, l.msg);
+            seen = l.seq;
+        }
+        let phase_changed = last_phase != Some(s.phase);
+        if s.state == forge::job::State::Running && (phase_changed || last_line.elapsed().as_secs_f64() >= 1.0) {
+            last_phase = Some(s.phase);
+            last_line = std::time::Instant::now();
+            let pct = if s.total > 0 { format!("{:5.1}%", s.done as f64 * 100.0 / s.total as f64) } else { "   …  ".into() };
+            let (done, total, rate) = if s.unit == "bytes" {
+                (forge::flash::human(s.done), if s.total > 0 { forge::flash::human(s.total) } else { "?".into() }, format!("{:.1} MB/s", s.rate / 1e6))
+            } else {
+                (s.done.to_string(), s.total.to_string(), format!("{:.1} {}/s", s.rate, s.unit))
+            };
+            let eta = s.eta_secs.map(|e| format!("ETA {}:{:02}", e / 60, e % 60)).unwrap_or_default();
+            eprintln!("{:<12} {pct}  {done} / {total}  {rate}  {eta}", format!("[{:?}]", s.phase).to_lowercase());
+        }
+        match s.state {
+            forge::job::State::Running => std::thread::sleep(std::time::Duration::from_millis(200)),
+            forge::job::State::Succeeded => {
+                print(s.result.unwrap_or(json!(null)));
+                std::process::exit(0)
+            }
+            forge::job::State::Cancelled => {
+                eprintln!("lumendisk: cancelled");
+                std::process::exit(130)
+            }
+            forge::job::State::Failed => fail(s.error.unwrap_or_default()),
+        }
+    }
 }

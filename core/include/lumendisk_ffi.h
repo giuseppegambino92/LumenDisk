@@ -280,6 +280,79 @@ char *ld_set_language(const char *code);
 char *ld_shadow_sessions(void);
 char *ld_shadow_discard_session(const char *key);
 
+/* ── Forge (1.1): format, flash, wipe, checksums, partition doctor ─────────────────
+ *
+ * Long operations run as jobs on a thread of their own; the app polls their status.
+ *
+ *  Request (tagged by "op"; every field in core/src/forge/plan.rs):
+ *    {"op":"flash","source":str,"target":TargetSpec,"mode":"auto"|"dd"|"iso"|"windows",
+ *     "verify":bool=true,"expect_hash":"sha256:<hex>"|"sha1:<hex>"|"md5:<hex>"|"<hex>"|null,
+ *     "eject":bool=true,"windows":{...}|null,"linux":{...}|null,"rpi":{...}|null}
+ *    {"op":"hash","source":path|"diskN","algorithms":["sha256","sha1","md5"] (default: all),
+ *     "decompressed":bool=false,"offset":u64|null,"length":u64|null}
+ *    {"op":"inspect","source":path}   {"op":"format",...}  {"op":"wipe",...}  {"op":"doctor",...}
+ *  TargetSpec = {"kind":"disk","bsd":"disk4"} | {"kind":"file","path":str,"size":u64|null}
+ *               (a file without a size grows to the image's size)
+ *  With no "expect_hash", a checksum file next to the image that lists it (SHA256SUMS,
+ *  <image>.sha256, Fedora CHECKSUM…) is checked instead. A mismatch fails before writing.
+ *
+ *  Snapshot = {"id":u64,"kind":str,"state":"running"|"succeeded"|"failed"|"cancelled",
+ *    "phase":Phase,"phases":[Phase],"done":u64,"total":u64 (0 = unknown),"unit":"bytes"|...,
+ *    "rate":f64 (units/s),"eta_secs":u64|null,"elapsed_secs":f64,
+ *    "logs":[{"seq":u64,"ms":u64,"level":"info"|"warn"|"error","msg":str}],
+ *    "result":object|null,"error":str|null}
+ *  Phase = "preparing"|"hashing"|"unmounting"|"wiping"|"partitioning"|"formatting"|"writing"|
+ *          "extracting"|"verifying"|"customizing"|"finishing"
+ *
+ *  Flash result (DD) = {"mode":"dd","source":str,"format":Format,"target":str,
+ *    "image_size":u64,"bytes_written":u64 (with the zero padding of the last sector),
+ *    "write_mb_s":f64,"verify_mb_s":f64 (when verified),
+ *    "verification":{"performed":bool,"ok":bool|null,"method":str,"target_sha256":str},
+ *    "hashes":{"image_sha256":str,"expected":{"algorithm":str,"hex":str,
+ *              "source":"request"|<checksum file>,"matched":"file"|"decompressed"}|null},
+ *    "rpi":object (when customised),"ejected":bool,
+ *    "durations":{"hashing":f64,"writing":f64,"verifying":f64,"customizing":f64,"total":f64}}
+ *  ISO / Windows modes: {"mode":"iso"|"windows","result":object,"durations":{...},...}.
+ *  A failed verification fails the job; its error names the first differing byte.
+ *
+ *  Hash result = {"source":str,"kind":"file"|"disk","what":"file"|"disk"|"range","offset":u64,
+ *    "bytes":u64,"sha256":str,"sha1":str,"md5":str (those requested),
+ *    "decompressed":{"format":Format,"bytes":u64,"sha256":str,...}|null,
+ *    "checksum_file":{"path":str,"algorithm":str,"expected":str,"matches":bool}|null,
+ *    "seconds":f64,"mb_s":f64}
+ *
+ *  Inspection = {"path":str,"file_name":str,
+ *    "format":"raw"|"gzip"|"xz"|"bzip2"|"zstd"|"zip"|"vhd"|"dmg",
+ *    "container":object|null (ZIP entry, DMG variant, VHD type, XZ blocks),
+ *    "file_size":u64,"compressed":bool,"size":u64|null (size of the disk image; null = known
+ *    only after decompressing),"size_estimate":u64|null,"random_access":bool,
+ *    "partition_scheme":"GPT"|"MBR"|null,"partitions":[PartitionInfo],
+ *    "iso":{"label":str,"size":u64,"joliet":bool,"udf":bool,"el_torito":bool,"efi_boot":bool,
+ *           "hybrid_tables":["mbr"|"gpt"],"hybrid":bool}|null,
+ *    "windows":WindowsInfo|null,"linux":LinuxInfo|null,"rpi":RpiInfo|null,
+ *    "checksum_file":{"path":str,"algorithm":str,"expected":str}|null,
+ *    "recommended_mode":"dd"|"iso"|"windows","explanation":str (localised),"notes":[str]}
+ *
+ *  DiskInfo = {"bsd":"disk4","media_name":str,"size":u64,"block_size":u32,"internal":bool,
+ *    "removable":bool,"ejectable":bool,"whole":bool,"writable":bool,"disk_image":bool,
+ *    "protocol":str,"boot":bool,"mounted":[str],"allowed":bool,"refusal":str|null}
+ */
+
+/* Start a job from a Request: {"ok":true,"job":u64}. */
+char *ld_forge_start(const char *request_json);
+/* The job's Snapshot (+ "ok") with the log lines whose seq > `since` (pass the last one seen,
+ * 0 = all). Unknown or forgotten job: {"ok":false,...}. */
+char *ld_forge_status(uint64_t job, uint64_t since);
+/* Ask a job to stop at its next check: {"ok":true,"cancelled":bool} (false: unknown job). */
+char *ld_forge_cancel(uint64_t job);
+/* Drop a finished job once its result was shown: {"ok":true,"forgotten":bool}. */
+char *ld_forge_forget(uint64_t job);
+/* Every whole disk with its verdict (allowed ones first): {"ok":true,"disks":[DiskInfo]}. */
+char *ld_forge_disks(void);
+/* Quick, synchronous Inspection of an image for the drop zone (+ "ok"): no hashing, and at most
+ * 128 MB of a compressed image are decompressed (what needed more is listed in "notes"). */
+char *ld_forge_inspect(const char *path);
+
 void ld_free_string(char *s);
 
 #ifdef __cplusplus

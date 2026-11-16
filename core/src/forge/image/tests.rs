@@ -185,6 +185,10 @@ fn samples(d: &[u8]) -> Vec<(&'static str, Vec<u8>, Format, bool)> {
         ("vhd-dynamic", vhd::build::dynamic(d, 64 << 10), Format::Vhd, true),
         ("dmg-udro", dmg::build::dmg(d, 1 << 20, &[Kind::Raw]), Format::Dmg, true),
         ("dmg-udzo", dmg::build::dmg(d, 1 << 20, &[Kind::Zlib]), Format::Dmg, true),
+        // These start with "BZh" / an XZ header: the trailer must win over the magic bytes.
+        ("dmg-udbz", dmg::build::dmg(d, 1 << 20, &[Kind::Bzip2]), Format::Dmg, true),
+        ("dmg-ulmo", dmg::build::dmg(d, 1 << 20, &[Kind::Lzma]), Format::Dmg, true),
+        ("dmg-ulfo", dmg::build::dmg(d, 1 << 20, &[Kind::Lzfse]), Format::Dmg, true),
         ("dmg-mixed", dmg::build::dmg(d, 256 << 10, &[Kind::Zlib, Kind::Bzip2, Kind::Lzfse, Kind::Lzma, Kind::Adc, Kind::Raw]), Format::Dmg, true),
     ]
 }
@@ -423,10 +427,16 @@ fn random_mutations_never_panic_or_hang() {
     let dir = tmpdir("fuzz");
     let d = disk(256 << 10);
     let ctx = JobCtx::detached(false);
-    let mut rng = Rng(0x5EED_1234_ABCD_0001);
+    let seed = std::env::var("LUMENDISK_FUZZ_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0x5EED_1234_ABCD_0001u64);
     let mut outcomes = std::collections::BTreeMap::<String, (u32, u32)>::new();
     let iterations = std::env::var("LUMENDISK_FUZZ_ITER").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+    let only = std::env::var("LUMENDISK_FUZZ_ONLY").ok();
     for (name, bytes, _, _) in samples(&d) {
+        if only.as_deref().is_some_and(|o| o != name) {
+            continue;
+        }
+        // One generator per sample, so a failing case reproduces with LUMENDISK_FUZZ_ONLY.
+        let mut rng = Rng(seed ^ name.bytes().fold(0u64, |h, b| h.wrapping_mul(131).wrapping_add(b as u64)) | 1);
         for it in 0..iterations {
             let mut m = bytes.clone();
             match rng.below(4) {
@@ -455,11 +465,23 @@ fn random_mutations_never_panic_or_hang() {
                 _ => m.truncate(1),
             }
             let p = write(&dir, &format!("{name}-{it}"), &m);
+            if std::env::var_os("LUMENDISK_FUZZ_TRACE").is_some() {
+                eprintln!("fuzz {name} #{it}");
+            }
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
                 let img = Image::open(&p).map_err(|e| e.to_string())?;
-                let v = decode_all(&img).map_err(|e| e.to_string())?;
-                if let Some(s) = img.size {
-                    assert_eq!(v.len() as u64, s, "a decoded image always has its announced size");
+                // A damaged size field can announce a huge (sparse, all-zero) disk: decode at
+                // most 64 MiB of it, without keeping it.
+                let mut pipe = img.pipe(1 << 20, 2);
+                let mut n = 0u64;
+                while let Some(c) = pipe.next_chunk() {
+                    n += c.map_err(|e| e.to_string())?.len() as u64;
+                    if n >= 64 << 20 {
+                        break;
+                    }
+                }
+                if let (Some(s), true) = (img.size, n < 64 << 20) {
+                    assert_eq!(n, s, "a decoded image always has its announced size");
                 }
                 let dev = img.device(&ctx, false, Some(4 << 20)).map_err(|e| e.to_string())?;
                 let mut b = vec![0u8; 8192];

@@ -142,8 +142,8 @@ fn corrupt(what: &str) -> ForgeError {
 
 /// Whether the file ends with a `koly` trailer.
 pub fn probe(f: &File, size: u64) -> bool {
-    let mut b = [0u8; 4];
-    size >= 512 && f.read_exact_at(&mut b, size - 512).is_ok() && &b == b"koly"
+    let mut b = [0u8; 12];
+    size >= 512 && f.read_exact_at(&mut b, size - 512).is_ok() && &b[..4] == b"koly" && be32(&b, 8) == 512
 }
 
 /// Parse the koly trailer, the XML plist and every mish table.

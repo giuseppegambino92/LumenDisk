@@ -127,7 +127,19 @@ impl Image {
         let mut head = vec![0u8; file_size.min(64) as usize];
         f.read_exact_at(&mut head, 0)?;
         let mut img = Image { path, format: Format::Raw, file_size, size: Some(file_size), size_hint: None, detail: Detail::None };
-        if head.len() >= 3 && head[..3] == [0x1F, 0x8B, 0x08] {
+        // Trailers first: a DMG's data fork starts with its first chunk (zlib, "BZh", an XZ
+        // stream…), and a fixed VHD starts with whatever the disk starts with.
+        if dmg::probe(&f, file_size) {
+            img.format = Format::Dmg;
+            let tab = dmg::open(&f, file_size)?;
+            img.size = Some(tab.size);
+            img.detail = Detail::Dmg(Arc::new(tab));
+        } else if vhd::probe(&f, file_size) {
+            img.format = Format::Vhd;
+            let info = vhd::open(&f, file_size)?;
+            img.size = Some(info.size);
+            img.detail = Detail::Vhd(Arc::new(info));
+        } else if head.len() >= 3 && head[..3] == [0x1F, 0x8B, 0x08] {
             img.format = Format::Gzip;
             img.size = None;
             // ISIZE: the size modulo 2^32 of the last member — a hint, never trusted.
@@ -167,16 +179,6 @@ impl Image {
             return Err(unsupported("DMG cifrato: aprilo con Utility Disco e salvane una copia non cifrata", "encrypted DMG: open it with Disk Utility and save an unencrypted copy"));
         } else if head.len() >= 4 && &head[..4] == b"sprs" {
             return Err(unsupported("immagine sparse di macOS: convertila in DMG (UDZO / UDRO) con Utility Disco", "macOS sparse image: convert it to a DMG (UDZO / UDRO) with Disk Utility"));
-        } else if vhd::probe(&f, file_size) {
-            img.format = Format::Vhd;
-            let info = vhd::open(&f, file_size)?;
-            img.size = Some(info.size);
-            img.detail = Detail::Vhd(Arc::new(info));
-        } else if dmg::probe(&f, file_size) {
-            img.format = Format::Dmg;
-            let tab = dmg::open(&f, file_size)?;
-            img.size = Some(tab.size);
-            img.detail = Detail::Dmg(Arc::new(tab));
         }
         Ok(img)
     }
