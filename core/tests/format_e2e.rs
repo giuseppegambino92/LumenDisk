@@ -255,6 +255,8 @@ fn format_matrix_on_image_files_checked_by_linux_tools() {
     }
     // FAT32 well above 32 GB (Windows refuses to create it; it is valid), sparse.
     cases.push(("fat32-64g".into(), Scheme::Gpt, 64 << 30, vec![part(TargetFs::Fat32, None, "BIG", None)]));
+    // …up to the format's limit: 2^32 − 1 sectors of 512 bytes (just under 2 TiB).
+    cases.push(("fat32-2t".into(), Scheme::Gpt, (2 << 40) + MIB, vec![part(TargetFs::Fat32, None, "HUGE", None)]));
     // Several partitions per scheme.
     let multi = |last: Option<u64>| {
         vec![part(TargetFs::Fat32, Some(64 * MIB), "EFI", None), part(TargetFs::Ntfs, Some(80 * MIB), "Windows", Some(8192)), part(TargetFs::Exfat, Some(40 * MIB), "Scambio", None), part(TargetFs::Ext4, last, "linux", None)]
@@ -431,6 +433,16 @@ fn macos_reads_tables_written_to_files() {
         assert_eq!(got.len(), 3, "{scheme:?}: {got:?}");
         assert!(diskutil_info(&got[0].1).contains("MS-DOS FAT32"));
         assert!(diskutil_info(&got[1].1).contains("ExFAT"));
+    }
+    // No partition table: the filesystem is the whole disk.
+    for (fs, want) in [(TargetFs::Exfat, "ExFAT"), (TargetFs::Fat32, "MS-DOS FAT32")] {
+        let path = dir.join(format!("superfloppy-{}.img", fs.display_name()));
+        let req = FormatRequest { target: TargetSpec::File { path: path.clone(), size: Some(96 * MIB) }, scheme: Scheme::None, partitions: vec![part(fs, None, "FLOPPY", None)], clear_signatures: true };
+        run_job(Request::Format(req)).unwrap();
+        let disk = Attached::new(&path);
+        let info = diskutil_info(&disk.0);
+        assert!(info.contains(want) && info.contains("FLOPPY"), "{info}");
+        assert!(diskutil_partitions(&disk.0).is_empty());
     }
 }
 

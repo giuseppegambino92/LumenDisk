@@ -225,7 +225,7 @@ impl BlockDev for DryRun {
                 c[o..o + n].copy_from_slice(src);
             } else if src.iter().any(|&b| b != 0) {
                 if (chunks.len() + 1) * DRY_CHUNK as usize > self.budget {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "dry run budget exceeded"));
+                    return Err(std::io::Error::other("dry run budget exceeded"));
                 }
                 let mut c = vec![0u8; DRY_CHUNK as usize];
                 c[o..o + n].copy_from_slice(src);
@@ -260,14 +260,14 @@ pub fn preflight(index: usize, fs: TargetFs, size: u64, sector: u64, opts: &Mkfs
     match fs {
         TargetFs::Fat16 if size > 4 * GIB => {
             return refuse(
-                format!("FAT16 non può superare 4 GiB (2 GiB con i cluster standard da 32 KiB): scegli FAT32 o exFAT"),
-                format!("FAT16 can't exceed 4 GiB (2 GiB with standard 32 KiB clusters): choose FAT32 or exFAT"),
+                "FAT16 non può superare 4 GiB (2 GiB con i cluster standard da 32 KiB): scegli FAT32 o exFAT".into(),
+                "FAT16 can't exceed 4 GiB (2 GiB with standard 32 KiB clusters): choose FAT32 or exFAT".into(),
             )
         }
         TargetFs::Fat16 if size > 2 * GIB && cluster.is_none() => {
             return refuse(
-                format!("FAT16 oltre 2 GiB richiede cluster da 64 KiB (poco compatibili): sceglili esplicitamente, o usa FAT32 / exFAT"),
-                format!("FAT16 above 2 GiB needs 64 KiB clusters (poorly supported): choose them explicitly, or use FAT32 / exFAT"),
+                "FAT16 oltre 2 GiB richiede cluster da 64 KiB (poco compatibili): sceglili esplicitamente, o usa FAT32 / exFAT".into(),
+                "FAT16 above 2 GiB needs 64 KiB clusters (poorly supported): choose them explicitly, or use FAT32 / exFAT".into(),
             )
         }
         TargetFs::Fat32 if size / sector > u32::MAX as u64 => {
@@ -449,11 +449,10 @@ pub fn format_device(dev: Arc<dyn BlockDev>, path: &str, r: &FormatRequest, ctx:
         let label = sanitize_label(p.fs, &p.mkfs.label);
         ctx.info(format!("partition {}: {} \"{}\" at {} ({} bytes)", pl.index, p.fs.display_name(), label, pl.start, pl.size));
         let view: Arc<dyn BlockDev> = Arc::new(PartitionDev::new(dev.clone(), pl.start, pl.size)?);
-        let unit = mkfs_unit(view, p.fs, &p.mkfs).map_err(|e| {
+        let unit = mkfs_unit(view, p.fs, &p.mkfs).inspect_err(|_| {
             if pl.index > 1 {
                 ctx.warn(format!("partitions 1..{} were formatted, partition {} failed", pl.index - 1, pl.index));
             }
-            e
         })?;
         out.push(json!({
             "index": pl.index,
