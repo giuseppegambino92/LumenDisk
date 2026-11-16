@@ -577,6 +577,9 @@ pub fn write_tree_tuned(r: &FlashRequest, tree: &mut dyn SourceTree, target: &Op
     // ── Customizing: answer file, boot records, UEFI:NTFS
     ctx.phase_units(Phase::Customizing, 3, "steps");
     if let Some(a) = &answer {
+        if find_file(&entries, "/autounattend.xml").is_some() {
+            ctx.warn("the media's own autounattend.xml is replaced by the one for the chosen options");
+        }
         tree::write_file(volume.as_mut(), "/autounattend.xml", a.xml.as_bytes())?;
         ctx.info(if a.custom { "custom autounattend.xml written" } else { "autounattend.xml written" });
     }
@@ -610,7 +613,8 @@ pub fn write_tree_tuned(r: &FlashRequest, tree: &mut dyn SourceTree, target: &Op
         ctx.phase(Phase::Verifying, total);
         let mut volume = vfs::open_fs(pdev.clone(), true, MountDefaults::default())?;
         for e in &files {
-            if e.symlink.is_some() || hidden.as_ref().is_some_and(|h| h.eq_ignore_ascii_case(&e.path)) {
+            let replaced = answer.is_some() && e.path.eq_ignore_ascii_case("/autounattend.xml");
+            if e.symlink.is_some() || replaced || hidden.as_ref().is_some_and(|h| h.eq_ignore_ascii_case(&e.path)) {
                 continue;
             }
             let path = e.path.clone();

@@ -92,13 +92,13 @@ pub struct Media {
 
 impl Media {
     fn windows11(&self) -> bool {
-        !self.server && self.build.map_or(true, |b| b >= 22000)
+        !self.server && self.build.is_none_or(|b| b >= 22000)
     }
     fn windows8_or_later(&self) -> bool {
-        self.build.map_or(true, |b| b >= 9200)
+        self.build.is_none_or(|b| b >= 9200)
     }
     fn privacy_policy(&self) -> bool {
-        self.build.map_or(true, |b| b >= 17763)
+        self.build.is_none_or(|b| b >= 17763)
     }
 }
 

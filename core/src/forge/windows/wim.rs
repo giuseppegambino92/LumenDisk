@@ -311,7 +311,7 @@ pub struct WimImage {
 /// Decode the XML resource: UTF-16LE, normally with a byte-order mark.
 pub fn decode_xml(raw: &[u8]) -> ForgeResult<String> {
     let b = raw.strip_prefix(&[0xFF, 0xFE]).unwrap_or(raw);
-    if b.len() % 2 != 0 {
+    if !b.len().is_multiple_of(2) {
         return Err(bad("XML data has an odd length"));
     }
     let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
@@ -514,10 +514,7 @@ pub fn unsplittable_reason(wim: &WimFile, table: &[BlobEntry]) -> Option<String>
         return Some("pipable WIM".into());
     }
     if wim.is_solid(Some(table)) {
-        return Some(t(
-            "immagine ESD (compressione solida LZMS): non si può dividere",
-            "ESD image (solid LZMS compression): it can't be split",
-        ));
+        return Some(t("immagine ESD (compressione solida LZMS)", "ESD image (solid LZMS compression)"));
     }
     if h.total_parts != 1 {
         return Some(t("il WIM è già diviso in parti", "the WIM is already split into parts"));
@@ -778,7 +775,7 @@ pub(crate) mod tests {
         for i in 0..images {
             let off = data.len() as u64;
             let len = 300 + i * 17;
-            data.extend(std::iter::repeat(0xA0 + i as u8).take(len));
+            data.extend(std::iter::repeat_n(0xA0 + i as u8, len));
             let mut hash = [0xEEu8; 20];
             hash[0] = i as u8;
             meta.push(BlobEntry { res: ResHdr { size_in_wim: len as u64, flags: res_flags::METADATA, offset: off, uncompressed_size: len as u64 }, part_number: 1, refcnt: 1, hash });

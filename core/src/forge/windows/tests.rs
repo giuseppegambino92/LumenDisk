@@ -255,3 +255,20 @@ fn the_iso_hookup_reports_clearly_until_the_reader_lands() {
     drop(target);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn the_medias_own_answer_file_is_replaced_and_still_verifies() {
+    let mut t = media(synth_wim(&[5000], 1, XML, 0), "install.wim");
+    t.0.push(("/autounattend.xml".into(), b"<unattend>theirs</unattend>".to_vec()));
+    let dir = tmp("own-answer");
+    let ctx = JobCtx::detached(false);
+    let target = open_for_write(&TargetSpec::File { path: dir.join("d.img"), size: Some(64 << 20) }, &ctx).unwrap();
+    let opts = WindowsOptions { local_account: Some(LocalAccount { name: "anna".into(), password: String::new() }), ..Default::default() };
+    let r = write_tree(&request(opts), &mut t, &target, &ctx).unwrap();
+    assert_eq!(r["verified"], true);
+    drop(target);
+    let (_, mut fs, _) = open_part(&dir.join("d.img"), 0);
+    let xml = String::from_utf8(tree::read_file(fs.as_mut(), "/autounattend.xml").unwrap().unwrap()).unwrap();
+    assert!(xml.contains("<Name>anna</Name>"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
