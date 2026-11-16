@@ -458,12 +458,193 @@ fn failing_requests_leave_the_target_alone() {
     assert!(run_job(Request::Format(req)).is_err());
 }
 
-#[allow(dead_code)]
 fn doctor(target: TargetSpec, action: DoctorAction) -> Result<Value, String> {
     run_job(Request::Doctor(DoctorRequest { target, action }))
 }
 
-#[allow(dead_code)]
 fn file_target(p: &Path) -> TargetSpec {
     TargetSpec::File { path: PathBuf::from(p), size: None }
+}
+
+fn finding_codes(report: &Value) -> Vec<String> {
+    report["findings"].as_array().unwrap().iter().map(|f| f["code"].as_str().unwrap().to_string()).collect()
+}
+
+/// Patch bytes of an image file in place.
+fn patch(path: &Path, off: u64, data: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.write_all_at(data, off).unwrap();
+}
+
+fn read_at(path: &Path, off: u64, len: usize) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(path).unwrap();
+    let mut b = vec![0u8; len];
+    f.read_exact_at(&mut b, off).unwrap();
+    b
+}
+
+fn set_len(path: &Path, len: u64) {
+    std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(len).unwrap();
+}
+
+/// Four real filesystems on a GPT image, the table damaged in every way the doctor repairs;
+/// after each repair sgdisk finds no problem and every filesystem passes its fsck.
+#[test]
+#[ignore]
+fn doctor_repairs_damaged_gpt_images() {
+    virtual_only();
+    let dir = common::workdir("forge_doctor_repair");
+    let size = 256 * MIB;
+    let master = dir.join("master.img");
+    let parts = vec![part(TargetFs::Fat32, Some(64 * MIB), "EFI", None), part(TargetFs::Ntfs, Some(64 * MIB), "Windows", None), part(TargetFs::Exfat, Some(40 * MIB), "Dati", None), part(TargetFs::Ext4, Some(64 * MIB), "linux", None)];
+    let req = FormatRequest { target: TargetSpec::File { path: master.clone(), size: Some(size) }, scheme: Scheme::Gpt, partitions: parts, clear_signatures: true };
+    let res = run_job(Request::Format(req)).unwrap();
+    let lbas = size / 512;
+    type Damage = Box<dyn Fn(&Path)>;
+    let cases: Vec<(&str, &str, Damage)> = vec![
+        ("primary-header", "gpt_primary_missing", Box::new(|p: &Path| patch(p, 512, &[0u8; 512]))),
+        ("primary-entries", "gpt_primary_entries_crc", Box::new(|p: &Path| patch(p, 1024 + 130, &[0x42]))),
+        ("primary-crc", "gpt_primary_header_crc", Box::new(|p: &Path| patch(p, 512 + 16, &[1, 2, 3, 4]))),
+        ("backup-header", "gpt_backup_missing", Box::new(move |p: &Path| patch(p, (lbas - 1) * 512, &[0u8; 512]))),
+        ("backup-entries", "gpt_backup_entries_crc", Box::new(move |p: &Path| patch(p, (lbas - 33) * 512 + 7, &[0x42]))),
+        ("pmbr", "pmbr_missing", Box::new(|p: &Path| patch(p, 0, &[0u8; 512]))),
+        // dd of the image onto a disk 128 MiB larger.
+        ("grown", "gpt_backup_not_at_end", Box::new(move |p: &Path| set_len(p, size + 128 * MIB))),
+        // …and onto one 8 MiB smaller (the partitions leave 23 MiB free at the end).
+        ("shrunk", "gpt_beyond_end", Box::new(move |p: &Path| set_len(p, size - 8 * MIB))),
+    ];
+    let mut expects = vec![];
+    for (tag, code, damage) in cases {
+        let name = format!("repair-{tag}.img");
+        let path = dir.join(&name);
+        std::fs::copy(&master, &path).unwrap();
+        damage(&path);
+        let check = doctor(file_target(&path), DoctorAction::Check).unwrap();
+        let codes = finding_codes(&check);
+        assert!(codes.iter().any(|c| c == code), "{tag}: {codes:?}");
+        assert_eq!(check["healthy"], false);
+        assert_eq!(check["repairable"], true, "{tag}: {check}");
+        let r = doctor(file_target(&path), DoctorAction::Repair).unwrap_or_else(|e| panic!("{tag}: {e}"));
+        eprintln!("{tag}: {}", r["actions"]);
+        assert_eq!(r["after"]["healthy"], true, "{tag}: {r}");
+        assert_eq!(r["after"]["partitions"].as_array().unwrap().len(), 4);
+        expects.push(expect_from(&name, Scheme::Gpt, &res));
+    }
+    // Ambiguous: both copies valid but different → refused, file unchanged.
+    let path = dir.join("ambiguous.img");
+    std::fs::copy(&master, &path).unwrap();
+    let mut arr = read_at(&path, (lbas - 33) * 512, 16384);
+    arr[56] = b'Z';
+    let crc = lumendisk_core::forge::layout::crc32(&arr);
+    patch(&path, (lbas - 33) * 512, &arr);
+    let mut hdr = read_at(&path, (lbas - 1) * 512, 512);
+    hdr[88..92].copy_from_slice(&crc.to_le_bytes());
+    hdr[16..20].fill(0);
+    let hcrc = lumendisk_core::forge::layout::crc32(&hdr[..92]);
+    hdr[16..20].copy_from_slice(&hcrc.to_le_bytes());
+    patch(&path, (lbas - 1) * 512, &hdr);
+    let before = std::fs::read(&path).unwrap();
+    assert!(finding_codes(&doctor(file_target(&path), DoctorAction::Check).unwrap()).contains(&"gpt_mismatch".to_string()));
+    let e = doctor(file_target(&path), DoctorAction::Repair).unwrap_err();
+    eprintln!("ambiguous: {e}");
+    assert!(std::fs::read(&path).unwrap() == before, "refused repair wrote nothing");
+    verify_in_toolbox(&dir, &expects);
+}
+
+/// MBR ⇄ GPT in place on images with real filesystems (ours and ones made by the Linux tools,
+/// with logical partitions): extents identical, every filesystem still passes fsck.
+#[test]
+#[ignore]
+fn doctor_converts_mbr_and_gpt_in_place() {
+    virtual_only();
+    let dir = common::workdir("forge_doctor_convert");
+    let size = 256 * MIB;
+    // Ours: 4 primaries, the last one leaving room at the end for the backup GPT.
+    let path = dir.join("ours.img");
+    let parts = vec![part(TargetFs::Fat32, Some(64 * MIB), "UNO", None), part(TargetFs::Ntfs, Some(48 * MIB), "Due", None), part(TargetFs::Exfat, Some(40 * MIB), "Tre", None), part(TargetFs::Ext4, Some(64 * MIB), "quattro", None)];
+    let req = FormatRequest { target: TargetSpec::File { path: path.clone(), size: Some(size) }, scheme: Scheme::Mbr, partitions: parts, clear_signatures: true };
+    let res = run_job(Request::Format(req)).unwrap();
+    let r = doctor(file_target(&path), DoctorAction::ConvertToGpt).unwrap();
+    assert_eq!(r["after"]["scheme"], "gpt", "{r}");
+    std::fs::copy(&path, dir.join("ours-gpt.img")).unwrap();
+    let r = doctor(file_target(&path), DoctorAction::ConvertToMbr).unwrap();
+    assert_eq!(r["after"]["scheme"], "mbr", "{r}");
+    let types: Vec<&str> = r["after"]["partitions"].as_array().unwrap().iter().map(|p| p["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["0x0C", "0x07", "0x07", "0x83"], "types from the filesystems found");
+    std::fs::copy(&path, dir.join("ours-mbr.img")).unwrap();
+    // A rest-of-disk MBR partition leaves no room for the backup GPT: refused, untouched.
+    let full = dir.join("full.img");
+    let req = FormatRequest { target: TargetSpec::File { path: full.clone(), size: Some(64 * MIB) }, scheme: Scheme::Mbr, partitions: vec![part(TargetFs::Exfat, None, "", None)], clear_signatures: true };
+    run_job(Request::Format(req)).unwrap();
+    let before = std::fs::read(&full).unwrap();
+    let e = doctor(file_target(&full), DoctorAction::ConvertToGpt).unwrap_err();
+    eprintln!("full: {e}");
+    assert!(e.contains("33"));
+    assert!(std::fs::read(&full).unwrap() == before);
+
+    // Linux's: sfdisk with an extended partition and two logical ones, mkfs by the Linux tools.
+    let script = "set -e; truncate -s 256M linux.img; \
+        printf 'label: dos\\nstart=2048, size=131072, type=c, bootable\\nstart=133120, type=5\\nstart=135168, size=65536, type=83\\nstart=202752, size=65536, type=7\\n' | sfdisk -q linux.img; \
+        sfdisk -d linux.img; \
+        L=$(losetup -f --show -o $((2048*512)) --sizelimit $((131072*512)) linux.img); mkfs.vfat -F 32 -n LINUXFAT $L >/dev/null; losetup -d $L; \
+        L=$(losetup -f --show -o $((135168*512)) --sizelimit $((65536*512)) linux.img); mkfs.ext4 -q -L logico $L; losetup -d $L; \
+        L=$(losetup -f --show -o $((202752*512)) --sizelimit $((65536*512)) linux.img); mkfs.exfat -L logico2 $L >/dev/null; losetup -d $L";
+    let (code, out) = common::docker_priv(&dir, script);
+    assert_eq!(code, 0, "{out}");
+    let linux = dir.join("linux.img");
+    let check = doctor(file_target(&linux), DoctorAction::Check).unwrap();
+    assert_eq!(check["scheme"], "mbr");
+    assert_eq!(check["partitions"].as_array().unwrap().len(), 3, "{check}");
+    assert_eq!(check["healthy"], true, "{check}");
+    let r = doctor(file_target(&linux), DoctorAction::ConvertToGpt).unwrap();
+    assert_eq!(r["after"]["healthy"], true, "{r}");
+
+    let mut expects = vec![];
+    let mut gpt = expect_from("ours-gpt.img", Scheme::Gpt, &res);
+    let mut mbr = expect_from("ours-mbr.img", Scheme::Mbr, &res);
+    for e in gpt.parts.iter_mut().chain(mbr.parts.iter_mut()) {
+        e.cluster = None;
+    }
+    expects.push(gpt);
+    expects.push(mbr);
+    let lp = |start: u64, count: u64, fs: TargetFs, label: &str| ExpectPart { start: start * 512, size: count * 512, fs, label: label.into(), cluster: None };
+    expects.push(Expect { img: "linux.img".into(), scheme: Scheme::Gpt, sector: 512, parts: vec![lp(2048, 131072, TargetFs::Fat32, "LINUXFAT"), lp(135168, 65536, TargetFs::Ext4, "logico"), lp(202752, 65536, TargetFs::Exfat, "logico2")] });
+    verify_in_toolbox(&dir, &expects);
+}
+
+/// The doctor on a `Disk` target (an attached image): check, repair a damaged backup GPT,
+/// macOS sees the partitions afterwards.
+#[test]
+#[ignore]
+fn doctor_on_an_attached_disk_image() {
+    virtual_only();
+    let dir = common::workdir("forge_doctor_disk");
+    let path = dir.join("disk.img");
+    let size = 160 * MIB;
+    let parts = vec![part(TargetFs::Fat32, Some(64 * MIB), "DOCTOR", None), part(TargetFs::Exfat, None, "Paziente", None)];
+    let req = FormatRequest { target: TargetSpec::File { path: path.clone(), size: Some(size) }, scheme: Scheme::Gpt, partitions: parts, clear_signatures: true };
+    let res = run_job(Request::Format(req)).unwrap();
+    patch(&path, size - 512, &[0u8; 512]);
+    {
+        let disk = Attached::new(&path);
+        let t = TargetSpec::Disk { bsd: disk.0.clone() };
+        let check = doctor(t.clone(), DoctorAction::Check).unwrap();
+        assert!(finding_codes(&check).contains(&"gpt_backup_missing".to_string()), "{check}");
+        let r = doctor(t.clone(), DoctorAction::Repair).unwrap();
+        assert_eq!(r["after"]["healthy"], true, "{r}");
+        let mut got = vec![];
+        for _ in 0..50 {
+            got = diskutil_partitions(&disk.0);
+            if got.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("{}", diskutil(&["list", &disk.0]));
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(diskutil_info(&got[1].1).contains("ExFAT"));
+    }
+    verify_in_toolbox(&dir, &[expect_from("disk.img", Scheme::Gpt, &res)]);
 }
