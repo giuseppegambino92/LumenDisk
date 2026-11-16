@@ -1420,3 +1420,185 @@ fn write_through_survives_a_crash_without_a_journal_sync() {
     let mut r = session(&dev, &dir);
     assert_eq!(full_view(&mut r).0, want);
 }
+
+// ── session removal when the directory sync after the rename fails ──
+
+/// Every file of a session directory, by relative path.
+fn dir_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                out.insert(p.strip_prefix(dir).unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// The `.trash-` directories left next to session `dir`.
+fn trash_of(dir: &Path) -> Vec<PathBuf> {
+    let prefix = format!(".trash-{}-", dir.file_name().unwrap().to_string_lossy());
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect();
+    v.sort();
+    v
+}
+
+/// The crash undid the rename (it never reached the disk): whatever was created under the
+/// session's name afterwards is lost too, and the trash is back under the old name.
+fn crash_undoes_the_rename(dir: &Path, trash: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::rename(trash, dir).unwrap();
+}
+
+/// fsync of the sessions folder fails right after a discard renamed the session away: the
+/// error is reported, nothing is deleted, and whichever way a crash then goes the session is
+/// either back whole (byte for byte, same changes) or gone, never half deleted.
+#[test]
+fn discard_with_a_failed_dir_sync_after_the_rename_never_leaves_half_a_session() {
+    let (dev, snap) = setup();
+    let dir = tmp("rmfault").join("s");
+    let parent = dir.parent().unwrap().to_path_buf();
+    let mut s = session(&dev, &dir);
+    scenario(&mut s, true);
+    s.sync().unwrap();
+    let before = full_view(&mut s);
+    let files = dir_bytes(&dir);
+    assert!(files.len() >= 3, "manifest, journal and stage expected: {:?}", files.keys());
+
+    // The contract, on the function itself.
+    store::fail_dir_syncs_of(Some(&parent));
+    let copy = parent.join("s-copy");
+    std::fs::create_dir(&copy).unwrap();
+    for (k, v) in &files {
+        std::fs::write(copy.join(k), v).unwrap();
+    }
+    let e = store::remove_session_dir(&copy).expect_err("the failed sync must be reported");
+    assert_eq!(e.raw_os_error(), Some(libc::EIO));
+    assert!(!copy.exists(), "Err with the name gone = renamed, removal not durable");
+    let t = trash_of(&copy);
+    assert_eq!(t.len(), 1);
+    assert_eq!(dir_bytes(&t[0]), files, "nothing may be deleted before the rename is durable");
+    std::fs::remove_dir_all(&t[0]).unwrap();
+
+    // Through the overlay: a rollback (discard) whose removal is not durable.
+    assert!(s.rollback() > 0);
+    s.simulate_crash();
+    let t = trash_of(&dir);
+    assert_eq!(t.len(), 1, "the discarded session waits, intact, under a .trash- name");
+    assert_eq!(dir_bytes(&t[0]), files);
+
+    // clean_trash must not delete it either while the folder cannot be synced.
+    store::clean_trash(&parent);
+    assert_eq!(dir_bytes(&t[0]), files, "clean_trash deleted files whose rename may not be durable");
+
+    // Outcome 1: the crash undid the rename. The session is back whole, with every change.
+    crash_undoes_the_rename(&dir, &t[0]);
+    store::fail_dir_syncs_of(None);
+    let mut r = session(&dev, &dir);
+    assert!(r.summary().restored, "the session must come back");
+    let after = full_view(&mut r);
+    assert_eq!(before.0, after.0);
+    assert_eq!(before.1, after.1);
+    r.simulate_crash();
+    assert!(dev.read_vec(0, 48 << 20).unwrap() == snap, "a discarded session never touches the disk");
+
+    // Outcome 2: the rename was durable. Once a sync succeeds, the trash is deleted.
+    store::fail_dir_syncs_of(Some(&parent));
+    let mut r = session(&dev, &dir);
+    r.rollback();
+    r.simulate_crash();
+    assert_eq!(trash_of(&dir).len(), 1);
+    assert!(store::list_sessions_in(&parent).is_empty(), "a .trash- directory is never listed as a session");
+    assert_eq!(trash_of(&dir).len(), 1, "listing must not delete it while the folder cannot be synced");
+    store::fail_dir_syncs_of(None);
+    store::clean_trash(&parent);
+    assert!(trash_of(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// fsync fails right after a *successful commit* renamed its session away: the commit still
+/// reports success (the volume has every change), and if a crash undoes the rename, the
+/// session that comes back resumes the finished commit without effects: same final tree.
+#[test]
+fn finished_commit_whose_session_comes_back_after_a_crash_resumes_without_effects() {
+    let (dev, snap) = setup();
+    let reference = {
+        let d2 = mem_from(&snap);
+        let mut e = ShadowOverlay::new(open_ext4(&d2), stage()).unwrap();
+        scenario(&mut e, true);
+        e.commit().unwrap();
+        drop(e);
+        tree(open_ext4(&d2).as_mut())
+    };
+    let dir = tmp("commitfault").join("s");
+    let parent = dir.parent().unwrap().to_path_buf();
+    let mut s = session(&dev, &dir);
+    scenario(&mut s, true);
+    s.sync().unwrap();
+    store::fail_dir_syncs_of(Some(&parent));
+    assert!(s.commit().unwrap() > 0, "the volume has every change: the commit succeeded");
+    s.simulate_crash();
+    assert_eq!(tree(open_ext4(&dev).as_mut()), reference);
+    let t = trash_of(&dir);
+    assert_eq!(t.len(), 1, "the finished session waits, intact, under a .trash- name");
+    assert_eq!(Manifest::load(&t[0]).unwrap().state, "committing");
+
+    crash_undoes_the_rename(&dir, &t[0]);
+    store::fail_dir_syncs_of(None);
+    let mut r = session(&dev, &dir);
+    assert!(r.commit_pending(), "a session that comes back is still committing");
+    r.commit().expect("replaying a finished commit must succeed");
+    drop(r);
+    assert!(!dir.exists());
+    assert_eq!(tree(open_ext4(&dev).as_mut()), reference, "replaying the plan changed the volume");
+    let mut fs = open_ext4(&dev);
+    assert_eq!(fs.dirty_state(), DirtyState::Clean);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+
+/// The removal fails before the rename (sessions folder not writable): the session is left
+/// exactly as it was, byte for byte, the overlay goes on in memory, and the next mount
+/// offers every change again.
+#[test]
+fn discard_whose_rename_fails_leaves_the_session_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dev, snap) = setup();
+    let dir = tmp("rmdeny").join("s");
+    let parent = dir.parent().unwrap().to_path_buf();
+    let mut s = session(&dev, &dir);
+    scenario(&mut s, true);
+    s.sync().unwrap();
+    let before = full_view(&mut s);
+    let files = dir_bytes(&dir);
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(s.rollback() > 0);
+    // The overlay keeps working, in memory, without touching the old session.
+    let root = s.root_ino();
+    let f = s.create(root, "after-rollback", 0o644, 0, 0).unwrap();
+    s.write(f, 0, &testutil::pattern(200_000, 3)).unwrap();
+    assert_eq!(s.read(f, 0, 200_000).unwrap(), testutil::pattern(200_000, 3));
+    drop(s);
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(dir_bytes(&dir), files, "a failed removal must leave the session byte for byte");
+    let mut r = session(&dev, &dir);
+    assert!(r.summary().restored);
+    let after = full_view(&mut r);
+    assert_eq!(before.0, after.0);
+    assert_eq!(before.1, after.1);
+    r.rollback();
+    drop(r);
+    assert!(!dir.exists());
+    assert!(dev.read_vec(0, 48 << 20).unwrap() == snap);
+    let _ = std::fs::remove_dir_all(&parent);
+}

@@ -76,10 +76,34 @@ pub fn barrier_sync(f: &File) -> io::Result<()> {
 /// fsync a directory so that creates / renames / unlinks inside it are durable.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     if cfg!(test) {
-        return Ok(()); // see `full_sync`
+        return injected_sync_fault(dir); // see `full_sync`
     }
     // F_FULLFSYNC is not supported on directories everywhere; a plain fsync orders the entry.
     fsync_fd(&File::open(dir)?)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_DIR_SYNCS_OF: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: make every [`sync_dir`] of `dir` on this thread fail with EIO, until called with `None`.
+#[cfg(test)]
+pub(crate) fn fail_dir_syncs_of(dir: Option<&Path>) {
+    FAIL_DIR_SYNCS_OF.with(|f| *f.borrow_mut() = dir.map(Path::to_path_buf));
+}
+
+#[cfg(test)]
+fn injected_sync_fault(dir: &Path) -> io::Result<()> {
+    match FAIL_DIR_SYNCS_OF.with(|f| f.borrow().as_deref() == Some(dir)) {
+        true => Err(io::Error::from_raw_os_error(libc::EIO)),
+        false => Ok(()),
+    }
+}
+
+#[cfg(not(test))]
+fn injected_sync_fault(_: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// `fsync(2)` that reports failure: callers promise durability on the strength of this call.
@@ -365,10 +389,14 @@ pub fn clean_trash(root: &Path) {
 
 /// Every session directory with a valid manifest.
 pub fn list_sessions(support: &Path) -> Vec<(PathBuf, Manifest)> {
-    let root = sessions_root(support);
-    clean_trash(&root);
+    list_sessions_in(&sessions_root(support))
+}
+
+/// [`list_sessions`] for the sessions folder `root`.
+pub(crate) fn list_sessions_in(root: &Path) -> Vec<(PathBuf, Manifest)> {
+    clean_trash(root);
     let mut out = vec![];
-    if let Ok(rd) = std::fs::read_dir(&root) {
+    if let Ok(rd) = std::fs::read_dir(root) {
         for e in rd.flatten() {
             let p = e.path();
             if !p.is_dir() || e.file_name().to_string_lossy().starts_with('.') {

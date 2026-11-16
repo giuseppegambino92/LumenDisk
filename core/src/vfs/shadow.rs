@@ -547,6 +547,9 @@ pub struct ShadowOverlay {
     /// Set when a commit found the source changed elsewhere (remote servers): the session can
     /// only be inspected and discarded.
     drift: Option<String>,
+    /// No stage file could be opened after a session restart: new writes are refused (there is
+    /// nowhere safe to put their data).
+    no_stage: bool,
 }
 
 impl ShadowOverlay {
@@ -587,6 +590,7 @@ impl ShadowOverlay {
             commit: None,
             flush_interval: FLUSH_INTERVAL,
             drift: None,
+            no_stage: false,
         }
     }
 
@@ -806,7 +810,7 @@ impl ShadowOverlay {
     }
 
     fn check_mutable(&self) -> FsResult<()> {
-        if self.commit.is_some() || self.drift.is_some() {
+        if self.commit.is_some() || self.drift.is_some() || self.no_stage {
             return Err(FsError::ReadOnly);
         }
         Ok(())
@@ -1561,11 +1565,30 @@ impl ShadowOverlay {
     fn restart_session(&mut self) {
         let Some(old) = self.sess.take() else { return };
         if let Err(e) = store::remove_session_dir(&old.dir) {
-            // Not durable (see its error contract): until a later directory sync succeeds, a
-            // crash may bring the old session back whole, never half deleted. After a commit it
-            // is still "committing" and resumes from its last checkpoint (every redo step is
-            // idempotent); after a discard its changes are simply offered again.
             eprintln!("lumendisk: removing Shadow session: {e}");
+            if old.dir.exists() {
+                // Not even renamed: leave it exactly as it is (recreating the stage here would
+                // truncate the data its journal points to) and go on in memory for this mount.
+                // It is offered again at the next Shadow mount.
+                match tempfile_stage() {
+                    Ok((f, p)) => {
+                        self.stage = f;
+                        self.stage_path = p;
+                    }
+                    Err(e) => {
+                        // The open file is still the old session's stage: never write to it,
+                        // and never delete it on drop (it is not ours any more).
+                        eprintln!("lumendisk: in-memory Shadow stage: {e}");
+                        self.stage_path = PathBuf::new();
+                        self.no_stage = true;
+                    }
+                }
+                return;
+            }
+            // Renamed but not durable (see its error contract): until a later directory sync
+            // succeeds, a crash may bring the old session back whole, never half deleted.
+            // After a commit it is still "committing" and resumes from its last checkpoint
+            // (every redo step is idempotent); after a discard its changes are offered again.
         }
         let fp = self.lower.fingerprint();
         let stage_path = old.dir.join(store::STAGE);
@@ -1670,10 +1693,16 @@ impl ShadowOverlay {
         self.free.clear();
         self.pending_free.clear();
         self.unsealed.clear();
-        if let Some(s) = &mut self.sess {
-            s.pending.clear();
+        match &mut self.sess {
+            // A persistent session's stage still backs its journal on disk until the session
+            // directory is durably removed: truncating it first would let a crash (or a failed
+            // removal) bring the session back with its data gone. `restart_session` (which
+            // every caller runs next) replaces the stage instead.
+            Some(s) => s.pending.clear(),
+            None => {
+                let _ = self.stage.set_len(0);
+            }
         }
-        let _ = self.stage.set_len(0);
     }
 
     /// Discard every pending change. Returns the number of discarded changes. While a commit
