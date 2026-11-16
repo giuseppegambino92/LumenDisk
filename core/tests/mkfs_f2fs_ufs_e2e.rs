@@ -74,7 +74,7 @@ mkdir -p /mnt/t && mount -t f2fs -o loop $img /mnt/t || {{ echo "FAILED: mount";
 for d in $(seq 1 10); do mkdir /mnt/t/dir$d; for f in $(seq 1 40); do echo "file $d/$f" > /mnt/t/dir$d/f$f.txt; done; done
 mkdir -p /mnt/t/deep/a/b/c && echo deep > /mnt/t/deep/a/b/c/leaf
 dd if=/dev/urandom of=/w/big.src bs=1M count={big_mb} status=none
-cp /w/big.src /mnt/t/big.bin && sync
+cp /w/big.src /mnt/t/big.bin && sync -f /mnt/t/big.bin  # syncfs of this volume only: a global sync waits on every mount of the shared Docker VM kernel
 df -k /mnt/t | tail -1
 umount /mnt/t || {{ echo "FAILED: umount"; exit 1; }}
 step fsck-after; check fsck.f2fs -f $img
