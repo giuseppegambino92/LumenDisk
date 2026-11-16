@@ -1397,3 +1397,26 @@ fn redo_does_not_take_an_io_error_for_a_missing_name() {
         let _ = std::fs::remove_dir_all(rig.dir.parent().unwrap());
     }
 }
+
+/// The write-through behind metadata replies: the frame is written (survives a crash of the
+/// process) but not synced — that is left to the next group commit.
+#[test]
+fn write_through_survives_a_crash_without_a_journal_sync() {
+    let (dev, _) = setup();
+    let dir = tmp("wt").join("s");
+    let mut s = session(&dev, &dir);
+    let root = s.root_ino();
+    let f = s.create(root, "f", 0o644, 0, 0).unwrap();
+    s.write(f, 0, &[7u8; 70_000]).unwrap();
+    s.mkdir(root, "d", 0o755, 0, 0).unwrap();
+    s.write_through().unwrap();
+    {
+        let ss = s.sess.as_ref().unwrap();
+        assert!(ss.pending.is_empty(), "every record is written");
+        assert_eq!(ss.synced, 0, "and none was synced");
+    }
+    let want = full_view(&mut s).0;
+    s.simulate_crash();
+    let mut r = session(&dev, &dir);
+    assert_eq!(full_view(&mut r).0, want);
+}

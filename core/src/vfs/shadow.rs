@@ -22,13 +22,16 @@
 //!   Overlay ids are allocated by a deterministic counter, so they come out identical.
 //! * **Group commit.** Records are buffered and written as one CRC-protected frame: stage file
 //!   barrier (`F_BARRIERFSYNC`) first, then the frame, then the journal `F_FULLFSYNC` (which
-//!   flushes the drive cache for the stage too). The NFS server runs one before every stable
-//!   reply — metadata operations, FILE_SYNC / DATA_SYNC writes, COMMIT — with the cache
-//!   flushes outside the volume lock ([`ShadowOverlay::durable_begin`]); requests arriving
-//!   meanwhile share the next one. UNSTABLE writes are covered by the next COMMIT or by the
-//!   100 ms timer. Chunks referenced by a written frame are never overwritten in place
-//!   (copy-on-write), so after a crash the recovered state is always a consistent prefix of
-//!   the operations, and it includes every operation that was answered as stable.
+//!   flushes the drive cache for the stage too). The NFS server runs one before replying to
+//!   FILE_SYNC / DATA_SYNC writes and COMMIT (close() / fsync()), with the cache flushes
+//!   outside the volume lock ([`ShadowOverlay::durable_begin`]); requests arriving meanwhile
+//!   share the next one; the 100 ms timer runs one too. Metadata replies only wait for
+//!   [`ShadowOverlay::write_through`]: the frame is written (it survives a crash of the
+//!   process) and synced by the next group commit (≤ ~100 ms later). Chunks referenced by a
+//!   written frame are never overwritten in place (copy-on-write), so after a crash the
+//!   recovered state is always a consistent prefix of the operations: after a process crash
+//!   it includes every answered operation, after a power cut every closed / fsynced file and
+//!   everything older than the last group commit.
 //! * **Drift detection.** The session stores a fingerprint of the lower volume
 //!   ([`FileSystem::fingerprint`]) and every record notes the attributes of the lower objects
 //!   it read. If the disk was modified elsewhere, recovery refuses and only Discard remains.
@@ -1452,6 +1455,25 @@ impl ShadowOverlay {
         synced.map_err(io)?;
         self.mark_synced(job.target);
         Ok(())
+    }
+
+    /// Write every buffered record to the journal without syncing it (under the volume lock):
+    /// from here on the operations survive a crash of this process; the next group commit
+    /// makes them survive a power loss. Stage chunks the records refer to are ordered first
+    /// (a barrier, only when the stage changed), so a power loss can still only cut the
+    /// journal at a frame boundary whose chunks made it.
+    pub fn write_through(&mut self) -> FsResult<()> {
+        let Some(s) = &mut self.sess else { return Ok(()) };
+        if !s.armed || s.pending.is_empty() {
+            return Ok(());
+        }
+        if s.stage_dirty {
+            store::barrier_sync(&self.stage).map_err(io)?;
+            s.stage_dirty = false;
+        }
+        let end = s.pending_base + s.pending.len() as u64;
+        self.unsealed.clear();
+        self.write_frame(end)
     }
 
     /// Timer flavour of [`ShadowOverlay::durable_begin`] (tests): only when records are
