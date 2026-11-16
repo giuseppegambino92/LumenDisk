@@ -53,8 +53,31 @@ pub fn full_sync(f: &File) -> io::Result<()> {
     f.sync_all()
 }
 
+/// Ordering barrier: everything written to `f` so far reaches stable storage before anything
+/// written (to any file of the same device) after this call returns (`F_BARRIERFSYNC` on
+/// macOS). It does not by itself make the bytes durable — a later [`full_sync`] of any file on
+/// the device does, because `F_FULLFSYNC` flushes the whole drive cache — but it costs a
+/// fraction of it. Falls back to a full sync where barriers are unsupported.
+pub fn barrier_sync(f: &File) -> io::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain fcntl on a valid descriptor.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_BARRIERFSYNC) } == 0 {
+            return Ok(());
+        }
+    }
+    full_sync(f)
+}
+
 /// fsync a directory so that creates / renames / unlinks inside it are durable.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    if cfg!(test) {
+        return Ok(()); // see `full_sync`
+    }
     let d = File::open(dir)?;
     // F_FULLFSYNC is not supported on directories everywhere; a plain fsync orders the entry.
     // SAFETY: plain fsync on a valid descriptor.
@@ -150,6 +173,11 @@ impl RecordLog {
 
     pub fn sync(&self) -> io::Result<()> {
         full_sync(&self.file)
+    }
+
+    /// A second descriptor of the log, to sync it without holding whatever owns the log.
+    pub fn clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 
     pub fn len(&self) -> u64 {

@@ -35,6 +35,15 @@ pub trait BlockDev: Send + Sync {
     /// because the last committed metadata may still reference it. Default: nothing to do.
     fn note_freed(&self, _offset: u64, _len: u64) {}
 
+    /// Order everything written so far before anything written afterwards to `other`, when
+    /// both live on the same device (`F_BARRIERFSYNC`): a later full sync of `other` then makes
+    /// both durable, for a fraction of the cost of [`BlockDev::flush`]. Returns false when it
+    /// can't promise that (another device, a raw disk, no barrier support): the caller has to
+    /// `flush()` instead. Default: false.
+    fn barrier_before(&self, _other: &File) -> io::Result<bool> {
+        Ok(false)
+    }
+
     /// Convenience helper. The range is checked against the device size *before* the buffer
     /// is allocated, so a length taken from corrupt on-disk metadata can't trigger a huge
     /// allocation.
@@ -171,6 +180,21 @@ impl BlockDev for FileDev {
     fn read_only(&self) -> bool {
         self.ro
     }
+    fn barrier_before(&self, other: &File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let (me, them) = (self.file.metadata()?, other.metadata()?);
+        if self.ro || !me.is_file() || me.dev() != them.dev() {
+            return Ok(false);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: plain fcntl on a valid descriptor.
+            return Ok(unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_BARRIERFSYNC) } == 0);
+        }
+        #[allow(unreachable_code)]
+        Ok(false)
+    }
 }
 
 /// Makes arbitrary byte-granular I/O work on raw devices that require sector alignment.
@@ -232,6 +256,9 @@ impl BlockDev for AlignedDev {
     fn note_freed(&self, offset: u64, len: u64) {
         self.inner.note_freed(offset, len)
     }
+    fn barrier_before(&self, other: &File) -> io::Result<bool> {
+        self.inner.barrier_before(other)
+    }
     fn read_only(&self) -> bool {
         self.inner.read_only()
     }
@@ -274,6 +301,9 @@ impl BlockDev for PartitionDev {
     }
     fn flush(&self) -> io::Result<()> {
         self.inner.flush()
+    }
+    fn barrier_before(&self, other: &File) -> io::Result<bool> {
+        self.inner.barrier_before(other)
     }
     fn read_only(&self) -> bool {
         self.inner.read_only()

@@ -1815,7 +1815,12 @@ pub mod tests {
             assert_eq!(v.read(d, 0, 100).unwrap(), b"remote"); // cached chunk
             worst = worst.max(t0.elapsed());
         }
-        assert!(worst < Duration::from_millis(50), "slowest offline stat+ls+read took {worst:?}");
+        // "Never blocks" means never waits on the network. While stalled, any backend call costs
+        // at least `meta_timeout` (150 ms here) before failing, so staying under it proves no
+        // call was waited on. A fixed 50 ms bound also caught plain local disk latency when
+        // F_FULLFSYNC-heavy tests run in parallel, and failed spuriously.
+        let net_wait = v.sh.cfg.meta_timeout.min(v.sh.cfg.data_timeout);
+        assert!(worst < net_wait, "slowest offline stat+ls+read took {worst:?} (a network wait costs ≥ {net_wait:?})");
         let mut slowest = Duration::ZERO;
         let mut timed = |f: &mut dyn FnMut()| {
             let t0 = Instant::now();
@@ -1832,7 +1837,7 @@ pub mod tests {
             v.mkdir(dd, "nuova", 0o755, 0, 0).unwrap();
         });
         timed(&mut || v.rename(root, "doc.txt", dd, "doc2.txt").unwrap());
-        assert!(slowest < Duration::from_millis(50), "slowest offline write op took {slowest:?}");
+        assert!(slowest < net_wait, "slowest offline write op took {slowest:?} (a network wait costs ≥ {net_wait:?})");
         assert!(v.handle().pending() >= 3);
         assert!(!be.files.lock().unwrap().contains_key("/scritto offline.txt"));
         // network back

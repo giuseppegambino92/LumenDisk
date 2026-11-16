@@ -30,6 +30,12 @@ pub struct NfsBridge<S: FileSystem + 'static> {
     /// caches otherwise make it refuse AppleDouble xattr writes). We report
     /// max(on-disk time, last change seen here).
     tracker: Arc<ChangeTracker>,
+    /// Group commit for stable replies; None: the stack has nothing to make durable on the
+    /// Mac (remote volumes, in-memory Shadow overlays).
+    durable: Option<Arc<GroupCommit>>,
+    /// WRITE / COMMIT verifier: random per server instance, so that after a restart the client
+    /// knows that UNSTABLE writes it never saw committed may be lost.
+    verifier: [u8; 8],
 }
 
 /// Per-volume timestamp bookkeeping shared between the NFS bridge and the runtime.
@@ -64,6 +70,111 @@ impl ChangeTracker {
     }
 }
 
+// ───────────────────────────── durability ─────────────────────────────
+
+/// Makes every operation answered so far durable on the Mac (journal / WAL written and
+/// `F_FULLFSYNC`ed). It is called without the volume lock and takes it only for its short
+/// phases, so the volume keeps serving requests while the cache flushes run.
+pub type DurableFn = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Group-commit coordinator, one per volume (RFC 1813 stable replies: metadata operations,
+/// FILE_SYNC / DATA_SYNC writes and COMMIT are answered only once their effect is durable).
+///
+/// A request needs the first round that *starts* after it finished its operation. When no
+/// round is running it runs one itself; otherwise it waits for the running round to end,
+/// and then the next round — run by one of the waiters — covers every request that arrived
+/// meanwhile: one `F_FULLFSYNC` for all of them. Rounds are cumulative (each one covers
+/// everything done before it started), so a later successful round also satisfies a
+/// request whose own round failed.
+pub struct GroupCommit {
+    make_durable: DurableFn,
+    st: Mutex<GcState>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct GcState {
+    started: u64,
+    finished: u64,
+    ok_upto: u64,
+    running: bool,
+    last_error: Option<String>,
+    waits: u64,
+}
+
+impl GroupCommit {
+    pub fn new(make_durable: DurableFn) -> Arc<GroupCommit> {
+        Arc::new(GroupCommit { make_durable, st: Mutex::new(GcState::default()), notify: tokio::sync::Notify::new() })
+    }
+
+    /// Return once everything done before the call is durable.
+    pub async fn wait(&self) -> Result<(), String> {
+        let need = {
+            let mut s = self.st.lock().unwrap_or_else(|e| e.into_inner());
+            s.waits += 1;
+            s.started + 1
+        };
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let lead = {
+                let mut s = self.st.lock().unwrap_or_else(|e| e.into_inner());
+                if s.finished >= need {
+                    return if s.ok_upto >= need { Ok(()) } else { Err(s.last_error.clone().unwrap_or_default()) };
+                }
+                if s.running {
+                    None
+                } else {
+                    s.running = true;
+                    s.started += 1;
+                    Some(s.started)
+                }
+            };
+            let Some(round) = lead else {
+                notified.await;
+                continue;
+            };
+            let r = tokio::task::block_in_place(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.make_durable)()))
+                    .unwrap_or_else(|p| Err(crate::vfs::fence::panic_message(p.as_ref())))
+            });
+            {
+                let mut s = self.st.lock().unwrap_or_else(|e| e.into_inner());
+                s.running = false;
+                s.finished = round;
+                match r {
+                    Ok(()) => s.ok_upto = round,
+                    Err(e) => {
+                        eprintln!("lumendisk: making changes durable failed: {e}");
+                        s.last_error = Some(e);
+                    }
+                }
+            }
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// (rounds run, requests that waited) — for tests and diagnostics.
+    pub fn stats(&self) -> (u64, u64) {
+        let s = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        (s.finished, s.waits)
+    }
+}
+
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUMENDISK_TRACE").is_some())
+}
+
+/// `LUMENDISK_TRACE=1`: log the durability-relevant calls with a timestamp.
+fn trace(what: std::fmt::Arguments) {
+    if trace_on() {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        eprintln!("lumendisk-trace: {:.6} {what}", t.as_secs_f64());
+    }
+}
+
 /// Is `disk` a plausible coarse-grained rendering of `want` (same instant within 2 s, or the
 /// same calendar day for date-only atimes)?
 fn same_coarse(disk: Timestamp, want: Timestamp, allow_day: bool) -> bool {
@@ -89,6 +200,16 @@ pub fn map_err(e: FsError) -> nfsstat3 {
     }
 }
 
+/// Does applying `s` to a file with attributes `a` change anything but ctime?
+fn setattr_changes(s: &SetAttr, a: &Attr) -> bool {
+    s.perm.is_some_and(|p| p != a.perm)
+        || s.uid.is_some_and(|u| u != a.uid)
+        || s.gid.is_some_and(|g| g != a.gid)
+        || s.size.is_some_and(|z| z != a.size)
+        || s.atime.is_some_and(|t| t != a.atime)
+        || s.mtime.is_some_and(|t| t != a.mtime)
+}
+
 fn ts(t: Timestamp) -> nfstime3 {
     nfstime3 { seconds: t.secs.clamp(0, u32::MAX as i64) as u32, nseconds: t.nsecs }
 }
@@ -102,7 +223,27 @@ impl<S: FileSystem + 'static> NfsBridge<S> {
         let secret = *uuid::Uuid::new_v4().as_bytes();
         // SAFETY: trivial libc getters.
         let (owner_uid, owner_gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        NfsBridge { fs, read_only, secret, owner_uid, owner_gid, fsid, tracker }
+        let mut verifier = [0u8; 8];
+        verifier.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+        NfsBridge { fs, read_only, secret, owner_uid, owner_gid, fsid, tracker, durable: None, verifier }
+    }
+
+    /// Answer stable requests only once `g` made them durable.
+    pub fn with_durability(mut self, g: Option<Arc<GroupCommit>>) -> Self {
+        self.durable = g;
+        self
+    }
+
+    /// Wait until every operation answered so far (this one included) is durable.
+    async fn durable(&self, what: &str) -> Result<(), nfsstat3> {
+        let Some(g) = &self.durable else { return Ok(()) };
+        if self.tracker.failure().is_some() {
+            return Err(nfsstat3::NFS3ERR_IO);
+        }
+        let t0 = std::time::Instant::now();
+        let r = g.wait().await.map_err(|_| nfsstat3::NFS3ERR_IO);
+        trace(format_args!("durable {what} in {:.2} ms", t0.elapsed().as_secs_f64() * 1000.0));
+        r
     }
 
     /// Record a content change (mtime + ctime) on `ids`.
@@ -283,7 +424,20 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         self.ro()?;
         let s = Self::to_setattr(&setattr);
-        let a = self.with(|fs| if s.is_empty() { fs.getattr(id) } else { fs.setattr(id, &s) })?;
+        let (a, changed) = self.with(|fs| {
+            let before = fs.getattr(id)?;
+            if s.is_empty() {
+                return Ok((before, false));
+            }
+            let after = fs.setattr(id, &s)?;
+            Ok((after, setattr_changes(&s, &before)))
+        })?;
+        // The macOS client repeats SETATTRs that change nothing (cp: the same mode up to three
+        // times per file). Those have nothing to make durable (apart from ctime) and don't
+        // wait for a group commit; the next one covers them.
+        if changed {
+            self.durable("SETATTR").await?;
+        }
         if s.mtime.is_some() || s.atime.is_some() {
             let mut ex = self.tracker.exact.lock().unwrap_or_else(|e| e.into_inner());
             let e = ex.entry(id).or_insert((None, None));
@@ -324,6 +478,29 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
         Ok(self.fattr(&a))
     }
 
+    async fn write_stable(&self, id: fileid3, offset: u64, data: &[u8], stable: stable_how) -> Result<(fattr3, stable_how), nfsstat3> {
+        let a = self.write(id, offset, data).await?;
+        trace(format_args!("WRITE {id} {offset}+{} {stable:?}", data.len()));
+        if stable == stable_how::UNSTABLE || self.durable.is_none() {
+            // Nothing stronger can be promised without a durability provider: the client
+            // COMMITs (which then has nothing to wait for either).
+            return Ok((a, stable_how::UNSTABLE));
+        }
+        self.durable("WRITE").await?;
+        // The whole volume state is durable, data and metadata: FILE_SYNC also covers DATA_SYNC.
+        Ok((a, stable_how::FILE_SYNC))
+    }
+
+    async fn commit(&self, id: fileid3, offset: u64, count: u32) -> Result<fattr3, nfsstat3> {
+        trace(format_args!("COMMIT {id} {offset}+{count}"));
+        self.durable("COMMIT").await?;
+        self.getattr(id).await
+    }
+
+    fn write_verifier(&self) -> writeverf3 {
+        self.verifier
+    }
+
     async fn create(&self, dirid: fileid3, filename: &filename3, attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
         self.ro()?;
         let name = name_of(filename)?;
@@ -340,6 +517,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
                 fs.setattr(ino, &s)
             }
         })?;
+        self.durable("CREATE").await?;
         self.touch(&[dirid, a.ino]);
         Ok((a.ino, self.fattr(&a)))
     }
@@ -349,6 +527,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
         let name = name_of(filename)?;
         let (uid, gid) = (self.owner_uid, self.owner_gid);
         let ino = self.with(|fs| fs.create(dirid, &name, 0o644, uid, gid))?;
+        self.durable("CREATE").await?;
         self.touch(&[dirid, ino]);
         Ok(ino)
     }
@@ -361,6 +540,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
             let ino = fs.mkdir(dirid, &name, 0o755, uid, gid)?;
             fs.getattr(ino)
         })?;
+        self.durable("MKDIR").await?;
         self.touch(&[dirid, a.ino]);
         Ok((a.ino, self.fattr(&a)))
     }
@@ -377,6 +557,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
             }
             Ok(ino)
         })?;
+        self.durable("REMOVE").await?;
         self.touch(&[dirid]);
         self.touch_meta(ino, false);
         Ok(())
@@ -390,6 +571,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
             fs.rename(from_dirid, &a, to_dirid, &b)?;
             Ok(m)
         })?;
+        self.durable("RENAME").await?;
         self.touch(&[from_dirid, to_dirid]);
         self.touch_meta(moved, false);
         Ok(())
@@ -426,6 +608,7 @@ impl<S: FileSystem + Send + 'static> NFSFileSystem for NfsBridge<S> {
             let ino = fs.symlink(dirid, &name, &target, uid, gid)?;
             fs.getattr(ino)
         })?;
+        self.durable("SYMLINK").await?;
         self.touch(&[dirid, a.ino]);
         Ok((a.ino, self.fattr(&a)))
     }
@@ -906,3 +1089,47 @@ tcp4       0      0  127.0.0.1.50101        127.0.0.1.11811        ESTABLISHED  
     }
 }
 
+
+#[cfg(test)]
+mod group_commit_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// Requests arriving while a round runs share the next one; a failed round fails only the
+    /// requests it was meant to cover.
+    #[test]
+    fn concurrent_requests_share_rounds() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let calls = Arc::new(AtomicU32::new(0));
+        let fail_next = Arc::new(AtomicBool::new(false));
+        let (c, f) = (calls.clone(), fail_next.clone());
+        let g = GroupCommit::new(Box::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            if f.swap(false, Ordering::SeqCst) {
+                Err("disk unplugged".into())
+            } else {
+                Ok(())
+            }
+        }));
+        rt.block_on(async {
+            let mut tasks = vec![];
+            for _ in 0..64 {
+                let g = g.clone();
+                tasks.push(tokio::spawn(async move { g.wait().await }));
+            }
+            for t in tasks {
+                t.await.unwrap().unwrap();
+            }
+        });
+        let rounds = calls.load(Ordering::SeqCst);
+        assert!((1..=3).contains(&rounds), "64 concurrent requests took {rounds} rounds");
+        assert_eq!(g.stats(), (rounds as u64, 64));
+        // A failing round reports the error to its waiters; the next request succeeds again.
+        fail_next.store(true, Ordering::SeqCst);
+        rt.block_on(async {
+            assert_eq!(g.wait().await, Err("disk unplugged".to_string()));
+            assert_eq!(g.wait().await, Ok(()));
+        });
+    }
+}
