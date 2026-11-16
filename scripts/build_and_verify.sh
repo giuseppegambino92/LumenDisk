@@ -214,7 +214,7 @@ if [ "$HAVE_DOCKER" = 1 ]; then
   run_suite "Persistent Shadow sessions: kill -9 with staged changes and during a commit, resume, e2fsck" shadow_persist_e2e --nocapture
   run_suite "Remote Shadow sessions: SFTP / WebDAV / LAN share, kill -9, restore, commit to the server, drift on server-side edits" remote_shadow_e2e --nocapture
   run_suite "Persistent Shadow on an attached block device (/dev/diskNs1, /dev/rdiskN): kill -9, resume, commit, e2fsck; raw-node I/O" device_shadow_e2e --nocapture
-  run_suite "Zero loss window: SIGKILL right after mkdir / create / rename / unlink / close / fsync, Shadow and read/write, e2fsck" durability_e2e --nocapture
+  run_suite "Zero loss window: SIGKILL right after mkdir / create / rename / unlink / close / fsync, Shadow and read/write, ext4 and FAT32, fsck" durability_e2e --nocapture
 
   if [ -n "${FULL:-}" ]; then
     bold "Long driver suites (ntfs-3g / kernel ntfs3 / vfat / exfat / fsck_msdos / fsck_exfat)"
