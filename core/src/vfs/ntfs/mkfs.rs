@@ -332,6 +332,13 @@ fn mkfs(dev: Arc<dyn BlockDev>, label: &str, cs: u64) -> FsResult<u32> {
     // in 512-byte units (and index VCNs count those units too).
     let cpb = if IBS as u64 >= cs { IBS as u64 / cs } else { IBS as u64 / 512 };
     let root_hdr = IndexRootHdr { ty: AT_FILE_NAME, collation: 1, block_size: IBS as u32, clusters_per_block: cpb as u8 };
+    // The view indexes ($Secure, $Quota, $ObjId, $Reparse) are stored as mkntfs writes them
+    // for 4 KiB clusters: their INDEX_ROOT header carries the same per-volume field.
+    let ir = |h: &str| {
+        let mut v = hex(h);
+        v[12] = cpb as u8;
+        v
+    };
     let mut bitmap_i30 = vec![0u8; 8];
     bitmap_i30[0] = 1;
     mk(
@@ -376,8 +383,8 @@ fn mkfs(dev: Arc<dyn BlockDev>, label: &str, cs: u64) -> FsResult<u32> {
             res(AT_STANDARD_INFORMATION, "", si72(now, vi, 0x101), 0),
             res(AT_FILE_NAME, "", f.clone(), 1),
             nonres(AT_DATA, "$SDS", run(sds_lcn, sds_cl), 0x400FC, cs),
-            res(AT_INDEX_ROOT, "$SDH", hex(SDH_ROOT), 0),
-            res(AT_INDEX_ROOT, "$SII", hex(SII_ROOT), 0),
+            res(AT_INDEX_ROOT, "$SDH", ir(SDH_ROOT), 0),
+            res(AT_INDEX_ROOT, "$SII", ir(SII_ROOT), 0),
         ],
         Some((true, f)),
     );
@@ -398,11 +405,11 @@ fn mkfs(dev: Arc<dyn BlockDev>, label: &str, cs: u64) -> FsResult<u32> {
     }
     let qa = hs | FILE_ATTR_ARCHIVE | FILE_ATTR_DUP_VIEW_INDEX;
     let f = fname(now, ext_ref, "$Quota", 0, 0, qa);
-    mk(24, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$O", hex(QUOTA_O_ROOT), 0), res(AT_INDEX_ROOT, "$Q", hex(QUOTA_Q_ROOT), 0)], Some((false, f)));
+    mk(24, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$O", ir(QUOTA_O_ROOT), 0), res(AT_INDEX_ROOT, "$Q", ir(QUOTA_Q_ROOT), 0)], Some((false, f)));
     let f = fname(now, ext_ref, "$ObjId", 0, 0, qa);
-    mk(25, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$O", hex(OBJID_O_ROOT), 0)], Some((false, f)));
+    mk(25, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$O", ir(OBJID_O_ROOT), 0)], Some((false, f)));
     let f = fname(now, ext_ref, "$Reparse", 0, 0, qa);
-    mk(26, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$R", hex(REPARSE_R_ROOT), 0)], Some((false, f)));
+    mk(26, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$R", ir(REPARSE_R_ROOT), 0)], Some((false, f)));
 
     // $Extend (needs its children's names for the index)
     let sort_entries = |v: &mut Vec<(u64, Vec<u8>)>| {

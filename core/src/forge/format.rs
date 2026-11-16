@@ -320,16 +320,43 @@ pub fn preflight(index: usize, fs: TargetFs, size: u64, sector: u64, opts: &Mkfs
         Err(ForgeError::Io(e)) if e.contains("dry run budget") => Ok(()),
         Err(ForgeError::Invalid(e)) => {
             let what = cluster.map(|c| format!("{name}, cluster {}", human(c))).unwrap_or_else(|| name.to_string());
-            refuse(
-                format!("impossibile creare {what} su {}: {e}", human_size(size)),
-                format!("can't create {what} on {}: {e}", human_size(size)),
-            )
+            let on = human_size(size);
+            // The usual reasons, in the user's language; the driver's own words otherwise.
+            if let (Some(c), Some((min, max))) = (cluster, fat_cluster_counts(fs)) {
+                let n = size / c;
+                if n < min {
+                    return refuse(
+                        format!("con cluster da {} su {on} ci sono circa {n} cluster, ma {name} ne richiede almeno {min}: scegli cluster più piccoli", human(c)),
+                        format!("{} clusters on {on} make about {n} clusters, but {name} needs at least {min}: choose smaller clusters", human(c)),
+                    );
+                }
+                if n > max {
+                    return refuse(
+                        format!("con cluster da {} su {on} ci sarebbero circa {n} cluster, più dei {max} ammessi da {name}: scegli cluster più grandi", human(c)),
+                        format!("{} clusters on {on} would make about {n} clusters, more than the {max} {name} allows: choose larger clusters", human(c)),
+                    );
+                }
+            }
+            if e.contains("too small") {
+                return refuse(format!("{on} sono troppo pochi per {what}"), format!("{on} is too small for {what}"));
+            }
+            refuse(format!("impossibile creare {what} su {on}: {e}"), format!("can't create {what} on {on}: {e}"))
         }
         Err(ForgeError::Unsupported(e)) => Err(ForgeError::Unsupported(t(
             &format!("partizione {index}: {name} non è ancora disponibile ({e})"),
             &format!("partition {index}: {name} is not available yet ({e})"),
         ))),
         Err(e) => Err(e),
+    }
+}
+
+/// Valid cluster counts for the FAT types (see `fat_fs::cluster_count_range`).
+fn fat_cluster_counts(fs: TargetFs) -> Option<(u64, u64)> {
+    use crate::vfs::{fat_fs, FsType};
+    match fs {
+        TargetFs::Fat16 => Some(fat_fs::cluster_count_range(FsType::Fat16)),
+        TargetFs::Fat32 => Some(fat_fs::cluster_count_range(FsType::Fat32)),
+        _ => None,
     }
 }
 
