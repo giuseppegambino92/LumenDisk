@@ -72,6 +72,8 @@ if [ -z "${SKIP_E2E:-}" ] && docker info >/dev/null 2>&1; then
   docker build -q -t lumendisk-toolbox scripts/docker >/dev/null
   ok "Docker toolbox image (e2fsprogs, ntfs-3g, dosfstools, exfatprogs, openssh-server) ready"
 fi
+# FULL=1 asks for every suite: without Docker that is impossible, so say so instead of skipping.
+[ -z "${FULL:-}" ] || [ "$HAVE_DOCKER" = 1 ] || die "FULL=1 needs Docker running (and no SKIP_E2E): start Docker Desktop"
 
 bold "Rust core (universal static library + CLI)"
 for T in aarch64-apple-darwin x86_64-apple-darwin; do
