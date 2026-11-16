@@ -253,6 +253,53 @@ actor CoreBridge {
         try await checked(HealthReply.self) { ld_disk_health(bsdName) }.health
     }
 
+    // MARK: - Forge (1.1): format, flash, wipe, checksums, partition doctor
+
+    /// Starts a job from a request (JSON built by `ForgeRequest`); returns its id.
+    func forgeStart(_ request: ForgeRequest) async throws -> UInt64 {
+        let json = try request.json()
+        return try await forgeChecked(ForgeStartReply.self) { ld_forge_start(json) }.job
+    }
+
+    /// The job's snapshot with the log lines after `since`.
+    func forgeStatus(job: UInt64, since: UInt64) async throws -> ForgeSnapshot {
+        try await forgeChecked(ForgeSnapshot.self) { ld_forge_status(job, since) }
+    }
+
+    func forgeCancel(job: UInt64) async throws {
+        _ = try await forgeChecked(Empty.self) { ld_forge_cancel(job) }
+    }
+
+    func forgeForget(job: UInt64) async throws {
+        _ = try await forgeChecked(Empty.self) { ld_forge_forget(job) }
+    }
+
+    /// Every whole disk with the core's verdict (runs `diskutil` for each: may take seconds).
+    func forgeDisks() async throws -> [ForgeDisk] {
+        try await forgeChecked(ForgeDisksReply.self) { ld_forge_disks() }.disks
+    }
+
+    /// Quick inspection of an image for the drop zone (never hashes; bounded decompression).
+    func forgeInspect(path: String) async throws -> ImageInspection {
+        try await forgeChecked(ImageInspection.self) { ld_forge_inspect(path) }
+    }
+
+    /// Like `checked`, but the payload is decoded with the forge decoder (explicit snake_case
+    /// keys, no key conversion: job results are free-form objects).
+    private func forgeChecked<T: Decodable & Sendable>(
+        _ type: T.Type,
+        _ body: @escaping @Sendable () -> UnsafeMutablePointer<CChar>?
+    ) async throws -> T {
+        guard initialized else { throw CoreError.notInitialized }
+        let data = try await call(body)
+        _ = try Self.decode(Empty.self, from: data)   // envelope: "ok" / "error"
+        do {
+            return try ForgeJSON.decode(type, from: data)
+        } catch {
+            throw CoreError.malformedResponse(String(describing: error))
+        }
+    }
+
     // MARK: - Plumbing
 
     /// Runs `body` on the FFI queue, copies the returned C string and frees it.

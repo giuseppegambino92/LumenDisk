@@ -186,6 +186,10 @@ enum DebugHooks {
         case "ghost": model.selection = .ghost
         case "images": model.selection = .images
         case "rules": model.selection = .rules
+        case "forge": model.selection = .forge
+        case _ where value.hasPrefix("forge:"):
+            if let tool = ForgeCenter.Tool(rawValue: String(value.dropFirst(6))) { model.forge.tool = tool }
+            model.selection = .forge
         case "network": model.selection = .network
         case _ where value.hasPrefix("peer"):
             let index = Int(value.dropFirst(4)) ?? 0
@@ -239,6 +243,7 @@ enum DebugHooks {
     ///   select <spec> · sheet <spec> · lang <it|en> · appearance <dark|light> · tech <on|off>
     ///   scroll <top|bottom> · speedtest <name> · popover <show|hide> · window <w>x<h>
     ///   mount-physical <mode> · eject <name> · refresh · quit
+    ///   forge <verb> … (see `forge(_:_:)`): Create & Format and the disk utilities
     private static func watchControlFile(_ path: String, _ model: AppModel) {
         Task {
             while true {
@@ -293,8 +298,126 @@ enum DebugHooks {
             if let v = model.volumes.first(where: { model.portal(for: $0) != nil })?.id {
                 await model.setPortalPlainHTTP(v, enabled: arg == "on")
             }
+        case "forge": await forge(arg, model)
         case "quit": await quit(model)
         default: NSLog("DEBUG: unknown command \(line)")
+        }
+    }
+
+    // MARK: Forge (Create & Format, utilities)
+
+    /// `forge <verb> [args]`: drives the Forge screens through ForgeCenter, i.e. the same calls
+    /// the buttons make (and the same rules: a refused disk can't be selected, nothing starts
+    /// without the confirmation sheet being confirmed). Every job runs in the real core.
+    private static func forge(_ line: String, _ model: AppModel) async {
+        let forge = model.forge
+        let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+        let verb = parts.first ?? "", arg = parts.count > 1 ? parts[1] : ""
+        switch verb {
+        case "tool":
+            if let tool = ForgeCenter.Tool(rawValue: arg) { forge.tool = tool }
+        case "disks":
+            forge.activate()
+            await forge.refreshDisks()
+            NSLog("DEBUG: forge disks: \(forge.disks.map { "\($0.bsd)=\(ForgeDiskRules.canSelect($0) ? "allowed" : "refused")" }.joined(separator: " "))")
+        case "target":
+            // target <bsd> [tool]: waits (a few refreshes) for the disk to be listed.
+            let f = arg.split(separator: " ").map(String.init)
+            guard let bsd = f.first else { return }
+            let tool = f.count > 1 ? (ForgeCenter.Tool(rawValue: f[1]) ?? forge.tool) : forge.tool
+            forge.activate()
+            for _ in 0..<6 where forge.disk(bsd) == nil {
+                await forge.refreshDisks()
+                if forge.disk(bsd) == nil { try? await Task.sleep(for: .seconds(1)) }
+            }
+            guard let disk = forge.disk(bsd) else { NSLog("DEBUG: forge target \(bsd): not listed"); return }
+            NSLog("DEBUG: forge target \(bsd) for \(tool.rawValue): selected=\(forge.select(disk, for: tool)) refusal=\(disk.refusal ?? "-")")
+        case "target-refused":
+            // Tries to select a refused disk, as a click would: it must not become the target.
+            guard let disk = forge.disks.first(where: { !ForgeDiskRules.canSelect($0) }) else { NSLog("DEBUG: forge no refused disk listed"); return }
+            let before = forge.plan.targetBSD
+            let ok = forge.select(disk, for: .create)
+            NSLog("DEBUG: forge refused \(disk.bsd) selectable=\(ok) target-unchanged=\(forge.plan.targetBSD == before)")
+        case "image":
+            await forge.loadImage(URL(fileURLWithPath: arg))
+            NSLog("DEBUG: forge inspected \(forge.inspection.map { "\($0.fileName) \($0.format) mode=\($0.recommendedMode.rawValue) hybrid=\($0.iso?.hybrid ?? false)" } ?? "FAILED: \(forge.inspectError ?? "-")")")
+        case "clear-image": forge.clearImage()
+        case "drawer":
+            forge.drawerOpen = arg != "closed"
+            forge.showAllSections = arg == "all"
+        case "drawer-scroll": forge.drawerScrollTarget = arg.isEmpty ? nil : arg
+        case "logs": forge.logDrawerOpen = arg != "closed"
+        case "format":
+            // format <scheme> <fs> [label]
+            let f = arg.split(separator: " ", maxSplits: 2).map(String.init)
+            forge.clearImage()
+            if let scheme = f.first.flatMap(ForgeScheme.init(rawValue:)) { forge.plan.scheme = scheme }
+            if f.count > 1, let fs = ForgeFS(rawValue: f[1]) { forge.plan.primary.setFilesystem(fs) }
+            forge.plan.primary.label = f.count > 2 ? f[2] : ""
+            forge.plan.addSecond = false
+        case "mode": if let mode = ForgeWriteMode(rawValue: arg) { forge.plan.mode = mode }
+        case "verify": forge.plan.verify = arg != "off"
+        case "eject": forge.plan.eject = arg != "off"
+        case "checksum": forge.plan.expectedChecksum = arg
+        case "demo-options":
+            // Sample values typed in the Windows / Linux / Raspberry Pi sections (UI state only;
+            // the Wi-Fi fields are left invalid on purpose to show the inline validation).
+            forge.plan.windows.bypassHardwareChecks = true
+            forge.plan.windows.localAccount = true
+            forge.plan.windows.accountName = "Mario"
+            forge.plan.windows.skipPrivacy = true
+            forge.plan.windows.locale = L("it-IT", "en-GB")
+            forge.plan.windows.timeZone = "Europe/Rome"
+            forge.plan.linux.persistence = true
+            forge.plan.rpi.enabled = true
+            forge.plan.rpi.hostname = "lumenpi"
+            forge.plan.rpi.user = "mario"
+            forge.plan.rpi.ssh = true
+            forge.plan.rpi.wifi = true
+            forge.plan.rpi.ssid = "Casa"
+            forge.plan.rpi.wifiPassword = "short"
+            forge.plan.rpi.country = ""
+        case "reset-options":
+            let target = forge.plan.targetBSD
+            forge.plan = ForgePlan()
+            forge.plan.targetBSD = target
+        case "prepare":
+            let ok = forge.prepareCreate()
+            NSLog("DEBUG: forge prepare ok=\(ok) issues=\(forge.createIssues.map(\.message))")
+        case "go":
+            // The confirmation sheet's checkbox + destructive button.
+            guard let c = forge.confirmation else { NSLog("DEBUG: forge go: nothing to confirm"); return }
+            forge.confirmationAcknowledged = true
+            await forge.confirmPending()
+            NSLog("DEBUG: forge confirmed \(c.request.op) on \(c.disk.bsd): job=\(forge.jobs[c.tool].map { "\($0.id)" } ?? "none") error=\(forge.startErrors[c.tool] ?? "-")")
+        case "cancel-sheet": forge.confirmation = nil
+        case "wait":
+            // wait <tool> [seconds]
+            let f = arg.split(separator: " ").map(String.init)
+            let tool = f.first.flatMap(ForgeCenter.Tool.init(rawValue:)) ?? forge.tool
+            let secs = f.count > 1 ? (Double(f[1]) ?? 120) : 120
+            guard let job = await forge.waitForJob(tool, timeout: .seconds(secs)) else { NSLog("DEBUG: forge wait \(tool.rawValue): no job"); return }
+            let result = (try? job.snapshot?.result.map { try ForgeJSON.encode($0) }) ?? nil
+            NSLog("DEBUG: forge job \(job.id) \(job.kind) state=\(job.state.rawValue) phases=\(job.snapshot?.phases.map(\.rawValue).joined(separator: ",") ?? "-") logs=\(job.logs.count) error=\(job.errorMessage ?? "-") result=\(result ?? "null")")
+        case "done":
+            if let tool = ForgeCenter.Tool(rawValue: arg) { await forge.dismiss(tool) }
+        case "hash":
+            // hash <path>: SHA-256 + SHA-1 + MD5 of a file
+            forge.tool = .hash
+            forge.hashDraft.source = .file(arg)
+            forge.hashDraft.algorithms = Set(HashAlgorithm.allCases)
+            await forge.startHash()
+            NSLog("DEBUG: forge hash started job=\(forge.jobs[.hash].map { "\($0.id)" } ?? "none") error=\(forge.startErrors[.hash] ?? "-")")
+        case "hash-source": forge.hashDraft.source = .file(arg)
+        case "hash-algos":
+            forge.hashDraft.algorithms = Set(arg.split(separator: ",").compactMap { HashAlgorithm(rawValue: String($0)) })
+        case "hash-compare": forge.hashDraft.compareWith = arg
+        case "wipe-method": if let m = WipeMethod(rawValue: arg) { forge.wipeMethod = m }
+        case "doctor-check":
+            forge.tool = .doctor
+            NSLog("DEBUG: forge doctor check started=\(forge.prepareDoctor(.check))")
+            try? await Task.sleep(for: .milliseconds(300))
+        default: NSLog("DEBUG: unknown forge command \(line)")
         }
     }
 
@@ -326,6 +449,8 @@ enum DebugHooks {
         // Automated runs leave nothing mounted: Shadow changes made by the test are discarded
         // (the core refuses to eject a volume that still has some).
         for v in model.pendingShadowVolumes { _ = await model.rollbackShadow(v) }
+        model.forge.confirmation = nil
+        await model.forge.cancelAllAndWait()
         model.activeSheet = nil   // an open sheet would hold up NSApp.terminate
         model.showCreateWizard = false
         model.lockInspection = nil
