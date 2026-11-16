@@ -1,0 +1,17 @@
+# Set by LumenDisk (Raspberry Pi Imager conventions): netplan v2, applied by cloud-init on first boot.
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      dhcp6: true
+      optional: true
+  wifis:
+    wlan0:
+      dhcp4: true
+      regulatory-domain: "IT"
+      access-points:
+        "Casa \"Rossi\" ✓":
+          hidden: true
+          password: "p@ss w'rd\\$(x)"
+      optional: true

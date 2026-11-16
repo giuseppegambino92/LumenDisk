@@ -1,0 +1,34 @@
+#cloud-config
+
+# This is the user-data configuration file for cloud-init.
+#hostname: raspberrypi
+
+# Set by LumenDisk (Raspberry Pi Imager 2.0.12 conventions)
+manage_resolv_conf: false
+hostname: "pi-lab"
+manage_etc_hosts: true
+packages:
+  - avahi-daemon
+apt:
+  preserve_sources_list: true
+  conf: |
+    Acquire {
+      Check-Date "false";
+    };
+timezone: "Europe/Rome"
+keyboard:
+  model: pc105
+  layout: "it"
+locale: "it_IT.UTF-8"
+user:
+  name: "mario"
+  shell: /bin/bash
+  lock_passwd: false
+  passwd: "$6$LumenDiskTest$golden"
+  ssh_authorized_keys:
+    - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGx1bWVuZGlzay10ZXN0LWtleS0wMDAwMDAw mario@mac"
+    - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7 it's-me"
+  sudo: null
+ssh_pwauth: false
+runcmd:
+  - [ systemctl, enable, --now, ssh ]

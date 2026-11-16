@@ -32,6 +32,10 @@ rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 quick-xml = "0.36"
 base64 = "0.22"
 sha2 = "0.10"
+# Forge: OS CSPRNG for crypt salts and wipe keys (already in the tree through uuid), and a fast
+# reproducible ChaCha20 keystream for random wipe passes (regenerated to verify the last pass).
+getrandom = "0.2"
+rand_chacha = "0.3"
 httpdate = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 # Forge source images (forge/image.rs), all pure Rust (no C toolchain, no system libraries):
