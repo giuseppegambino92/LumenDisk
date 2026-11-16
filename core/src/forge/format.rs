@@ -582,20 +582,26 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_filesystems_fail_before_writing() {
+    fn linux_and_bsd_filesystems_format_or_are_refused_before_writing() {
+        // 64 MiB: below the Btrfs (≈109 MiB) and XFS (300 MiB) minimums, above F2FS's and UFS2's.
         for fs in [TargetFs::Btrfs, TargetFs::Xfs, TargetFs::F2fs, TargetFs::Ufs2] {
             let m = Arc::new(MemDev::new(64 << 20));
             m.write_at(0, &[0x5A; 512]).unwrap();
             match fmt(m.clone(), &req(Scheme::Gpt, vec![spec(fs, None, "x", None)])) {
-                // Still a stub: refused cleanly with the disk untouched.
-                Err(ForgeError::Unsupported(e)) => {
-                    assert!(e.contains(fs.display_name()), "{e}");
-                    assert_eq!(m.snapshot()[..512], [0x5A; 512]);
+                Err(e) => {
+                    assert!(matches!(fs, TargetFs::Btrfs | TargetFs::Xfs), "{fs:?}: {e}");
+                    assert_eq!(m.snapshot()[..512], [0x5A; 512], "{fs:?}: refused, so the disk must be untouched");
                 }
-                // Implemented by its workstream meanwhile.
-                Ok(v) => assert_eq!(v["partitions"][0]["fs"], serde_json::to_value(fs).unwrap()),
-                Err(e) => panic!("{fs:?}: {e}"),
+                Ok(v) => {
+                    assert!(matches!(fs, TargetFs::F2fs | TargetFs::Ufs2), "{fs:?} should not fit in 64 MiB");
+                    assert_eq!(v["partitions"][0]["fs"], serde_json::to_value(fs).unwrap());
+                }
             }
+        }
+        for fs in [TargetFs::Btrfs, TargetFs::Xfs] {
+            let m: Arc<dyn BlockDev> = Arc::new(MemDev::new(320 << 20));
+            let v = fmt(m, &req(Scheme::Gpt, vec![spec(fs, None, "x", None)])).unwrap_or_else(|e| panic!("{fs:?}: {e}"));
+            assert_eq!(v["partitions"][0]["fs"], serde_json::to_value(fs).unwrap());
         }
     }
 

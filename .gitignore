@@ -8,6 +8,7 @@
 
 # Disk images and test data
 *.img
+!/core/src/forge/windows/res/uefi-ntfs.img
 *.dmg
 *.wal
 *.stage

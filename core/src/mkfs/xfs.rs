@@ -977,7 +977,12 @@ fn write_image(dev: &dyn BlockDev, img: &Image) -> FsResult<()> {
 }
 
 pub fn format(dev: Arc<dyn BlockDev>, opts: &MkfsOptions) -> FsResult<()> {
-    format_with_sector(dev, opts, 512)
+    // The device's logical sector (4096 on 4Kn disks): the kernel refuses a smaller one.
+    let sect = match dev.logical_sector_size() {
+        Some(4096) => 4096,
+        _ => 512,
+    };
+    format_with_sector(dev, opts, sect)
 }
 
 /// Like [`format`] for a device whose logical sector is `sectsize` bytes (512 or 4096): XFS
