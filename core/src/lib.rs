@@ -259,3 +259,7 @@ pub extern "C" fn ld_free_string(s: *mut c_char) {
 // ───────────────────────────── Phase 2 (network & remote) ─────────────────────────────
 
 pub mod ffi2;
+
+// ───────────────────────────── Forge (1.1) ─────────────────────────────
+
+pub mod forge_ffi;

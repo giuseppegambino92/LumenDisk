@@ -223,6 +223,14 @@ pub struct HashRequest {
     /// "sha256", "sha1", "md5" (default: all three).
     #[serde(default)]
     pub algorithms: Vec<String>,
+    /// For a compressed image / container: also hash the decompressed image (default false).
+    #[serde(default)]
+    pub decompressed: bool,
+    /// Hash only a byte range of the file / disk (default: all of it).
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub length: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
