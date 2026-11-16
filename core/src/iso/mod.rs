@@ -192,6 +192,12 @@ impl IsoTree {
         Ok(out)
     }
 
+    /// The file whose data starts at byte `pos` of the image (an El Torito boot image is
+    /// normally also a file of the tree), if any.
+    pub fn path_at(&self, pos: u64) -> Option<&str> {
+        self.nodes.iter().find(|n| matches!(&n.data, Data::Extents(e) if e.first().is_some_and(|x| x.pos == pos && !x.sparse))).map(|n| n.path.as_str())
+    }
+
     /// The device the image is read from.
     pub fn device(&self) -> &Arc<dyn BlockDev> {
         &self.dev

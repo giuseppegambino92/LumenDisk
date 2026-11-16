@@ -73,6 +73,7 @@ struct TNode {
 }
 
 /// Builder. Paths are absolute ("/a/b.txt"); parents are created as needed.
+#[derive(Clone)]
 pub struct IsoBuilder {
     label: String,
     rock: bool,

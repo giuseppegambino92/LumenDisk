@@ -1,0 +1,17 @@
+Unmodified binaries from the official SYSLINUX 6.03 release (bios/ build products shipped in
+the release tarball), embedded by LumenDisk's ISO mode to make FAT32 USB media BIOS-bootable.
+
+  Source:   https://www.kernel.org/pub/linux/utils/boot/syslinux/syslinux-6.03.tar.xz
+  SHA-256:  26d3986d2bea109d5dc0e4f8c4822a459276cf021125e8c9f23c3cca5d8c850e
+            (matches kernel.org's signed sha256sums.asc, "Kernel.org checksum autosigner",
+            key B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1)
+  License:  GNU GPL version 2 or later (see COPYING in the tarball); the corresponding source
+            code is the tarball above.
+  Copyright 1994-2014 H. Peter Anvin et al.
+
+Files: bios/core/ldlinux.sys, bios/core/ldlinux.bss, bios/mbr/mbr.bin,
+bios/com32/elflink/ldlinux/ldlinux.c32, bios/com32/lib/libcom32.c32,
+bios/com32/libutil/libutil.c32, bios/com32/cmenu/libmenu/libmenu.c32,
+bios/com32/gpllib/libgpl.c32, bios/com32/menu/{menu,vesamenu}.c32, bios/com32/chain/chain.c32,
+bios/com32/mboot/mboot.c32, bios/com32/gfxboot/gfxboot.c32, bios/com32/hdt/hdt.c32,
+bios/com32/modules/*.c32.
