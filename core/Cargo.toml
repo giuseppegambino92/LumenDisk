@@ -34,6 +34,21 @@ base64 = "0.22"
 sha2 = "0.10"
 httpdate = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+# Forge source images (forge/image.rs), all pure Rust (no C toolchain, no system libraries):
+# gzip / zip deflate / DMG zlib (miniz_oxide backend), XZ / DMG LZMA (no encoder in the app),
+# bzip2 (libbz2-rs-sys, the Rust port of libbzip2), zstd (decoder only), DMG LZFSE,
+# CRC-32 for ZIP and XZ index records.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz", "optimization"] }
+bzip2 = "0.6"
+ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"] }
+lzfse_rust = "0.2"
+crc32fast = "1"
+# Forge checksums (forge/hash.rs): same `digest` 0.10 family as sha2.
+sha1 = "0.10"
+md-5 = "0.10"
 
 [dev-dependencies]
 libc = "0.2"
+# Tests build XZ images (the app itself only decodes).
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz", "optimization", "encoder"] }
