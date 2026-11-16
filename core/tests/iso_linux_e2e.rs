@@ -15,7 +15,8 @@
 //! distributions' signed checksum lists) are cached in `~/.cache/lumendisk-test/iso`.
 //!
 //! Test-only boot configuration patch (documented, applied to the written image, never by ISO
-//! mode itself): `console=ttyS0,115200` on the kernel command lines, a finite menu timeout
+//! mode itself): `console=ttyS0,115200` on the kernel command lines, `serial 0 115200` in the
+//! SYSLINUX configuration when it has no SERIAL directive, a finite menu timeout
 //! where the ISO waits forever (Debian: ISOLINUX `timeout 0`, GRUB without `timeout`), so the
 //! boot can be watched and driven over the serial console.
 
@@ -154,13 +155,14 @@ fn reader_listing(t: &mut iso::IsoTree, lower: bool) -> Vec<String> {
 
 /// List `image` (in `dir`) through an independent implementation in the container: a kernel
 /// mount (`fstype` iso9660 / udf, with `mount_opts`), or, for Joliet (the Docker Desktop kernel
-/// is built without CONFIG_JOLIET), 7-Zip's ISO handler, which reads the Joliet tree.
+/// is built without CONFIG_JOLIET), 7-Zip's ISO handler, which reads the Joliet tree (minus the
+/// `[BOOT]` folder it synthesises from El Torito).
 fn kernel_listing(dir: &Path, image: &str, fstype: &str, mount_opts: &str, lower: bool) -> Vec<String> {
     std::fs::write(dir.join("lister.py"), LISTER).unwrap();
     let list = format!("PYTHONIOENCODING=utf-8:surrogateescape python3 /w/lister.py {{}} {} > /w/kernel.txt", if lower { "lower" } else { "" });
     let script = if fstype == "joliet" {
         format!(
-            "set -e; export LANG=C.UTF-8; rm -rf /tmp/x; 7z x -tiso -o/tmp/x /w/{image} >/tmp/7z.log 2>&1 || {{ cat /tmp/7z.log; exit 1; }}; {}",
+            "set -e; export LANG=C.UTF-8; rm -rf /tmp/x; 7z x -tiso -o/tmp/x /w/{image} >/tmp/7z.log 2>&1 || {{ cat /tmp/7z.log; exit 1; }}; rm -rf '/tmp/x/[BOOT]'; {}",
             list.replace("{}", "/tmp/x")
         )
     } else {
@@ -540,6 +542,11 @@ fn test_console_patch(image: &Path) {
                 out.push_str(line);
             }
         }
+        // SYSLINUX prints on the VGA console only, unless told to use the serial port too.
+        let lname = f.to_lowercase();
+        if (lname.ends_with("/syslinux.cfg") || lname.ends_with("/isolinux.cfg")) && !out.to_lowercase().lines().any(|l| l.trim_start().starts_with("serial ")) {
+            out = format!("serial 0 115200\n{out}");
+        }
         // GRUB menus without a timeout wait forever.
         if f.to_lowercase().ends_with("grub/grub.cfg") && !out.contains("set timeout") {
             out = format!("set timeout=3\n{out}");
@@ -595,6 +602,8 @@ fn it_iso_mode_debian_live_persistence_survives_a_power_cycle() {
     let steps = vec![
         step("SYSLINUX 6.03", None, 300),
         step("user@debian:~\\$ $", Some(&format!("grep -o persistence /proc/cmdline; echo {marker} > ~/persist.txt; sync; sudo poweroff\n")), 2400),
+        // `grep -o` printed the parameter ISO mode added: the live system runs with persistence.
+        step("\npersistence\r?\n", None, 60),
     ];
     boot(&dir, "debian.img", Firmware::SeaBios, &steps, &auto, true, "debian-bios");
     // Second boot: UEFI (GRUB from the ISO). The file must still be there.
