@@ -411,13 +411,19 @@ for boot in range(1, 6):
         return None
     def send(s):
         p.stdin.write(s.encode()); p.stdin.flush()
-    m = wait(rb"([A-Za-z0-9-]+) login: ", deadline_s)
-    if m is None:
-        p.wait(timeout=30) if p.poll() is not None else None
-        if p.poll() is not None:
-            print("boot %d: QEMU exited (guest rebooted), %.0f s left" % (boot, t_end - time.time()), flush=True)
+    # Without the watchdog driver the BCM2835 has no restart handler: a guest reboot stops at
+    # "reboot: Restarting system" (filesystems already synced and unmounted). QEMU is then
+    # stopped here and started again for the next boot.
+    m = wait(rb"([A-Za-z0-9-]+) login: |reboot: Restarting system", deadline_s)
+    if m is None or m.group(0).startswith(b"reboot:"):
+        time.sleep(3)
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+        if m is not None or time.time() < t_end:
+            print("boot %d: guest rebooted after %.0f s" % (boot, deadline_s - (t_end - time.time())), flush=True)
             continue
-        print("no login prompt in time", flush=True); p.kill(); sys.exit(2)
+        print("no login prompt in time", flush=True); sys.exit(2)
     name = m.group(1).decode()
     print("boot %d: login prompt of %r" % (boot, name), flush=True)
     if name != host:
