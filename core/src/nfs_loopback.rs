@@ -786,7 +786,16 @@ pub fn unmount(mountpoint: &Path, force: bool) -> Result<(), String> {
     if force {
         cmd.arg("-f");
     }
-    let out = cmd.arg(mountpoint).output().map_err(|e| e.to_string())?;
+    let mut out = cmd.arg(mountpoint).output().map_err(|e| e.to_string())?;
+    // Right after a large write the NFS client can answer EBUSY for a moment, with no process
+    // holding the volume. A normal eject retries briefly (≤ 3 s) before reporting "in use".
+    let t0 = std::time::Instant::now();
+    let mut pause = std::time::Duration::from_millis(50);
+    while !force && !out.status.success() && is_mountpoint(mountpoint) && t0.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(500));
+        out = Command::new("/sbin/umount").arg(mountpoint).output().map_err(|e| e.to_string())?;
+    }
     if out.status.success() || !is_mountpoint(mountpoint) {
         return Ok(());
     }
