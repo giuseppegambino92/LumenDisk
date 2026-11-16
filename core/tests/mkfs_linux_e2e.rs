@@ -70,18 +70,27 @@ fn script(c: &Case) -> String {
     };
     let dump = match c.fs {
         Fs::Btrfs => "step dump_super btrfs inspect-internal dump-super -f /w/disk.img;",
-        Fs::Xfs => "step xfs_db xfs_db -r -c 'sb 0' -c print -c 'agf 0' -c print -c 'agi 0' -c print /w/disk.img;",
+        // xfs_logprint must find our unmount record where the superblock says the log is:
+        // a log the kernel can't find gets overwritten by file data, and the unmount then
+        // hangs forever in the kernel (seen while developing).
+        Fs::Xfs => "step xfs_db xfs_db -r -c 'sb 0' -c print -c 'agf 0' -c print -c 'agi 0' -c print /w/disk.img; \
+                    step logprint sh -c 'xfs_logprint -t /w/disk.img 2>&1; xfs_logprint -t /w/disk.img 2>&1 | grep -q \"state: <CLEAN>\"';",
     };
     let losetup = if c.sector == 512 { "losetup -f --show /w/disk.img".to_string() } else { format!("losetup -b {} -f --show /w/disk.img", c.sector) };
     // Big file: 100 MB, or a quarter of the filesystem on the smallest images.
     let big = (100 * 1000 * 1000).min(c.size / 4);
     format!(
         r##"
-step() {{ name=$1; shift; echo ">>> $name: $*"; "$@" 2>&1; rc=$?; echo "@@ $name rc=$rc"; }}
+step() {{ name=$1; shift; echo ">>> $name: $*"; "$@" 2>&1; rc=$?; echo "@@ $name rc=$rc"; [ $rc -eq 0 ] || FAILED=1; }}
+# Run a command that may block in the kernel (sync, umount) for at most 120 s; a stuck one
+# can't be killed, so report it and stop instead of waiting forever.
+bounded() {{ "$@" & p=$!; i=0; while kill -0 $p 2>/dev/null; do i=$((i+1)); if [ $i -gt 1200 ]; then echo "HUNG: $* (kernel task stuck)"; exit 3; fi; sleep 0.1; done; wait $p; }}
 cd /w
 {check}
 {dump}
 step blkid blkid -p -o export /w/disk.img
+# Never hand the kernel a filesystem the tools already rejected.
+[ -z "$FAILED" ] || exit 0
 LOOP=$({losetup})
 echo "loop: $LOOP"
 DEV=$(basename $LOOP)
@@ -93,14 +102,14 @@ step bigfile sh -c 'head -c {big} /dev/urandom > /mnt/t/big.bin && sha256sum /mn
 step copy cp -a /mnt/t/dir /mnt/t/dir2
 step rm sh -c 'rm -f /mnt/t/dir2/f1*'
 step df df -k /mnt/t
-step sync sync
-step umount umount /mnt/t
+step sync bounded sync -f /mnt/t
+step umount bounded umount /mnt/t
 losetup -d $LOOP 2>/dev/null
 {check}
 LOOP=$({losetup})
 step mount_ro mount -o ro $LOOP /mnt/t
 step verify sh -c 'test "$(sha256sum /mnt/t/big.bin | cut -d" " -f1)" = "$(cat /w/big.sha)" && test $(ls /mnt/t/dir | wc -l) -eq 401 && test $(ls /mnt/t/dir2 | wc -l) -eq 290 && test "$(cat /mnt/t/link)" = "file number 1"'
-step umount_ro umount /mnt/t
+step umount_ro bounded umount /mnt/t
 losetup -d $LOOP 2>/dev/null
 # Kernel messages about our loop device since the first mount (checked by the caller).
 dmesg | awk -v t=$T0 '{{ ts = substr($0, 2, index($0, "]") - 2) + 0; if (ts >= t) print }}' | grep -E "[(: ]$DEV[):, ]" > /tmp/kmsg.txt
@@ -108,6 +117,43 @@ step kmsg cat /tmp/kmsg.txt
 rm -f /w/big.sha
 "##
     )
+}
+
+/// Like `common::docker_priv`, but gives up after `secs`: a filesystem the kernel chokes on
+/// can leave a task in uninterruptible sleep, whose container then never exits. The test
+/// fails (naming the container) instead of hanging the whole suite.
+fn docker_priv_bounded(dir: &Path, script: &str, secs: u64) -> (i32, String) {
+    use std::process::{Command, Stdio};
+    let name = format!("lumendisk-mkfs-e2e-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+    let out_path = dir.with_extension("out");
+    let out = std::fs::File::create(&out_path).unwrap();
+    let mut child = Command::new("docker")
+        .args(["run", "--rm", "--privileged", "--name", &name, "-v"])
+        .arg(format!("{}:/w", dir.display()))
+        .args(["-w", "/w", "lumendisk-toolbox", "sh", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .expect("docker not available");
+    let t0 = std::time::Instant::now();
+    let code = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st.code().unwrap_or(-1);
+        }
+        if t0.elapsed() > std::time::Duration::from_secs(secs) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = Command::new("docker").args(["kill", &name]).output();
+            let text = std::fs::read_to_string(&out_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&out_path);
+            return (-2, format!("{text}\nTIMEOUT after {secs} s: container {name} may be stuck in the kernel"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let text = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    (code, text)
 }
 
 /// Parse `@@ step rc=N` lines: (step, rc) in order.
@@ -147,7 +193,7 @@ fn run(c: Case) {
     let uuid = *uuid::Uuid::new_v4().as_bytes();
     lumen_format(&img, &c, uuid);
     let t0 = std::time::Instant::now();
-    let (code, out) = common::docker_priv(&dir, &script(&c));
+    let (code, out) = docker_priv_bounded(&dir, &script(&c), 900);
     let st = steps(&out);
     if std::env::var("MKFS_E2E_VERBOSE").is_ok() {
         eprintln!("{out}");
@@ -161,7 +207,7 @@ fn run(c: Case) {
     }
     let expected: &[&str] = match c.fs {
         Fs::Btrfs => &["check_ro", "check_lowmem", "dump_super", "blkid", "mount", "populate", "bigfile", "copy", "rm", "df", "sync", "umount", "check_ro", "check_lowmem", "mount_ro", "verify", "umount_ro", "kmsg"],
-        Fs::Xfs => &["repair_n", "repair_nf", "xfs_db", "blkid", "mount", "populate", "bigfile", "copy", "rm", "df", "sync", "umount", "repair_n", "repair_nf", "mount_ro", "verify", "umount_ro", "kmsg"],
+        Fs::Xfs => &["repair_n", "repair_nf", "xfs_db", "logprint", "blkid", "mount", "populate", "bigfile", "copy", "rm", "df", "sync", "umount", "repair_n", "repair_nf", "mount_ro", "verify", "umount_ro", "kmsg"],
     };
     let names: Vec<&str> = st.iter().map(|s| s.0.as_str()).collect();
     if names != expected {
@@ -180,7 +226,10 @@ fn run(c: Case) {
         };
         for name in checks {
             let o = step_output(&out, name, nth);
-            let bad = o.lines().any(|l| {
+            // xfs_repair on an image file always notes it can't ask the host for the sector
+            // size; that is not about the filesystem.
+            let host_note = ["Cannot get host filesystem geometry.", "Repair may fail if there is a sector size mismatch between", "the image and the host filesystem."];
+            let bad = o.lines().filter(|l| !host_note.contains(&l.trim())).any(|l| {
                 let low = l.to_ascii_lowercase();
                 (low.contains("error") && !low.contains("no error found"))
                     || low.contains("warning")
@@ -335,4 +384,79 @@ fn xfs_4k_sectors() {
 #[ignore]
 fn xfs_sparse_50g() {
     run(Case { name: "xfs-50g", fs: Fs::Xfs, size: 50 * GIB, cluster: None, label: "Fifty", sector: 512 });
+}
+
+#[test]
+#[ignore]
+fn xfs_32k_blocks_minimum_size() {
+    // The smallest filesystem mkfs.xfs makes with 32 KiB blocks: the log is at the kernel
+    // minimum for this AG size (2213 blocks), not the 64 MiB default.
+    run(Case { name: "xfs-32k-min", fs: Fs::Xfs, size: lumendisk_core::mkfs::xfs::MIN_DEV_SIZE, cluster: Some(32768), label: "thirtytwo", sector: 512 });
+}
+
+#[test]
+#[ignore]
+fn xfs_16k_blocks_4k_sectors() {
+    run(Case { name: "xfs-16k-4kn", fs: Fs::Xfs, size: 5 * GIB + 16384 * 7, cluster: Some(16384), label: "16k4kn", sector: 4096 });
+}
+
+#[test]
+#[ignore]
+fn btrfs_sparse_300g_third_mirror() {
+    // Large enough for the third superblock copy at 256 GiB.
+    run(Case { name: "btrfs-300g", fs: Fs::Btrfs, size: 300 * GIB, cluster: Some(32768), label: "Three mirrors", sector: 512 });
+}
+
+/// Same size, block size, sector, label and UUID formatted by mkfs.xfs 6.13: every AG's
+/// superblock, AGF, AGI and AGFL (as printed by xfs_db) and the root / rt inodes must be
+/// identical, except time stamps, generation numbers and checksums covering them.
+fn xfs_same_as_mkfs(name: &str, size: u64, bs: u32, sector: u32) {
+    let dir = common::workdir(&format!("mkfs-cmp-{name}"));
+    let uuid = *uuid::Uuid::new_v4().as_bytes();
+    let c = Case { name: "cmp", fs: Fs::Xfs, size, cluster: Some(bs), label: "cmp", sector };
+    lumen_format(&dir.join("disk.img"), &c, uuid);
+    let dump = |img: &str| {
+        format!(
+            "n=$(xfs_db -r -c 'sb 0' -c 'print agcount' {img} | cut -d' ' -f3); a=0; \
+             while [ $a -lt $n ]; do xfs_db -r -c \"sb $a\" -c print -c \"agf $a\" -c print -c \"agi $a\" -c print -c \"agfl $a\" -c print {img} | sed \"s/^/ag$a /\"; a=$((a+1)); done; \
+             r=$(xfs_db -r -c 'sb 0' -c 'print rootino' {img} | cut -d' ' -f3); \
+             for i in 0 1 2; do xfs_db -r -c \"inode $((r + i))\" -c print {img} | sed \"s/^/ino$i /\"; done"
+        )
+    };
+    let filter = "grep -vE 'crc = |time|\\.gen = |change_count|nsec'";
+    let script = format!(
+        "set -e; truncate -s {size} ref.img; mkfs.xfs -q -f -b size={bs} -s size={sector} -L cmp -m uuid={u} ref.img; \
+         ({mine}) > mine.txt 2>&1; ({theirs}) > ref.txt 2>&1; \
+         {filter} mine.txt > a.txt; {filter} ref.txt > b.txt; \
+         echo \"lines: $(wc -l < a.txt), AGs: $(grep -c 'magicnum = 0x58414746' a.txt), fields: $(grep -cE '^ag[0-9]+ (dblocks|logstart|rootino|fdblocks|bnoroot|freeblks|longest|flcount|count|freecount|newino|bno\\[)' a.txt)\"; \
+         grep -qE '^ino0 u3.sfdir3.hdr.parent' a.txt; diff a.txt b.txt; \
+         logrec() {{ d=$(xfs_logprint -t $1 2>&1 | sed -n 's/.*daddr: \\([0-9]*\\).*/\\1/p'); dd if=$1 bs=512 skip=$d count=512 2>/dev/null; }}; \
+         logrec disk.img > a.log; logrec ref.img > b.log; test -s a.log; cmp a.log b.log; \
+         xfs_logprint -t disk.img 2>&1 | grep 'state: <CLEAN>'; echo SAME",
+        u = uuid::Uuid::from_bytes(uuid).hyphenated(),
+        mine = dump("disk.img"),
+        theirs = dump("ref.img"),
+    );
+    let (code, out) = common::docker(&dir, &script);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(code == 0 && out.contains("SAME"), "[{name}] differs from mkfs.xfs:\n{out}");
+    eprintln!(
+        "SUMMARY xfs-vs-mkfs {name:<8} size={size} block={bs} sector={sector}: every AG's sb/agf/agi/agfl + root/rt inodes + first log record identical to mkfs.xfs 6.13 ({})",
+        out.lines().next().unwrap_or("").trim()
+    );
+}
+
+#[test]
+#[ignore]
+fn xfs_headers_match_mkfs_xfs() {
+    xfs_same_as_mkfs("1g-4k", GIB, 4096, 512);
+    xfs_same_as_mkfs("min-4k", 300 * MIB, 4096, 512);
+    xfs_same_as_mkfs("odd-1k", GIB + 12345, 1024, 512);
+    xfs_same_as_mkfs("2k", 700 * MIB + 2048 * 5, 2048, 512);
+    xfs_same_as_mkfs("64k", 2 * GIB + 65536 * 3 + 100, 65536, 512);
+    xfs_same_as_mkfs("32k", GIB, 32768, 512);
+    xfs_same_as_mkfs("4kn", 3 * GIB / 2, 4096, 4096);
+    xfs_same_as_mkfs("16k-4kn", 5 * GIB + 16384 * 7, 16384, 4096);
+    xfs_same_as_mkfs("64k-4kn", 5 * GIB, 65536, 4096);
+    xfs_same_as_mkfs("50g", 50 * GIB, 4096, 512);
 }
