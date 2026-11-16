@@ -84,6 +84,8 @@ pub(crate) enum Data {
     Extents(Vec<Extent>),
     /// Small files stored inside their descriptor (UDF embedded data).
     Inline(Vec<u8>),
+    /// Listed, but its data can't be read (why).
+    Unsupported(String),
 }
 
 /// One entry of a parsed tree (the root is not included).
@@ -216,6 +218,7 @@ fn read_node(dev: &dyn BlockDev, n: &Node, offset: u64, buf: &mut [u8]) -> Forge
     }
     let want = (buf.len() as u64).min(n.size - offset) as usize;
     match &n.data {
+        Data::Unsupported(why) => Err(ForgeError::Unsupported(format!("{}: {why}", n.path))),
         Data::None => {
             // A file with a size but no data (hostile): reads as zeros.
             buf[..want].fill(0);
