@@ -136,7 +136,8 @@ bold "Swift 6 app (universal)"
 # Remove any binary left by an earlier build first, so the one checked below can only come
 # from this build; the build's own exit status decides, the output is filtered separately.
 BIN="macos/.build/out/Products/Release/LumenDisk"
-find macos/.build -path '*Release*' -name LumenDisk -type f -delete 2>/dev/null
+# (a fresh clone has no macos/.build yet: find would fail and set -e would end the script silently)
+[ ! -d macos/.build ] || find macos/.build -path '*Release*' -name LumenDisk -type f -delete
 SWIFT_LOG="$(mktemp -t lumendisk-swift)"
 SWIFT_RC=0
 ( cd macos && swift build -q -c release --arch arm64 --arch x86_64 ) > "$SWIFT_LOG" 2>&1 || SWIFT_RC=$?
