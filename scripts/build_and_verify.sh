@@ -135,7 +135,6 @@ ok "$(summary_of "$OUT")"; record "LAN server" "$(summary_of "$OUT")"
 bold "Swift 6 app (universal)"
 # Remove any binary left by an earlier build first, so the one checked below can only come
 # from this build; the build's own exit status decides, the output is filtered separately.
-BIN="macos/.build/out/Products/Release/LumenDisk"
 # (a fresh clone has no macos/.build yet: find would fail and set -e would end the script silently)
 [ ! -d macos/.build ] || find macos/.build -path '*Release*' -name LumenDisk -type f -delete
 SWIFT_LOG="$(mktemp -t lumendisk-swift)"
@@ -144,8 +143,10 @@ SWIFT_RC=0
 grep -v -E 'deprecated|^$' "$SWIFT_LOG" || :
 rm -f "$SWIFT_LOG"
 [ "$SWIFT_RC" = 0 ] || die "swift build failed (exit $SWIFT_RC)"
-[ -x "$BIN" ] || BIN="$(find macos/.build -path '*Release*' -name LumenDisk -type f -perm -111 | head -1)"
-[ -x "$BIN" ] || die "Swift build did not produce a binary"
+# Where the universal product lands depends on the Swift version (.build/out/… or .build/apple/…):
+# ask SwiftPM rather than search (a search can find a single-arch intermediate binary).
+BIN="$(cd macos && swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/LumenDisk"
+[ -x "$BIN" ] || die "Swift build did not produce a binary ($BIN)"
 [ "$(lipo -archs "$BIN")" = "x86_64 arm64" ] || die "Swift binary is not universal ($(lipo -archs "$BIN"))"
 ok "LumenDisk binary ($(lipo -archs "$BIN"))"
 
