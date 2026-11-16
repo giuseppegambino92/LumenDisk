@@ -399,4 +399,6 @@ fn big_wim_over_4gib_is_split_with_the_real_limit() {
     assert_eq!(code, 0, "{log}");
     let log = check_volume(&dir, "big.img", &v, 0, "fat32", Some("/w/orig.wim"));
     assert!(log.contains("SWM-VERIFY-OK") && log.contains("APPLY-OK 3 images"), "{log}");
+    // About 11 GB of test data: don't leave it behind.
+    let _ = std::fs::remove_dir_all(&dir);
 }
