@@ -392,7 +392,17 @@ pub fn run(r: &FormatRequest, ctx: &JobCtx) -> ForgeResult<Value> {
     ctx.phase(Phase::Preparing, 0);
     validate_request(r)?;
     let target = super::target::open_for_write(&r.target, ctx)?;
-    format_device(target.dev.clone(), &target.path, r, ctx)
+    let result = format_device(target.dev.clone(), &target.path, r, ctx)?;
+    // Like Disk Utility: once the device is closed, let macOS mount what it can read
+    // (FAT, exFAT, NTFS read-only…) so the new volume shows up in Finder.
+    let bsd = target.info.as_ref().map(|i| i.bsd.clone());
+    drop(target);
+    if let Some(bsd) = bsd {
+        if let Err(e) = super::target::mount_disk(&bsd) {
+            ctx.info(format!("{bsd}: macOS did not mount the new volumes ({e}); LumenDisk can mount them"));
+        }
+    }
+    Ok(result)
 }
 
 /// The body of [`run`] once the target is open (also used by tests on RAM disks).

@@ -355,7 +355,8 @@ pub fn run(r: &HashRequest, ctx: &JobCtx) -> ForgeResult<Value> {
     let is_range = r.offset.is_some() || r.length.is_some();
     let total_bytes;
     if let Some(node) = disk_node(&r.source).filter(|_| !Path::new(&r.source).is_file()) {
-        let dev = crate::block::open_source(&node, true, None)?;
+        super::target::check_readable(&node)?;
+        let dev = crate::block::open_source(&node, true, None).map_err(super::target::access_error)?;
         let size = dev.size();
         let len = r.length.unwrap_or(size.saturating_sub(offset));
         if offset.checked_add(len).map_or(true, |e| e > size) {

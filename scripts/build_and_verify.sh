@@ -153,6 +153,10 @@ BIN="$(cd macos && swift build -c release --arch arm64 --arch x86_64 --show-bin-
 [ -x "$BIN" ] || die "Swift build did not produce a binary ($BIN)"
 [ "$(lipo -archs "$BIN")" = "x86_64 arm64" ] || die "Swift binary is not universal ($(lipo -archs "$BIN"))"
 ok "LumenDisk binary ($(lipo -archs "$BIN"))"
+OUT=$( (cd macos && swift test 2>&1) ) || { echo "$OUT" | grep -E "error|failed|XCTAssert" | tail -30; die "Swift tests failed"; }
+NSWIFT=$(grep -Eo 'Executed [0-9]+ tests?, with 0 failures' <<<"$OUT" | tail -1 | grep -Eo '[0-9]+' | head -1)
+[ -n "$NSWIFT" ] || { echo "$OUT" | tail -20; die "Swift tests: no summary"; }
+ok "Swift tests: $NSWIFT passed (request JSON, decoding, validation, disk selection rules)"; record "Swift tests" "$NSWIFT passed"
 
 bold "Bundling dist/LumenDisk.app"
 APP=dist/LumenDisk.app

@@ -163,7 +163,7 @@ impl JobCtx {
         self.s.done.store(0, Ordering::Relaxed);
         let mut i = self.lock();
         i.phase = phase;
-        if i.phases.last() != Some(&phase) {
+        if !i.phases.contains(&phase) {
             i.phases.push(phase);
         }
         i.total = total;

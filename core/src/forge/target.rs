@@ -134,6 +134,11 @@ fn mounted_volumes(whole: &str) -> Vec<String> {
 
 /// `diskutil info` of `dev` (`disk4`, `/dev/disk4`, `/dev/rdisk4`), with the policy applied.
 pub fn disk_info(dev: &str) -> ForgeResult<DiskInfo> {
+    disk_info_with(dev, &boot_disks())
+}
+
+/// [`disk_info`] with the startup disks already known (listing many disks asks once).
+fn disk_info_with(dev: &str, boot_disks: &HashSet<String>) -> ForgeResult<DiskInfo> {
     let bsd = bsd_name(dev);
     let v = plist_json(&["info", "-plist", &bsd])?;
     let protocol = s(&v, "BusProtocol");
@@ -149,7 +154,7 @@ pub fn disk_info(dev: &str) -> ForgeResult<DiskInfo> {
         writable: b(&v, "WritableMedia") || b(&v, "Writable"),
         disk_image: protocol == "Disk Image",
         protocol,
-        boot: boot_disks().contains(&bsd),
+        boot: boot_disks.contains(&bsd),
         mounted: mounted_volumes(&bsd),
         allowed: false,
         refusal: None,
@@ -192,10 +197,11 @@ pub fn check_policy(d: &DiskInfo) -> ForgeResult<()> {
 /// Every whole disk, each with its verdict. The UI lists the allowed ones first.
 pub fn list_disks() -> ForgeResult<Vec<DiskInfo>> {
     let v = plist_json(&["list", "-plist"])?;
+    let boot = boot_disks();
     let mut out = vec![];
     for d in v.get("WholeDisks").and_then(Value::as_array).into_iter().flatten() {
         if let Some(name) = d.as_str() {
-            if let Ok(i) = disk_info(name) {
+            if let Ok(i) = disk_info_with(name, &boot) {
                 out.push(i);
             }
         }
@@ -264,6 +270,29 @@ pub fn mount_disk(bsd: &str) -> ForgeResult<()> {
     }
 }
 
+/// The error for a device macOS didn't let LumenDisk open: authopen's prompt was cancelled or
+/// the user isn't an administrator.
+pub fn access_error(e: std::io::Error) -> ForgeError {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        ForgeError::Unsafe(t(
+            "accesso al disco non autorizzato: la richiesta di macOS è stata annullata o rifiutata",
+            "access to the disk was not authorized: the macOS prompt was cancelled or denied",
+        ))
+    } else {
+        ForgeError::Io(e.to_string())
+    }
+}
+
+/// Reading a disk (checksums) follows the same rule as writing it: only the disks (or
+/// partitions of disks) that [`check_policy`] allows, never the startup or internal disks.
+pub fn check_readable(dev: &str) -> ForgeResult<()> {
+    let info = disk_info(&whole_of(&bsd_name(dev)))?;
+    match info.refusal {
+        Some(r) => Err(ForgeError::Unsafe(r)),
+        None => Ok(()),
+    }
+}
+
 /// Where a job writes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -304,7 +333,7 @@ pub fn open_for_write(spec: &TargetSpec, ctx: &super::job::JobCtx) -> ForgeResul
             }
             unmount_disk(&info.bsd, false)?;
             let path = format!("/dev/r{}", info.bsd);
-            let dev = crate::block::open_source(&path, false, None)?;
+            let dev = crate::block::open_source(&path, false, None).map_err(access_error)?;
             if dev.size() == 0 {
                 return Err(ForgeError::Io(t("il disco non riporta una dimensione", "the disk reports no size")));
             }
