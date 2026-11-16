@@ -644,10 +644,7 @@ impl Drop for Pipe {
 
 /// The file tree of an ISO image, for OS detection and ISO / Windows modes.
 pub fn open_iso_tree(dev: Arc<dyn BlockDev>) -> ForgeResult<Option<Box<dyn SourceTree>>> {
-    // TODO(iso workstream): hook up the ISO 9660 / UDF reader once it exists:
-    //     return Ok(Some(Box::new(crate::iso::open(dev)?)));
-    let _ = dev;
-    Ok(None)
+    Ok(Some(Box::new(crate::iso::open(dev)?)))
 }
 
 /// What [`inspect`] concluded; also what flash uses to resolve [`WriteMode::Auto`].

@@ -322,8 +322,9 @@ pub fn run(r: &FlashRequest, ctx: &JobCtx) -> ForgeResult<Value> {
         }
         let dev = img.device(ctx, true, None)?;
         if r.mode == WriteMode::Auto && !windows {
-            if let Some(mut tree) = image::open_iso_tree(dev.clone())? {
-                windows = super::windows::detect(tree.as_mut())?.is_some();
+            // Only a hint for Auto: an ISO the reader can't parse is still written as asked.
+            if let Ok(Some(mut tree)) = image::open_iso_tree(dev.clone()) {
+                windows = matches!(super::windows::detect(tree.as_mut()), Ok(Some(_)));
             }
         }
         src_dev = Some(dev);

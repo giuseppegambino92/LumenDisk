@@ -300,11 +300,9 @@ pub fn write(r: &FlashRequest, src: Arc<dyn BlockDev>, target: &OpenTarget, ctx:
     write_tree(r, tree.as_mut(), target, ctx)
 }
 
-/// HOOKUP(iso): the ISO 9660 / UDF reader belongs to another workstream. Once `crate::iso`
-/// exists, the body of this function becomes `crate::iso::open(src)` (the ISO as a
-/// `Box<dyn SourceTree>`); everything else already works on any [`SourceTree`].
-fn open_iso(_src: Arc<dyn BlockDev>) -> ForgeResult<Box<dyn SourceTree>> {
-    Err(ForgeError::Unsupported(t("modalità Windows: il lettore ISO non è ancora disponibile", "Windows mode: the ISO reader is not available yet")))
+/// The ISO (ISO 9660 / UDF, see [`crate::iso`]) as a file tree.
+fn open_iso(src: Arc<dyn BlockDev>) -> ForgeResult<Box<dyn SourceTree>> {
+    Ok(Box::new(crate::iso::open(src)?))
 }
 
 /// [`write_tree_tuned`] with the real limits.

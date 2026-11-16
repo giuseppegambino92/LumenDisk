@@ -244,15 +244,36 @@ fn a_folder_tree_works_and_cancel_stops_the_job() {
     std::fs::remove_dir_all(&src).unwrap();
 }
 
+/// The whole chain from an ISO: a UDF 2.50 image with a metadata partition (how Windows ISOs
+/// store their files) is read by `crate::iso` and written as Windows media.
 #[test]
-fn the_iso_hookup_reports_clearly_until_the_reader_lands() {
-    let dir = tmp("hook");
+fn windows_media_from_a_udf_iso_through_the_iso_reader() {
+    let files = media(synth_wim(&[5000, 7000], 2, XML, 1), "install.wim");
+    let mut b = crate::iso::testimg::udf::UdfBuilder::new(0x0250, 2048);
+    b.label("CCCOMA_X64FRE_IT-IT_DV9").metadata_partition(true);
+    for (path, data) in &files.0 {
+        b.file(path, data.clone());
+    }
+    let iso = b.build();
+    let src: Arc<dyn BlockDev> = Arc::new(crate::block::MemDev::new(iso.len().div_ceil(2048) * 2048));
+    src.write_at(0, &iso).unwrap();
+    // detect() through the reader, as inspect / Auto mode do
+    let mut tree = crate::iso::open(src.clone()).unwrap();
+    let info = detect(&mut tree).unwrap().expect("a Windows ISO");
+    assert_eq!(info.install_image, "/sources/install.wim");
+    let dir = tmp("udf-iso");
     let ctx = JobCtx::detached(false);
-    let target = open_for_write(&TargetSpec::File { path: dir.join("d.img"), size: Some(1 << 20) }, &ctx).unwrap();
-    let src: Arc<dyn BlockDev> = Arc::new(crate::block::MemDev::new(4096));
-    let e = write(&request(WindowsOptions::default()), src, &target, &ctx).unwrap_err();
-    assert!(matches!(e, ForgeError::Unsupported(_)));
+    let target = open_for_write(&TargetSpec::File { path: dir.join("d.img"), size: Some(64 << 20) }, &ctx).unwrap();
+    let opts = WindowsOptions { bypass_hardware_checks: true, ..Default::default() };
+    let r = write(&request(opts), src, &target, &ctx).unwrap();
+    assert_eq!(r["verified"], true, "{r}");
     drop(target);
+    let (_, mut fs, _) = open_part(&dir.join("d.img"), 0);
+    for (path, data) in &files.0 {
+        assert_eq!(&tree::read_file(fs.as_mut(), path).unwrap().unwrap(), data, "{path}");
+    }
+    let xml = String::from_utf8(tree::read_file(fs.as_mut(), "/autounattend.xml").unwrap().unwrap()).unwrap();
+    assert!(xml.contains("BypassTPMCheck"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
