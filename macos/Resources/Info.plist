@@ -38,7 +38,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>© 2026 LumenDisk. Tutti i diritti riservati.</string>
+	<string>© 2026 Giuseppe Gambino. Free software under the GNU GPL v3 or later.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>LumenDisk finds other Macs sharing disks on your network, shares your volumes when you ask it to, and lets your phone send and receive files over Wi-Fi.</string>
 	<key>NSPrincipalClass</key>

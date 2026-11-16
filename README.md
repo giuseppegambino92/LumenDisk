@@ -165,4 +165,4 @@ If LumenDisk is useful to you, you can support its development:
 
 ---
 
-© Giuseppe Gambino. The bundled NFSv3 server in `vendor/nfsserve` is BSD-3-Clause (XetData / Hugging Face).
+© Giuseppe Gambino. LumenDisk is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE) since version 1.1 (versions up to 1.0.3 were released under the MIT license). The bundled NFSv3 server in `vendor/nfsserve` is BSD-3-Clause (XetData / Hugging Face). Third-party components and their licenses are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
