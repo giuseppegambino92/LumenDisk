@@ -514,6 +514,7 @@ impl<'a> Vol<'a> {
         let mut out = vec![0u8; icb.info_len as usize];
         match self.file_data(icb)? {
             Data::None => {}
+            Data::Unsupported(why) => return Err(ForgeError::Unsupported(why)),
             Data::Inline(d) => out[..d.len()].copy_from_slice(&d),
             Data::Extents(ex) => {
                 let mut off = 0usize;
@@ -1382,7 +1383,7 @@ mod tests {
                  find . -mindepth 1 | sort | while read f; do \
                    if [ -L \"$f\" ]; then echo \"L $f -> $(readlink \"$f\")\"; \
                    elif [ -d \"$f\" ]; then echo \"D $f\"; \
-                   else echo \"F $f $(sha256sum < \"$f\" | cut -d' ' -f1)\"; fi; done; cd /; umount /m"
+                   else echo \"F $f $(sha256sum < \"$f\" | cut -d' ' -f1)\"; fi; done; cd /; timeout 120 umount /m"
             );
             let out = Command::new("docker")
                 .args(["run", "--rm", "--privileged", "-v", &format!("{}:/w", dir.display()), "lumendisk-toolbox", "sh", "-c", &script])

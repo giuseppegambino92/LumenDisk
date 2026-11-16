@@ -375,9 +375,6 @@ pub(crate) fn le32(b: &[u8], o: usize) -> u32 {
 pub(crate) fn le64(b: &[u8], o: usize) -> u64 {
     b.get(o..o + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap_or([0; 8]))).unwrap_or(0)
 }
-pub(crate) fn be16(b: &[u8], o: usize) -> u16 {
-    b.get(o..o + 2).map(|s| u16::from_be_bytes([s[0], s[1]])).unwrap_or(0)
-}
 
 /// Days from 1970-01-01 to `y-m-d` (proleptic Gregorian), for timestamps of any origin.
 pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
