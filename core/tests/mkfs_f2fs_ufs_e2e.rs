@@ -11,7 +11,8 @@ use common::*;
 use lumendisk_core::block::{BlockDev, FileDev};
 use lumendisk_core::forge::MkfsOptions;
 use lumendisk_core::mkfs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -196,5 +197,195 @@ fn f2fs_bytes_match_mkfs_f2fs() {
         assert_eq!(flags(&reference) & !0x100, flags(&ours));
         println!("F2FS vs mkfs.f2fs {bytes:>12} bytes: {nblocks} blocks, differing {differing:?} (version strings / CP_TRIMMED / CRCs only)");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─────────────────────────────────────────── UFS2 ───────────────────────────────────────────
+
+/// Run `script` as root in a FreeBSD VM with `disks` attached ($DISK1…): see
+/// scripts/freebsd_check.sh. Returns (exit code, output).
+fn freebsd(dir: &Path, script: &str, disks: &[PathBuf]) -> (i32, String) {
+    let harness = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/freebsd_check.sh");
+    let guest = dir.join("guest.sh");
+    std::fs::write(&guest, script).unwrap();
+    let out = Command::new("sh").arg(&harness).arg(&guest).args(disks).output().expect("sh");
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.code().unwrap_or(-1), s)
+}
+
+struct UfsCase {
+    name: &'static str,
+    bytes: u64,
+    bsize: Option<u32>,
+}
+
+/// Normalise `dumpfs` output for comparison: times, `fs_id`, check-hashes and the random
+/// parts differ between two runs of `newfs` too.
+const DUMPFS_NORM: &str = r#"norm() {
+  dumpfs "$1" | sed -E \
+    -e 's/(time|mtime)[[:space:]]+[A-Z][a-z][a-z] .*$/\1 */' \
+    -e 's/id[[:space:]]+\[ [0-9a-f]+ [0-9a-f]+ \]/id [ * ]/' \
+    -e 's/ckhash[[:space:]]+[0-9a-f]+/ckhash */g'
+}
+"#;
+
+/// Same size and options with FreeBSD's `newfs -b B -f B/8 -L label`: `dumpfs` of both must
+/// be identical except times, `fs_id` and check-hashes.
+#[test]
+#[ignore]
+fn ufs2_matches_freebsd_newfs() {
+    let dir = workdir("mkfs-ufs-newfs");
+    let cases = [
+        UfsCase { name: "64m", bytes: 64 << 20, bsize: None },
+        UfsCase { name: "1g-odd", bytes: (1 << 30) + 12345 * 512, bsize: Some(16384) },
+        UfsCase { name: "300m-4k", bytes: 300 << 20, bsize: Some(4096) },
+        UfsCase { name: "777m-8k", bytes: (777 << 20) + 4096 * 3, bsize: Some(8192) },
+        UfsCase { name: "2g-64k", bytes: 2 << 30, bsize: Some(65536) },
+        UfsCase { name: "min", bytes: mkfs::ufs::min_bytes(32768), bsize: None },
+    ];
+    let mut disks = Vec::new();
+    let mut script = format!("set -u\n{DUMPFS_NORM}fail=0\n");
+    for (i, c) in cases.iter().enumerate() {
+        let ours = dir.join(format!("{}-ours.img", c.name));
+        let reference = dir.join(format!("{}-newfs.img", c.name));
+        sized_file(&ours, c.bytes);
+        sized_file(&reference, c.bytes);
+        mkfs::ufs::format(open_dev(&ours), &opts("cmpvol", c.bsize)).unwrap();
+        disks.push(ours);
+        disks.push(reference);
+        let b = c.bsize.unwrap_or(32768);
+        let (a, r, name, f) = (2 * i + 1, 2 * i + 2, c.name, b / 8);
+        script.push_str(&format!(
+            r#"echo "=== {name}"
+if newfs -b {b} -f {f} -L cmpvol $DISK{r} > /tmp/newfs.out 2>&1; then head -3 /tmp/newfs.out; else cat /tmp/newfs.out; fail=1; fi
+norm $DISK{a} > /tmp/ours.txt; norm $DISK{r} > /tmp/ref.txt
+if [ "{name}" = min ]; then
+  # Two 1-block clusters were the only free blocks; newfs takes both for / and .snap without
+  # updating cg_clustersum (fsck_ffs recomputes it), LumenDisk keeps it exact.
+  grep -v '^clusters 1-8' /tmp/ours.txt > /tmp/o; mv /tmp/o /tmp/ours.txt
+  grep -v '^clusters 1-8' /tmp/ref.txt > /tmp/r; mv /tmp/r /tmp/ref.txt
+fi
+if diff -u /tmp/ref.txt /tmp/ours.txt > /tmp/diff.txt; then echo "{name}: dumpfs identical to newfs ($(wc -l < /tmp/ours.txt) lines)"; else echo "{name}: dumpfs DIFFERS from newfs"; head -80 /tmp/diff.txt; fail=1; fi
+fsck_ffs -n $DISK{a} 2>&1 | tail -1
+"#
+        ));
+    }
+    script.push_str("exit $fail\n");
+    let t0 = Instant::now();
+    let (code, out) = freebsd(&dir, &script, &disks);
+    println!("{out}");
+    assert_eq!(code, 0, "dumpfs differs from newfs:\n{out}");
+    let problems = fsck_ffs_problems(&out);
+    assert!(problems.is_empty(), "fsck_ffs -n: {problems:#?}");
+    println!("UFS2 vs FreeBSD newfs: {} cases identical (VM run {:.0?})", cases.len(), t0.elapsed());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `fsck_ffs` output problems: anything but the phase banners and the summary.
+fn fsck_ffs_problems(out: &str) -> Vec<String> {
+    out.lines()
+        .filter(|l| {
+            let u = l.to_ascii_uppercase();
+            ["MODIFIED", "FIX?", "SALVAGE", "CLEAR?", "BAD ", "UNREF", "INCORRECT", "MISSING", "ADJUST", "RECONNECT", "UNEXPECTED", "CANNOT", "ERROR", "CHECK-HASH", "REBUILD"]
+                .iter()
+                .any(|w| u.contains(w))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The guest side of a UFS2 round trip on $1 (label $2, big file $3 MiB): FreeBSD's checker,
+/// a read-write mount with soft updates, hundreds of files and a big file, unmount, the checker
+/// again and a read-only remount comparing everything.
+const UFS_ROUNDTRIP: &str = r#"rt() {
+  dev=$1; label=$2; big=$3; name=$4
+  echo "=== $name ($dev)"
+  dumpfs -m $dev
+  dumpfs $dev | grep -E '^(flags|volname)' | tr '\t' ' '
+  [ -e /dev/ufs/$label ] && echo "glabel: /dev/ufs/$label" || { echo "FAILED: no /dev/ufs/$label"; return 1; }
+  ls /dev/ufsid/ | head -20 | tr '\n' ' '; echo
+  echo "--- fsck_ffs -n"; fsck_ffs -n $dev || { echo "FAILED: fsck_ffs -n"; return 1; }
+  echo "--- fsck_ffs -f -y"; fsck_ffs -f -y $dev > /tmp/f.txt 2>&1; rc=$?; cat /tmp/f.txt
+  [ $rc -eq 0 ] || { echo "FAILED: fsck_ffs -f -y ($rc)"; return 1; }
+  grep -q MODIFIED /tmp/f.txt && { echo "FAILED: fsck modified the fresh filesystem"; return 1; }
+  mkdir -p /mnt/u && mount $dev /mnt/u || { echo "FAILED: mount"; return 1; }
+  mount | grep /mnt/u; mount | grep /mnt/u | grep -q soft-updates || { echo "FAILED: not mounted with soft updates"; return 1; }
+  d=1; while [ $d -le 10 ]; do mkdir /mnt/u/dir$d; f=1; while [ $f -le 40 ]; do echo "file $d/$f" > /mnt/u/dir$d/f$f.txt; f=$((f+1)); done; d=$((d+1)); done
+  mkdir -p /mnt/u/deep/a/b/c && echo deep > /mnt/u/deep/a/b/c/leaf
+  dd if=/dev/random of=/mnt/u/big.bin bs=1m count=$big 2>/dev/null
+  sum=$(sha256 -q /mnt/u/big.bin)
+  df -k /mnt/u | tail -1
+  umount /mnt/u || { echo "FAILED: umount"; return 1; }
+  echo "--- fsck_ffs -f -y after writes"; fsck_ffs -f -y $dev > /tmp/f.txt 2>&1; rc=$?; cat /tmp/f.txt
+  [ $rc -eq 0 ] || { echo "FAILED: fsck_ffs after writes ($rc)"; return 1; }
+  grep -q MODIFIED /tmp/f.txt && { echo "FAILED: fsck modified the filesystem after writes"; return 1; }
+  echo "--- fsck_ffs -n after writes"; fsck_ffs -n $dev | tail -1
+  mount -o ro $dev /mnt/u || { echo "FAILED: remount"; return 1; }
+  n=$(find /mnt/u -type f | wc -l | tr -d ' ')
+  [ "$n" -eq 402 ] || { echo "FAILED: $n files"; umount /mnt/u; return 1; }
+  [ "$(sha256 -q /mnt/u/big.bin)" = "$sum" ] || { echo "FAILED: big file differs"; umount /mnt/u; return 1; }
+  [ "$(cat /mnt/u/dir7/f33.txt)" = "file 7/33" ] || { echo "FAILED: content"; umount /mnt/u; return 1; }
+  umount /mnt/u
+  echo "$name: OK files=$n big=${big}MiB sha256=$sum"
+}
+fail=0
+"#;
+
+/// Format with LumenDisk, then in FreeBSD: fsck_ffs -n, fsck_ffs -f -y, mount (soft updates),
+/// 402 files + a big file, umount, fsck again, read-only verification. Also `blkid` on Linux.
+#[test]
+#[ignore]
+fn ufs2_freebsd_roundtrip() {
+    let dir = workdir("mkfs-ufs-roundtrip");
+    // (case, label, big file MiB)
+    let cases = [
+        (UfsCase { name: "512m", bytes: 512 << 20, bsize: None }, "ld_512m", 100),
+        (UfsCase { name: "small-8m", bytes: 8 << 20, bsize: None }, "ld_small", 2),
+        (UfsCase { name: "odd-16k", bytes: (700 << 20) + 3 * 512, bsize: Some(16384) }, "ld_odd", 100),
+        (UfsCase { name: "4k", bytes: 400 << 20, bsize: Some(4096) }, "ld_4k", 100),
+        (UfsCase { name: "64k", bytes: 2 << 30, bsize: Some(65536) }, "ld_64k", 100),
+        (UfsCase { name: "sparse-20g", bytes: 20 << 30, bsize: None }, "ld_20g", 100),
+    ];
+    let mut disks = Vec::new();
+    let mut script = format!("set -u\n{UFS_ROUNDTRIP}");
+    let mut mkfs_times = Vec::new();
+    for (i, (c, label, big)) in cases.iter().enumerate() {
+        let img = dir.join(format!("{}.img", c.name));
+        sized_file(&img, c.bytes);
+        let t = Instant::now();
+        mkfs::ufs::format(open_dev(&img), &opts(label, c.bsize)).unwrap();
+        mkfs_times.push(t.elapsed());
+        disks.push(img);
+        script.push_str(&format!("rt $DISK{} {label} {big} {} || fail=1\n", i + 1, c.name));
+    }
+    script.push_str(
+        r#"echo "--- kernel messages"; dmesg | grep -iE "ufs|ffs|hash" | tail -20
+if dmesg | grep -iE "check-hash|ffs.*(error|fail|corrupt)|not properly dismounted"; then echo "FAILED: kernel complained"; fail=1; fi
+exit $fail
+"#,
+    );
+
+    // Linux's blkid recognises the volumes too (TYPE, LABEL, UUID from fs_id).
+    let (code, out) = docker(&dir, "for f in *.img; do echo \"$f: $(blkid -p -o export $f | tr '\\n' ' ')\"; done");
+    assert_eq!(code, 0, "{out}");
+    for (c, label, _) in &cases {
+        let line = out.lines().find(|l| l.starts_with(&format!("{}.img:", c.name))).unwrap_or_else(|| panic!("{out}"));
+        assert!(line.contains("TYPE=ufs") && line.contains(&format!("LABEL={label}")), "blkid: {line}");
+        assert!(line.to_ascii_lowercase().contains("uuid=0123456789abcdef"), "blkid: {line}");
+    }
+    println!("blkid:\n{out}");
+
+    let t0 = Instant::now();
+    let (code, out) = freebsd(&dir, &script, &disks);
+    println!("{out}");
+    assert_eq!(code, 0, "FreeBSD checks failed:\n{out}");
+    let problems = fsck_ffs_problems(&out);
+    assert!(problems.is_empty(), "fsck_ffs: {problems:#?}\n{out}");
+    for ((c, _, big), t) in cases.iter().zip(&mkfs_times) {
+        assert!(out.contains(&format!("{}: OK files=402", c.name)), "{}", c.name);
+        println!("UFS2 {:>10}: {:>12} bytes, block {:>5}  mkfs {:>8.2?}  fsck -n/-f -y, mount rw (SU), 402 files + {big} MiB, umount, fsck, ro verify OK", c.name, c.bytes, c.bsize.unwrap_or(32768), t);
+    }
+    println!("FreeBSD VM run: {:.0?}", t0.elapsed());
     let _ = std::fs::remove_dir_all(&dir);
 }

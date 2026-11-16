@@ -97,6 +97,7 @@ const SUM_FOOTER_SIZE: usize = 5;
 const SUM_JOURNAL_SIZE: usize = BLKSIZE as usize - SUM_FOOTER_SIZE - SUMMARY_SIZE * ENTRIES_IN_SUM;
 const SUM_TYPE_NODE: u8 = 1;
 const NAT_JOURNAL_ENTRY_SIZE: usize = 13;
+const _: () = assert!(SUM_JOURNAL_SIZE >= 2 + NAT_JOURNAL_ENTRY_SIZE && SUM_JOURNAL_SIZE >= 2 + 6 * SIT_JOURNAL_ENTRY_SIZE);
 const SIT_JOURNAL_ENTRY_SIZE: usize = 78;
 
 const ROOT_INO: u32 = 3;
@@ -367,7 +368,7 @@ impl Layout {
         (self.segment_count_nat as usize) << 5
     }
     fn nat_bits_blocks(&self) -> u32 {
-        ((self.nat_bits_bytes() * 2 + 8 + BLKSIZE as usize - 1) / BLKSIZE as usize) as u32
+        (self.nat_bits_bytes() * 2 + 8).div_ceil(BLKSIZE as usize) as u32
     }
     fn cp_pack_total_block_count(&self) -> u32 {
         // cp page × 2, compact data summary × 1, node summaries × 3, plus the SIT bitmap payload.
@@ -522,7 +523,6 @@ fn compact_summary(l: &Layout) -> Vec<u8> {
     b[6] = 0;
     put32(&mut b, 7, ROOT_INO);
     put32(&mut b, 11, l.root_node_blk());
-    debug_assert!(15 <= 2 + NAT_JOURNAL_ENTRY_SIZE);
     // SIT journal: n_sits then entries {segno, vblocks, valid_map[64], mtime}.
     let sit = SUM_JOURNAL_SIZE;
     put16(&mut b, sit, 6);
