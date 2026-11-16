@@ -117,6 +117,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let model = AppModel.shared
+        // A running format / write / wipe would leave the disk half-written: ask first, then stop
+        // the jobs and quit again (the second pass takes the normal path below).
+        if !model.isTerminating, let job = model.forge.runningJobs.first {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = L("Un'operazione è ancora in corso", "An operation is still running")
+            alert.informativeText = L("«\(job.title)» non è terminata. Se esci ora viene interrotta e il disco potrebbe restare inutilizzabile finché non lo formatti o scrivi di nuovo.",
+                                      "“\(job.title)” hasn't finished. If you quit now it is stopped, and the disk may stay unusable until you format or write it again.")
+            alert.addButton(withTitle: L("Continua l'Operazione", "Keep Running"))
+            alert.addButton(withTitle: L("Interrompi ed Esci", "Stop and Quit"))
+            NSApp.activate()
+            guard alert.runModal() == .alertSecondButtonReturn else {
+                model.forge.tool = job.tool
+                model.selection = .forge
+                model.bringMainWindowForward()
+                return .terminateCancel
+            }
+            Task { @MainActor in
+                await model.forge.cancelAllAndWait()
+                NSApp.terminate(nil)
+            }
+            return .terminateCancel
+        }
         if model.isTerminating || model.volumes.isEmpty { return .terminateNow }
 
         let count = model.volumes.count

@@ -345,6 +345,7 @@ enum DebugHooks {
         case "drawer":
             forge.drawerOpen = arg != "closed"
             forge.showAllSections = arg == "all"
+        case "drawer-scroll": forge.drawerScrollTarget = arg.isEmpty ? nil : arg
         case "logs": forge.logDrawerOpen = arg != "closed"
         case "format":
             // format <scheme> <fs> [label]

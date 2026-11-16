@@ -91,6 +91,8 @@ final class ForgeCenter {
     private(set) var inspectError: String?
     var drawerOpen = false
     var showAllSections = false
+    /// Section the drawer scrolls to ("windows", "linux", "rpi"); set by the debug hooks.
+    var drawerScrollTarget: String?
     var confirmation: ForgeConfirmation?
     var confirmationAcknowledged = false
     var logDrawerOpen = false

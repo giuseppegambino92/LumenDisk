@@ -32,27 +32,33 @@ struct ForgeDrawer: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    if inspection != nil || all {
-                        DrawerSection(title: L("Modalità di scrittura", "Write mode"), symbol: "square.and.arrow.down") { WriteModeSection() }
-                        DrawerSection(title: L("Verifica e checksum", "Verification & checksum"), symbol: "checkmark.shield") { VerifySection() }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if inspection != nil || all {
+                            DrawerSection(title: L("Modalità di scrittura", "Write mode"), symbol: "square.and.arrow.down") { WriteModeSection() }
+                            DrawerSection(title: L("Verifica e checksum", "Verification & checksum"), symbol: "checkmark.shield") { VerifySection() }
+                        }
+                        if inspection == nil || all {
+                            DrawerSection(title: L("Formattazione", "Formatting"), symbol: "square.grid.3x3.square") { FormatSection() }
+                        }
+                        if all || mode == .windows || inspection?.windows != nil {
+                            DrawerSection(title: "Windows", symbol: "pc", inactiveNote: mode == .windows ? nil : inactive) { WindowsSection() }.id("windows")
+                        }
+                        if all || mode == .iso || inspection?.linux != nil {
+                            DrawerSection(title: "Linux", symbol: "terminal", inactiveNote: mode == .iso ? nil : inactive) { LinuxSection() }.id("linux")
+                        }
+                        if all || inspection?.rpi != nil {
+                            DrawerSection(title: "Raspberry Pi", symbol: "cpu", inactiveNote: mode == .dd ? nil : inactive) { RaspberrySection() }.id("rpi")
+                        }
                     }
-                    if inspection == nil || all {
-                        DrawerSection(title: L("Formattazione", "Formatting"), symbol: "square.grid.3x3.square") { FormatSection() }
-                    }
-                    if all || mode == .windows || inspection?.windows != nil {
-                        DrawerSection(title: "Windows", symbol: "pc", inactiveNote: mode == .windows ? nil : inactive) { WindowsSection() }
-                    }
-                    if all || mode == .iso || inspection?.linux != nil {
-                        DrawerSection(title: "Linux", symbol: "terminal", inactiveNote: mode == .iso ? nil : inactive) { LinuxSection() }
-                    }
-                    if all || inspection?.rpi != nil {
-                        DrawerSection(title: "Raspberry Pi", symbol: "cpu", inactiveNote: mode == .dd ? nil : inactive) { RaspberrySection() }
-                    }
+                    .padding(14)
+                    .frame(width: ForgeDrawer.width, alignment: .leading)
                 }
-                .padding(14)
-                .frame(width: ForgeDrawer.width, alignment: .leading)
+                .onChange(of: forge.drawerScrollTarget, initial: true) {
+                    guard let target = forge.drawerScrollTarget else { return }
+                    withAnimation { proxy.scrollTo(target, anchor: .top) }
+                }
             }
         }
     }
@@ -301,7 +307,6 @@ private struct WindowsSection: View {
                     Text(L("Automatico (UEFI e BIOS)", "Automatic (UEFI and BIOS)")).tag(Choice<BootTarget>.automatic)
                     ForEach(BootTarget.allCases) { Text($0.title).tag(Choice.value($0)) }
                 }
-                .pickerStyle(.segmented)
                 .labelsHidden()
                 .accessibilityLabel(L("Destinazione di avvio", "Boot target"))
             }
@@ -429,7 +434,6 @@ private struct LinuxSection: View {
                     Text(L("Automatico", "Automatic")).tag(Choice<BootTarget>.automatic)
                     ForEach(BootTarget.allCases) { Text($0.title).tag(Choice.value($0)) }
                 }
-                .pickerStyle(.segmented)
                 .labelsHidden()
                 .accessibilityLabel(L("Destinazione di avvio", "Boot target"))
             }

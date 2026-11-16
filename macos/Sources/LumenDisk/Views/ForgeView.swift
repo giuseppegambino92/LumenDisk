@@ -80,6 +80,7 @@ private struct ForgeHeaderBar: View {
                 title
                 picker
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -335,19 +336,19 @@ struct ForgeCreateView: View {
     private var setup: some View {
         let forge = model.forge
         return ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        ForgeDropZone()
-                        if forge.inspection == nil {
-                            ForgeFormatOnlyCard()
-                        }
-                        if let error = forge.startErrors[.create] {
-                            ForgeErrorBanner(message: error)
-                        }
-                    }
-                    .padding(22)
-                    .frame(maxWidth: 760)
-                    .frame(maxWidth: .infinity)
+            VStack(alignment: .leading, spacing: 16) {
+                ForgeDropZone()
+                if forge.inspection == nil {
+                    ForgeFormatOnlyCard()
                 }
+                if let error = forge.startErrors[.create] {
+                    ForgeErrorBanner(message: error)
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
+        }
     }
 }
 
