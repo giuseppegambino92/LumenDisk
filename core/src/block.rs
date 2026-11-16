@@ -22,6 +22,13 @@ pub trait BlockDev: Send + Sync {
     fn flush(&self) -> io::Result<()>;
     fn read_only(&self) -> bool;
 
+    /// Logical sector size of the underlying medium (512, or 4096 on 4K-native disks), when
+    /// known. Partition tables are laid out in these units (UEFI 2.10 §5.3.1: an LBA is one
+    /// logical block). None for files and RAM devices: callers assume 512.
+    fn logical_sector_size(&self) -> Option<u32> {
+        None
+    }
+
     /// Write **file payload** (as opposed to filesystem metadata). Journaling layers write it
     /// in place immediately and keep it out of the redo log (ordered mode, like ext4
     /// `data=ordered`); everything else treats it as a normal write. Drivers must use it only
@@ -180,6 +187,9 @@ impl BlockDev for FileDev {
     fn read_only(&self) -> bool {
         self.ro
     }
+    fn logical_sector_size(&self) -> Option<u32> {
+        self.sector
+    }
     fn barrier_before(&self, other: &File) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
         let (me, them) = (self.file.metadata()?, other.metadata()?);
@@ -262,6 +272,9 @@ impl BlockDev for AlignedDev {
     fn read_only(&self) -> bool {
         self.inner.read_only()
     }
+    fn logical_sector_size(&self) -> Option<u32> {
+        self.inner.logical_sector_size()
+    }
 }
 
 /// A window onto a parent device.
@@ -307,6 +320,9 @@ impl BlockDev for PartitionDev {
     }
     fn read_only(&self) -> bool {
         self.inner.read_only()
+    }
+    fn logical_sector_size(&self) -> Option<u32> {
+        self.inner.logical_sector_size()
     }
 }
 
@@ -443,9 +459,12 @@ pub fn parse_partitions(dev: &dyn BlockDev) -> io::Result<Vec<PartitionInfo>> {
     if mbr[510] != 0x55 || mbr[511] != 0xAA {
         return Ok(vec![]);
     }
+    // MBR LBAs are in logical sectors (4096 bytes on 4K-native disks).
+    let ss = dev.logical_sector_size().map(u64::from).filter(|s| s.is_power_of_two() && (512..=4096).contains(s)).unwrap_or(SECTOR);
     let has_protective = (0..4).any(|i| mbr[446 + i * 16 + 4] == 0xEE);
     if has_protective {
-        for &ss in &[512u64, 4096] {
+        let order = if ss == 4096 { [4096u64, 512] } else { [512u64, 4096] };
+        for &ss in &order {
             if let Some(v) = parse_gpt(dev, ss)? {
                 return Ok(v);
             }
@@ -455,7 +474,7 @@ pub fn parse_partitions(dev: &dyn BlockDev) -> io::Result<Vec<PartitionInfo>> {
     if looks_like_boot_sector(&mbr) {
         return Ok(vec![]);
     }
-    parse_mbr(dev, &mbr)
+    parse_mbr(dev, &mbr, ss)
 }
 
 fn looks_like_boot_sector(b: &[u8]) -> bool {
@@ -523,7 +542,7 @@ fn parse_gpt(dev: &dyn BlockDev, ss: u64) -> io::Result<Option<Vec<PartitionInfo
     Ok(Some(out))
 }
 
-fn parse_mbr(dev: &dyn BlockDev, mbr: &[u8]) -> io::Result<Vec<PartitionInfo>> {
+fn parse_mbr(dev: &dyn BlockDev, mbr: &[u8], ss: u64) -> io::Result<Vec<PartitionInfo>> {
     let mut out = vec![];
     let mut ext_base = None;
     for i in 0..4 {
@@ -540,8 +559,8 @@ fn parse_mbr(dev: &dyn BlockDev, mbr: &[u8]) -> io::Result<Vec<PartitionInfo>> {
         }
         out.push(PartitionInfo {
             index: i as u32 + 1,
-            start: lba * SECTOR,
-            size: cnt * SECTOR,
+            start: lba * ss,
+            size: cnt * ss,
             scheme: "MBR".into(),
             type_name: mbr_type_name(t).into(),
             type_id: format!("0x{t:02X}"),
@@ -554,10 +573,10 @@ fn parse_mbr(dev: &dyn BlockDev, mbr: &[u8]) -> io::Result<Vec<PartitionInfo>> {
         let mut idx = 5;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..128 {
-            if (ebr_lba + 1) * SECTOR > dev.size() || !seen.insert(ebr_lba) {
+            if (ebr_lba + 1) * ss > dev.size() || !seen.insert(ebr_lba) {
                 break;
             }
-            let ebr = dev.read_vec(ebr_lba * SECTOR, 512)?;
+            let ebr = dev.read_vec(ebr_lba * ss, 512)?;
             if ebr[510] != 0x55 || ebr[511] != 0xAA {
                 break;
             }
@@ -566,8 +585,8 @@ fn parse_mbr(dev: &dyn BlockDev, mbr: &[u8]) -> io::Result<Vec<PartitionInfo>> {
             if t != 0 && cnt != 0 {
                 out.push(PartitionInfo {
                     index: idx,
-                    start: (ebr_lba + lba) * SECTOR,
-                    size: cnt * SECTOR,
+                    start: (ebr_lba + lba) * ss,
+                    size: cnt * ss,
                     scheme: "MBR".into(),
                     type_name: mbr_type_name(t).into(),
                     type_id: format!("0x{t:02X}"),
@@ -583,7 +602,7 @@ fn parse_mbr(dev: &dyn BlockDev, mbr: &[u8]) -> io::Result<Vec<PartitionInfo>> {
             ebr_lba = base + nlba;
         }
     }
-    out.retain(|p| p.start + p.size <= dev.size());
+    out.retain(|p| p.start.checked_add(p.size).map_or(false, |e| e <= dev.size()));
     Ok(out)
 }
 

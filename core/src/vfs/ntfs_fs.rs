@@ -62,6 +62,12 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     mkfs::format(dev, label)
 }
 
+/// [`format`] with an explicit cluster size (512 B to 2 MiB; None: 4 KiB up to 16 TiB).
+/// Returns the cluster size used.
+pub fn format_with(dev: Arc<dyn BlockDev>, label: &str, cluster: Option<u32>) -> FsResult<u32> {
+    mkfs::format_with(dev, label, cluster)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Boot sector
 

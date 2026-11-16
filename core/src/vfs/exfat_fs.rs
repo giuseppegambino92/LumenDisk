@@ -1818,33 +1818,75 @@ impl FileSystem for ExFatFs {
 // ───────────────────────────── mkfs ─────────────────────────────
 
 pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
-    if dev.read_only() {
-        return Err(FsError::ReadOnly);
-    }
-    let size = dev.size();
-    let vol = size / 512;
-    if vol < 2048 {
-        return Err(FsError::Invalid(
-            "volume too small for exFAT (minimum 1 MiB)".into(),
-        ));
-    }
-    let cs: u64 = if size <= 256 << 20 {
+    mkfs(dev, label, None, 512).map(|_| ())
+}
+
+/// Like [`format`], with an explicit cluster size in bytes (None: the default for the size)
+/// and the device's logical sector size as exFAT sector size (BytesPerSectorShift 9..=12).
+/// Returns the cluster size used.
+pub fn format_with(dev: Arc<dyn BlockDev>, label: &str, cluster: Option<u32>) -> FsResult<u32> {
+    let bps = match dev.logical_sector_size() {
+        Some(s @ (1024 | 2048 | 4096)) => s as u64,
+        _ => 512,
+    };
+    mkfs(dev, label, cluster, bps)
+}
+
+/// Default exFAT cluster size for a volume (Microsoft's table: 4 KiB up to 256 MiB, 32 KiB up
+/// to 32 GiB, 128 KiB above).
+pub fn default_cluster(size: u64) -> u64 {
+    if size <= 256 << 20 {
         4096
     } else if size <= 32 << 30 {
         32768
     } else {
         131072
+    }
+}
+
+/// Smallest and largest cluster size exFAT allows with `bps`-byte sectors (exFAT spec §3.1.15:
+/// SectorsPerClusterShift ≤ 25 − BytesPerSectorShift, i.e. clusters up to 32 MiB).
+pub fn cluster_range(bps: u64) -> (u64, u64) {
+    (bps, 32 << 20)
+}
+
+fn mkfs(dev: Arc<dyn BlockDev>, label: &str, cluster: Option<u32>, bps: u64) -> FsResult<u32> {
+    if dev.read_only() {
+        return Err(FsError::ReadOnly);
+    }
+    let size = dev.size();
+    let vol = size / bps;
+    if size < 1 << 20 {
+        return Err(FsError::Invalid(
+            "volume too small for exFAT (minimum 1 MiB)".into(),
+        ));
+    }
+    let cs: u64 = match cluster {
+        None => default_cluster(size).max(bps),
+        Some(c) => {
+            let c = c as u64;
+            let (lo, hi) = cluster_range(bps);
+            if !c.is_power_of_two() || c < lo || c > hi {
+                return Err(FsError::Invalid(format!("invalid exFAT cluster size {c}: a power of two from {lo} to {hi} bytes")));
+            }
+            c
+        }
     };
-    let spc = cs / 512;
-    let fat_offset = if vol >= 65536 {
-        2048
+    let spc = cs / bps;
+    // FatOffset: at least 24 sectors (main + backup boot regions); 1 MiB on volumes of 32 MiB
+    // and more, like Windows, so the FAT and the heap stay aligned on flash media.
+    let fat_offset = if size >= 32 << 20 {
+        ((1u64 << 20) / bps).max(24)
     } else {
         24u64.div_ceil(spc) * spc
     };
+    if fat_offset >= vol {
+        return Err(FsError::Invalid("volume too small for exFAT".into()));
+    }
     let mut count = (vol - fat_offset) / spc;
     let (mut fat_len, mut heap);
     loop {
-        fat_len = ((count + 2) * 4).div_ceil(512);
+        fat_len = ((count + 2) * 4).div_ceil(bps);
         heap = (fat_offset + fat_len).div_ceil(spc) * spc;
         if heap >= vol {
             return Err(FsError::Invalid("volume too small for exFAT".into()));
@@ -1861,16 +1903,17 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     let up = upcase_bytes();
     let up_cl = (up.len() as u64).div_ceil(cs);
     if count < bm_cl + up_cl + 2 {
-        return Err(FsError::Invalid("volume too small for exFAT".into()));
+        return Err(FsError::Invalid(format!("volume too small for exFAT with {cs}-byte clusters")));
     }
     let bm_first = 2u64;
     let up_first = bm_first + bm_cl;
     let root = up_first + up_cl;
     let used = bm_cl + up_cl + 1;
+    let sec = bps as usize;
 
     let now = Timestamp::now();
     let serial = (now.secs as u32).rotate_left(13) ^ now.nsecs ^ 0x4C55_4D45;
-    let mut bs = vec![0u8; 512];
+    let mut bs = vec![0u8; sec];
     bs[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
     bs[3..11].copy_from_slice(b"EXFAT   ");
     wr64(&mut bs, 72, vol);
@@ -1881,7 +1924,7 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     wr32(&mut bs, 96, root as u32);
     wr32(&mut bs, 100, serial);
     wr16(&mut bs, 104, 0x0100);
-    bs[108] = 9;
+    bs[108] = bps.trailing_zeros() as u8;
     bs[109] = spc.trailing_zeros() as u8;
     bs[110] = 1;
     bs[111] = 0x80;
@@ -1891,19 +1934,21 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     }
     bs[510] = 0x55;
     bs[511] = 0xAA;
-    let mut region = vec![0u8; 512 * 12];
-    region[..512].copy_from_slice(&bs);
+    // Boot region: main boot sector, 8 extended boot sectors (ExtendedBootSignature
+    // 0xAA550000 in the last 4 bytes of each), OEM parameters, reserved, checksum sector.
+    let mut region = vec![0u8; sec * 12];
+    region[..sec].copy_from_slice(&bs);
     for s in 1..=8 {
-        region[s * 512 + 510] = 0x55;
-        region[s * 512 + 511] = 0xAA;
+        region[s * sec + sec - 2] = 0x55;
+        region[s * sec + sec - 1] = 0xAA;
     }
-    let chk = boot_checksum(&region[..512 * 11]);
-    for k in 0..128 {
-        wr32(&mut region, 11 * 512 + k * 4, chk);
+    let chk = boot_checksum(&region[..sec * 11]);
+    for k in 0..sec / 4 {
+        wr32(&mut region, 11 * sec + k * 4, chk);
     }
 
-    zero_dev(dev.as_ref(), 0, fat_offset * 512)?;
-    zero_dev(dev.as_ref(), fat_offset * 512, fat_len * 512)?;
+    zero_dev(dev.as_ref(), 0, fat_offset * bps)?;
+    zero_dev(dev.as_ref(), fat_offset * bps, fat_len * bps)?;
     // FAT: media + reserved entries, then chains for bitmap, up-case table and root.
     let mut fat = vec![0u8; ((root + 1) * 4) as usize];
     wr32(&mut fat, 0, 0xFFFF_FFF8);
@@ -1918,8 +1963,8 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
             wr32(&mut fat, (c * 4) as usize, v);
         }
     }
-    dev.write_at(fat_offset * 512, &fat)?;
-    let cpos = |c: u64| heap * 512 + (c - 2) * cs;
+    dev.write_at(fat_offset * bps, &fat)?;
+    let cpos = |c: u64| heap * bps + (c - 2) * cs;
     zero_dev(dev.as_ref(), cpos(bm_first), (bm_cl + up_cl + 1) * cs)?;
     let mut bm = vec![0u8; used.div_ceil(8) as usize];
     for i in 0..used as usize {
@@ -1929,7 +1974,11 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     dev.write_at(cpos(up_first), &up)?;
     let mut rootd = vec![0u8; 96];
     rootd[0] = T_LABEL;
-    let lab: Vec<u16> = label.encode_utf16().take(11).collect();
+    // VolumeLabel: at most 11 UTF-16 code units; never end on half a surrogate pair.
+    let mut lab: Vec<u16> = label.encode_utf16().take(11).collect();
+    if lab.last().is_some_and(|&u| (0xD800..0xDC00).contains(&u)) {
+        lab.pop();
+    }
     rootd[1] = lab.len() as u8;
     for (k, &u) in lab.iter().enumerate() {
         wr16(&mut rootd, 2 + 2 * k, u);
@@ -1943,9 +1992,9 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     wr64(&mut rootd, 64 + 24, up.len() as u64);
     dev.write_at(cpos(root), &rootd)?;
     dev.write_at(0, &region)?;
-    dev.write_at(12 * 512, &region)?;
+    dev.write_at(12 * bps, &region)?;
     dev.flush()?;
-    Ok(())
+    Ok(cs as u32)
 }
 
 /// The standard compressed exFAT up-case table (exFAT spec §7.2.5.1, checksum 0xE619D30D).
