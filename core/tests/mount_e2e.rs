@@ -17,16 +17,7 @@ fn setup(name: &str) -> PathBuf {
     if std::env::var_os("NFS_DEBUG").is_some() {
         let _ = tracing_subscriber::fmt().with_env_filter("nfsserve=debug").with_writer(std::io::stderr).try_init();
     }
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("{info}");
-        for v in runtime().list() {
-            let _ = runtime().unmount(&v.id, true);
-        }
-    }));
-    let dir = workdir(name);
-    runtime().set_support_dir(&dir.join("support"));
-    fs::create_dir_all(dir.join("mnt")).unwrap();
-    dir
+    setup_in_process("mount_e2e", name)
 }
 
 fn req(dir: &Path, img: &str, partition: u32, mode: MountMode) -> MountRequest {
@@ -37,7 +28,7 @@ fn req(dir: &Path, img: &str, partition: u32, mode: MountMode) -> MountRequest {
         ghost_shield: true,
         ghost_rules: None,
         uid_map: None,
-        mount_root: Some(dir.join("mnt").to_string_lossy().into_owned()),
+        mount_root: Some(mount_root(&dir).to_string_lossy().into_owned()),
         name: None,
         fd: None,
         volume_icon: None,
@@ -46,14 +37,12 @@ fn req(dir: &Path, img: &str, partition: u32, mode: MountMode) -> MountRequest {
     }
 }
 
-/// Force-unmount anything left mounted if a test panics, so no mount outlives its server.
+/// Force-unmount this test's volumes if it panics, so no mount outlives its server.
 struct Cleanup;
 impl Drop for Cleanup {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            for v in runtime().list() {
-                let _ = runtime().unmount(&v.id, true);
-            }
+            unmount_this_tests_volumes();
         }
     }
 }
@@ -65,7 +54,7 @@ fn mount(r: MountRequest) -> (VolumeStatus, PathBuf) {
 }
 
 fn unmount(st: &VolumeStatus) {
-    runtime().unmount(&st.id, false).expect("unmount failed");
+    unmount_settled(&st.id);
     assert!(!lumendisk_core::nfs_loopback::is_mountpoint(Path::new(&st.mountpoint)));
 }
 

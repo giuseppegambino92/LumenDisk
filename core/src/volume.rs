@@ -1183,9 +1183,18 @@ impl Runtime {
         if let Some((s, _, _)) = v.portal.lock().unwrap().take() {
             s.stop();
         }
-        let r = lock_stack(&v.fs).sync().map_err(|e| e.to_string());
+        let r = {
+            let mut g = lock_stack(&v.fs);
+            let r = g.sync().map_err(|e| e.to_string());
+            // Release the layers now. An NFS request or a timer round can still hold the stack
+            // (they outlive `stop()` / `abort()`); they must not keep the device, its WAL or a
+            // remote volume's offline queue alive after the unmount has returned.
+            g.inner = Lower::Direct(Box::new(NullFs));
+            r
+        };
         if let Some(w) = &v.wal {
-            let _ = w.flush_all();
+            // (the server's durability hook and status calls hold the WAL too)
+            w.close();
         }
         let _ = std::fs::remove_dir(&v.mountpoint);
         self.vols.lock().unwrap().remove(&v.id);

@@ -510,6 +510,24 @@ impl WalDev {
         self.flush_round(true, true)
     }
 
+    /// Clean unmount: flush everything and delete the journal now, instead of when the last
+    /// handle goes (a request or a status call can still hold one for a moment). Nothing may
+    /// write through this device afterwards. Returns false (journal kept, as after a crash)
+    /// when the flush fails or something was written meanwhile.
+    pub fn close(&self) -> bool {
+        if self.flush_all().is_err() {
+            return false;
+        }
+        let mut s = self.st.lock().unwrap();
+        if s.dead || !s.txn.is_empty() || !s.committed.is_empty() || !s.written.is_empty() || !s.flushing.is_empty() {
+            return false;
+        }
+        s.dead = true; // done: Drop must neither flush nor delete again
+        drop(s);
+        let _ = std::fs::remove_file(&self.path);
+        true
+    }
+
     fn overlay_block(s: &State, blk: u64) -> Option<&[u8]> {
         s.txn.get(&blk).or_else(|| s.committed.get(&blk)).or_else(|| s.written.get(&blk)).or_else(|| s.flushing.get(&blk)).map(|b| &b[..])
     }

@@ -16,16 +16,7 @@ use lumendisk_core::volume::{runtime, MountMode, MountRequest, RemoteMountReques
 use lumendisk_core::wal::{Fault, Journaled, WalDev};
 
 fn setup(name: &str) -> PathBuf {
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("{info}");
-        for v in runtime().list() {
-            let _ = runtime().unmount(&v.id, true);
-        }
-    }));
-    let dir = workdir(name);
-    runtime().set_support_dir(&dir.join("support"));
-    fs::create_dir_all(dir.join("mnt")).unwrap();
-    dir
+    setup_in_process("phase3", name)
 }
 
 fn req(dir: &Path, path: &str, mode: MountMode) -> MountRequest {
@@ -36,7 +27,7 @@ fn req(dir: &Path, path: &str, mode: MountMode) -> MountRequest {
         ghost_shield: true,
         ghost_rules: None,
         uid_map: None,
-        mount_root: Some(dir.join("mnt").to_string_lossy().into_owned()),
+        mount_root: Some(mount_root(&dir).to_string_lossy().into_owned()),
         name: None,
         fd: None,
         volume_icon: None,
@@ -146,7 +137,7 @@ fn e2e_webdav_apache_rfc4918_with_offline_queue() {
         mode: MountMode::ReadWrite,
         ghost_shield: true,
         name: Some("NAS".into()),
-        mount_root: Some(dir.join("mnt").to_string_lossy().into_owned()),
+        mount_root: Some(mount_root(&dir).to_string_lossy().into_owned()),
         volume_icon: None,
     };
     // Wrong password is refused.
@@ -175,6 +166,14 @@ fn e2e_webdav_apache_rfc4918_with_offline_queue() {
     assert!(o.contains("dal MAC") && o.contains("# ciao") && o.contains("rinominato.txt"), "{o}");
     assert!(!o.contains(".DS_Store"), "Ghost Shield: junk must not reach the NAS\n{o}");
 
+    // Browse the folders while online, as Finder does before anything is saved into them.
+    // Offline, a new name can only be created in a folder whose listing is cached: otherwise
+    // the name might exist on the server and the queued create would clobber it (EIO instead).
+    // (This used to pass without it only when some other process — Spotlight, Docker Desktop's
+    // VM — happened to list the mount while online.)
+    assert!(fs::read_dir(&mp).unwrap().count() >= 2);
+    assert!(fs::read_dir(mp.join("Documenti")).unwrap().count() >= 3);
+
     // ── offline: pause the server, keep working, quit, come back ──
     assert!(Command::new("docker").args(["pause", &name]).status().unwrap().success());
     wait_for("offline", Duration::from_secs(8), || !status(&st.id).remote.unwrap().online);
@@ -189,9 +188,11 @@ fn e2e_webdav_apache_rfc4918_with_offline_queue() {
     fs::write(mp.join("Nuova offline/dentro.bin"), vec![42u8; 300_000]).unwrap();
     assert!(status(&st.id).remote.unwrap().pending_ops >= 3);
     // Eject while still offline: nothing is lost, the queue is persisted.
-    runtime().unmount(&st.id, false).unwrap();
-    let qdir = dir.join("support/OfflineQueue");
-    let queued: Vec<_> = walk(&qdir).into_iter().filter(|p| p.ends_with("queue.json")).collect();
+    unmount_settled(&st.id);
+    // (this volume's queue: other remote volumes of the suite share the support dir)
+    let qdir = runtime().support().join("OfflineQueue");
+    let ours = |p: &PathBuf| p.ends_with("queue.json") && fs::read_to_string(p).map(|q| q.contains(&base)).unwrap_or(false);
+    let queued: Vec<_> = walk(&qdir).into_iter().filter(|p| ours(p)).collect();
     assert_eq!(queued.len(), 1, "offline queue must be on disk: {:?}", walk(&qdir));
     // Server comes back; the volume is mounted again and the queue drains by itself.
     assert!(Command::new("docker").args(["unpause", &name]).status().unwrap().success());
@@ -199,8 +200,8 @@ fn e2e_webdav_apache_rfc4918_with_offline_queue() {
     wait_for("queued changes synced after restart", Duration::from_secs(30), || status(&st2.id).remote.map(|r| r.online && r.pending_ops == 0).unwrap_or(false));
     let (_, o) = sh(Command::new("docker").args(["exec", &name, "sh", "-c", "cat '/srv/dav/Documenti/offline 1.txt'; echo; stat -c %s '/srv/dav/Nuova offline/dentro.bin'"]));
     assert!(o.contains("scritto senza rete") && o.contains("300000"), "{o}");
-    runtime().unmount(&st2.id, false).unwrap();
-    assert!(walk(&qdir).iter().all(|p| !p.ends_with("queue.json")), "queue must be cleared once synced");
+    unmount_settled(&st2.id);
+    assert!(!walk(&qdir).iter().any(ours), "queue must be cleared once synced");
 }
 
 fn walk(p: &Path) -> Vec<PathBuf> {
@@ -266,7 +267,7 @@ fn ordered_crash(fs_name: &str, mkfs: &str, fsck: &str) {
     let mp = PathBuf::from(&st.mountpoint);
     assert!(fs::read(mp.join("video.mov")).unwrap() == video, "video content after replay");
     assert_eq!(fs::read_dir(mp.join("Progetto")).unwrap().count(), 100);
-    runtime().unmount(&st.id, false).unwrap();
+    unmount_settled(&st.id);
     let (c, o) = docker(&dir, fsck);
     assert_eq!(c, 0, "fsck after replay:\n{o}");
 }
@@ -319,7 +320,7 @@ fn e2e_physical_device_mount_benchmark_health() {
     let h = lumendisk_core::health::disk_health(&devnode).unwrap();
     println!("health: {h:?}");
     assert!(h.protocol.is_some());
-    runtime().unmount(&st.id, false).unwrap();
+    unmount_settled(&st.id);
     drop(_att);
     let (c, o) = docker(&dir, "e2fsck -fn usb.img && debugfs -R 'cat \"/dalla chiavetta.txt\"' usb.img");
     assert_eq!(c, 0, "{o}");
@@ -376,7 +377,7 @@ fn lan_req(dir: &Path, url: String, code: &str, fp: Option<String>) -> RemoteMou
         mode: MountMode::ReadWrite,
         ghost_shield: true,
         name: Some("Mac di Anna".into()),
-        mount_root: Some(dir.join("mnt").to_string_lossy().into_owned()),
+        mount_root: Some(mount_root(&dir).to_string_lossy().into_owned()),
         volume_icon: None,
     }
 }
@@ -414,7 +415,7 @@ fn e2e_lan_share_tls_encrypted_pinned_and_impostor_proof() {
     assert!(!contains(&wire, token.as_bytes()), "bearer token visible on the wire!");
     assert!(!contains(&wire, b"PROPFIND"), "WebDAV verbs visible on the wire!");
     println!("TLS: {} bytes relayed, no plaintext content/token/verbs observed", wire.len());
-    runtime().unmount(&client.id, false).unwrap();
+    unmount_settled(&client.id);
 
     // 2. Impostor: right certificate pin for the *impostor*, but it doesn't know our pairing
     //    code → the proof fails and the token is never sent.
@@ -426,9 +427,9 @@ fn e2e_lan_share_tls_encrypted_pinned_and_impostor_proof() {
     // 4. Typed address without a fingerprint: learned on first contact + pairing proof.
     let typed = runtime().mount_remote(lan_req(&dir, format!("http://127.0.0.1:{}", share.port), &share.pairing_code, None)).unwrap();
     assert_eq!(fs::read_to_string(PathBuf::from(&typed.mountpoint).join("dal client.txt")).unwrap(), "RISPOSTA-RISERVATA-4242");
-    runtime().unmount(&typed.id, false).unwrap();
+    unmount_settled(&typed.id);
     runtime().share_stop(&host.id).unwrap();
     runtime().share_stop(&evil.id).unwrap();
-    runtime().unmount(&host.id, false).unwrap();
-    runtime().unmount(&evil.id, false).unwrap();
+    unmount_settled(&host.id);
+    unmount_settled(&evil.id);
 }

@@ -18,16 +18,7 @@ use lumendisk_core::volume::{runtime, ImageUrlRequest, MountMode, MountRequest, 
 use lumendisk_core::wal::{Fault, Journaled, WalDev};
 
 fn setup(name: &str) -> PathBuf {
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("{info}");
-        for v in runtime().list() {
-            let _ = runtime().unmount(&v.id, true);
-        }
-    }));
-    let dir = workdir(name);
-    runtime().set_support_dir(&dir.join("support"));
-    fs::create_dir_all(dir.join("mnt")).unwrap();
-    dir
+    setup_in_process("phase2", name)
 }
 
 fn req(dir: &Path, img: &str, mode: MountMode) -> MountRequest {
@@ -38,7 +29,7 @@ fn req(dir: &Path, img: &str, mode: MountMode) -> MountRequest {
         ghost_shield: true,
         ghost_rules: None,
         uid_map: None,
-        mount_root: Some(dir.join("mnt").to_string_lossy().into_owned()),
+        mount_root: Some(mount_root(&dir).to_string_lossy().into_owned()),
         name: None,
         fd: None,
         volume_icon: None,
@@ -92,7 +83,7 @@ fn e2e_ntfs_symlinks_cp_r() {
     }
     assert_eq!(fs::read_to_string(m.join("rel_link")).unwrap(), "contenuto reale\n");
     assert_eq!(fs::read(m.join("dir_link/deep/x.bin")).unwrap().len(), 100_000);
-    runtime().unmount(&st.id, false).unwrap();
+    unmount_settled(&st.id);
 
     // Byte-for-byte targets after a fresh open of the raw image.
     let dev: Arc<dyn BlockDev> = Arc::new(FileDev::open(&dir.join("disk.img"), true).unwrap());
@@ -160,7 +151,7 @@ fn crash_and_recover(fs_name: &str, mkfs: &str, fsck: &str) {
     let n = fs::read_dir(PathBuf::from(&st.mountpoint).join("Lavoro")).unwrap().count();
     assert_eq!(n, 300);
     assert_eq!(fs::read_to_string(PathBuf::from(&st.mountpoint).join("Lavoro/documento numero 299.txt")).unwrap(), "riga 299\n".repeat(50));
-    runtime().unmount(&st.id, false).unwrap();
+    unmount_settled(&st.id);
     assert!(!wp.exists(), "clean unmount removes the WAL");
     let (c, o) = docker(&dir, fsck);
     assert_eq!(c, 0, "fsck after replay:\n{o}");
@@ -170,6 +161,27 @@ fn crash_and_recover(fs_name: &str, mkfs: &str, fsck: &str) {
 #[ignore]
 fn e2e_wal_crash_recovery_fat32() {
     crash_and_recover("fat32", "mkfs.fat -F 32 -n WALTEST", "fsck.fat -n disk.img");
+}
+
+/// An NFS request, a timer round or a status call from another thread (`list()` clones every
+/// volume) can still hold a volume when it is unmounted. The unmount must release it anyway:
+/// once it returns, the WAL is gone.
+#[test]
+#[ignore]
+fn e2e_unmount_releases_the_volume_while_a_request_still_holds_it() {
+    let dir = setup("p2_release");
+    let img = dir.join("disk.img");
+    runtime().create_image(img.to_str().unwrap(), "EXT4", 32, "RELEASE").unwrap();
+    let st = runtime().mount(req(&dir, "disk.img", MountMode::ReadWrite)).unwrap();
+    fs::write(PathBuf::from(&st.mountpoint).join("a.txt"), "x").unwrap();
+    let dev: Arc<dyn BlockDev> = Arc::new(FileDev::open(&img, true).unwrap());
+    let wp = lumendisk_core::wal::wal_path(&runtime().support(), &lumendisk_core::volume::Runtime::wal_key(&dev, &img.to_string_lossy(), 0));
+    drop(dev);
+    assert!(wp.exists(), "a writable mount keeps a WAL");
+    let in_flight = runtime().get(&st.id).unwrap(); // e.g. a status call not finished yet
+    unmount_settled(&st.id);
+    assert!(!wp.exists(), "the WAL must be removed when the unmount returns, not when the last holder lets go");
+    drop(in_flight);
 }
 
 #[test]
@@ -270,7 +282,7 @@ fn e2e_loopback_rejects_foreign_uid_and_second_mount() {
     // The real mount keeps working.
     fs::write(PathBuf::from(&st.mountpoint).join("ok.txt"), "still fine").unwrap();
     assert_eq!(fs::read_to_string(PathBuf::from(&st.mountpoint).join("ok.txt")).unwrap(), "still fine");
-    runtime().unmount(&st.id, false).unwrap();
+    unmount_settled(&st.id);
 }
 
 // ───────────────────────── 4. Remote .img over HTTP Range ─────────────────────────
@@ -344,7 +356,7 @@ fn e2e_remote_image_http_range() {
         mode: MountMode::Shadow,
         ghost_shield: true,
         name: None,
-        mount_root: Some(dir.join("mnt").to_string_lossy().into_owned()),
+        mount_root: Some(mount_root(&dir).to_string_lossy().into_owned()),
         volume_icon: None,
     };
     let t0 = Instant::now();
@@ -374,8 +386,8 @@ fn e2e_remote_image_http_range() {
     assert!(mount_time < Duration::from_secs(3), "mount took {mount_time:?}");
     runtime().shadow_rollback(&boot.id).unwrap();
     runtime().shadow_rollback(&rootfs.id).unwrap();
-    runtime().unmount(&boot.id, false).unwrap();
-    runtime().unmount(&rootfs.id, false).unwrap();
+    unmount_settled(&boot.id);
+    unmount_settled(&rootfs.id);
     assert_eq!(fnv(&fs::read(&img).unwrap()), before, "the remote image must never be modified");
 }
 
@@ -453,7 +465,7 @@ fn e2e_lan_share_zero_beachball_disconnect() {
         mode: MountMode::ReadWrite,
         ghost_shield: true,
         name: Some("Disco di Rete".into()),
-        mount_root: Some(dir.join("mnt").to_string_lossy().into_owned()),
+        mount_root: Some(mount_root(&dir).to_string_lossy().into_owned()),
         volume_icon: None,
     };
     // Wrong pairing code is refused.
@@ -505,9 +517,9 @@ fn e2e_lan_share_zero_beachball_disconnect() {
     });
     // Ghost Shield on the client: the junk never crossed the network.
     assert!(!hmp.join(".DS_Store").exists());
-    runtime().unmount(&client.id, false).unwrap();
+    unmount_settled(&client.id);
     runtime().share_stop(&host.id).unwrap();
-    runtime().unmount(&host.id, false).unwrap();
+    unmount_settled(&host.id);
 }
 
 // ───────────────────────── 6. SFTP mount (real OpenSSH) ─────────────────────────
@@ -554,7 +566,7 @@ fn e2e_sftp_mount_roundtrip() {
         mode: MountMode::ReadWrite,
         ghost_shield: true,
         name: Some("Raspberry".into()),
-        mount_root: Some(dir.join("mnt").to_string_lossy().into_owned()),
+        mount_root: Some(mount_root(&dir).to_string_lossy().into_owned()),
         volume_icon: None,
     };
     let mut st = None;
@@ -576,7 +588,7 @@ fn e2e_sftp_mount_roundtrip() {
     std::os::unix::fs::symlink("../server.txt", mp.join("sotto/link")).unwrap();
     fs::write(mp.join("._dal mac.bin"), "appledouble").unwrap();
     wait_for("sftp upload", Duration::from_secs(20), || status(&st.id).remote.map(|r| r.pending_ops == 0).unwrap_or(false));
-    runtime().unmount(&st.id, false).unwrap();
+    unmount_settled(&st.id);
     let o = std::process::Command::new("docker")
         .args(["exec", &name, "sh", "-c", "cd /home/pi/progetti && sha256sum 'dal mac.bin' && readlink sotto/link && ls -a"])
         .output()
@@ -617,7 +629,7 @@ fn e2e_portal_and_volume_icon() {
     assert!(page.to_lowercase().contains("pin"), "{page}");
     assert!(status(&st.id).portal.is_some());
     runtime().portal_stop(&st.id).unwrap();
-    runtime().unmount(&st.id, false).unwrap();
+    unmount_settled(&st.id);
     // …but nothing was written to the disk.
     let (c, o) = docker(&dir, "debugfs -R 'ls -a /' disk.img 2>/dev/null");
     assert_eq!(c, 0);
