@@ -17,7 +17,7 @@
   <img src="docs/screenshots/it-01-volume.png" alt="LumenDisk: un volume ext4 con la scheda Salute e Velocità Disco" width="860">
 </p>
 
-LumenDisk monta su macOS dischi, schede SD e immagini disco **ext2/ext3/ext4, NTFS, FAT12/16/32 ed exFAT** in lettura e scrittura completa, così si comportano come qualsiasi altro disco nel Finder. Monta anche **server SFTP, condivisioni WebDAV/NAS, altri Mac della tua rete** e **file `.img` / `.iso` remoti** senza scaricarli.
+LumenDisk monta su macOS dischi, schede SD e immagini disco **ext2/ext3/ext4, NTFS, FAT12/16/32 ed exFAT** in lettura e scrittura completa, così si comportano come qualsiasi altro disco nel Finder. Monta anche **server SFTP, condivisioni WebDAV/NAS, altri Mac della tua rete** e **file `.img` / `.iso` remoti** senza scaricarli. E **formatta unità** con undici filesystem e **crea supporti avviabili** per Windows, Linux e Raspberry Pi, come Rufus e Raspberry Pi Imager, direttamente sul Mac.
 
 Tutto gira in spazio utente: un motore in Rust, con i suoi driver dei file system, presenta ogni volume a macOS tramite un server NFS privato in loopback, e il `mount_nfs` di macOS lo mette nel Finder. Nel kernel non si installa nulla e la Protezione dell'integrità del sistema resta attiva.
 
@@ -44,6 +44,19 @@ Richiede macOS 14 Sonoma o successivo.
 - **Immagini con più partizioni**: trascina un'immagine Raspberry Pi e monti `bootfs` (FAT32) e `rootfs` (ext4) affiancate, pronte da modificare prima di scriverle sulla scheda.
 - **I dischi che macOS non sa leggere** compaiono come *"Non montato da macOS · Pronto per LumenDisk"* con il pulsante **Monta Ora**.
 - **Dischi di prova**: crea con un clic un'immagine vuota ext4, NTFS, FAT32 o exFAT.
+
+### Formattazione e supporti avviabili
+- **Formatta qualsiasi unità** in **ext2/3/4, FAT16, FAT32 (anche oltre 32 GB), exFAT, NTFS, Btrfs, XFS, F2FS o UFS2**, con tabella delle partizioni **GPT, MBR o APM** oppure senza, con l'etichetta e la **dimensione dei cluster** che preferisci. Ogni filesystem è scritto da LumenDisk stesso, senza strumenti esterni, e verificato con quelli ufficiali (`e2fsck`, `fsck.vfat`, `fsck.exfat`, `ntfsfix`, `btrfs check`, `xfs_repair`, `fsck.f2fs`, `fsck_ffs` di FreeBSD).
+- **Scrivi immagini** su chiavette USB e schede SD: `.iso`, `.img`, `.dmg`, `.vhd`, anche compresse (`.xz`, `.gz`, `.bz2`, `.zst`, `.zip`). L'immagine viene confrontata con il suo SHA-256 prima di scrivere, e alla fine l'unità viene riletta e confrontata.
+- **Supporti di installazione di Windows 11, 10, 8.1 e 7**: FAT32 con `install.wim` diviso in parti `.swm` quando supera i 4 GB, oppure NTFS con UEFI:NTFS. Entrambi si avviano in UEFI (anche con Secure Boot, su NTFS grazie a UEFI:NTFS firmato Microsoft) e sui PC BIOS.
+  - **Opzioni per Windows 11**: salta i controlli di TPM 2.0, Secure Boot, RAM e CPU; crea un account locale senza account Microsoft né rete; salta le domande sulla privacy; imposta lingua e fuso orario. Puoi anche usare un tuo `autounattend.xml`.
+- **Linux e BSD**: la **modalità DD** scrive ISO ibride e immagini byte per byte. La **modalità ISO** copia i file su un'unità FAT32 che si avvia in UEFI e, per le ISO basate su SYSLINUX, anche da BIOS, con una **partizione di persistenza** facoltativa per i sistemi live Ubuntu (casper) e Debian/Kali (live-boot).
+- **Raspberry Pi**: dopo aver scritto Raspberry Pi OS o Ubuntu, imposta nome host, utente e password, SSH (anche con chiavi), Wi-Fi con il suo paese, lingua, fuso orario e tastiera, come fa Raspberry Pi Imager (firstrun o cloud-init, scelto in base all'immagine).
+- **Utilità**:
+  - **Checksum**: SHA-256, SHA-1 e MD5 di immagini e unità, confrontati con un valore incollato o con un file `SHA256SUMS` accanto all'immagine.
+  - **Cancellazione sicura**: zeri, casuale, DoD 5220.22-M (3 o 7 passaggi) o Gutmann (35 passaggi).
+  - **Dottore delle tabelle delle partizioni**: trova e ripara tabelle GPT e MBR danneggiate, e converte MBR in GPT e viceversa senza spostare i dati.
+- **Sicurezza**: si possono scrivere solo unità esterne, schede SD e immagini disco. Il disco di avvio e le unità interne sono sempre rifiutati, e ogni cancellazione va confermata dopo aver visto nome, dimensione e volumi dell'unità. Per scrivere su un'unità si usa la richiesta di autorizzazione di macOS (`authopen`): LumenDisk non esegue mai codice con privilegi.
 
 ### Protezione
 - **Ghost Shield**: `.DS_Store`, i file AppleDouble `._*`, `.Spotlight-V100`, `.Trashes` e `.fseventsd` restano in un archivio locale e non vengono mai scritti sul disco Linux o Windows. Il Finder funziona come sempre.
@@ -160,6 +173,15 @@ Il modello delle minacce è descritto in [SECURITY.md](SECURITY.md). Copre:
 - La maggior parte degli adattatori USB nasconde i dati SMART a macOS; in quel caso LumenDisk lo dice chiaramente.
 - Ogni close() o `fsync` di un file scritto attende un `F_FULLFSYNC` (circa 4 ms su un SSD Apple; le richieste concorrenti ne condividono uno), quindi copiare 1.500 file piccoli con `cp` richiede circa 9 s invece di circa 2 s. I file grandi ne risentono poco (150 MB: 0,23–0,32 s invece di 0,20–0,35 s). In caso di blackout possono mancare le modifiche più recenti di circa 100 ms non ancora chiuse o salvate con `fsync`. Sui volumi SFTP, WebDAV e LAN la garanzia è quella della cache remota, non questa.
 - Shadow Mode: un'applicazione delle modifiche già iniziata non si può annullare; la garanzia è che si può sempre portare a termine. Il controllo che il disco non sia stato modificato altrove guarda i metadati del file system e i file toccati dalla sessione, quindi una modifica fatta altrove che non cambia né gli uni né gli altri può sfuggire; non viene fatto mentre si completa un'applicazione interrotta. Sui volumi SFTP, WebDAV e LAN il controllo confronta dimensione e data di modifica (al secondo su SFTP) di ciò che la sessione ha letto, più l'ETag su WebDAV, quindi una modifica sul server che li lascia tutti uguali può sfuggire. Le loro sessioni salvate si possono verificare e riprendere solo ricollegandosi al server, perché nessuna password viene salvata, e durante l'applicazione il Finder attende il caricamento.
+
+- **Formattazione e supporti avviabili**:
+  - I supporti Windows sono stati provati con immagini di installazione sintetiche, con UEFI:NTFS e i settori di avvio Microsoft reali in QEMU (BIOS, UEFI, Secure Boot), e con set `install.wim` verificati da wimlib. Windows Setup vero e proprio (lettura delle parti `.swm`, applicazione di `autounattend.xml`) non è stato eseguito qui, perché nei test non è stata usata una ISO di Windows.
+  - I supporti di Windows 7 x64 si avviano in UEFI solo se la ISO contiene i file `efi/boot`.
+  - La modalità ISO si avvia da BIOS solo con le ISO basate su SYSLINUX 6.x: per le ISO solo GRUB (Ubuntu 20.10 e successive) e i SYSLINUX più vecchi serve la modalità DD sui PC BIOS, come suggerisce LumenDisk. I file oltre 4 GB richiedono la modalità DD.
+  - Su SSD, chiavette USB e schede SD nessun numero di passaggi garantisce che ogni copia dei dati sparisca (wear levelling, blocchi di riserva): la scelta affidabile è un passaggio più la cancellazione sicura del dispositivo stesso.
+  - Btrfs è a dispositivo singolo; F2FS e Btrfs vengono creati senza TRIM.
+  - Le immagini `.gz` e `.bz2` rivelano la loro dimensione solo durante la decompressione, quindi un'unità troppo piccola si scopre durante la scrittura invece che prima.
+  - Non sono supportati i DMG vecchi senza tabella XML, VHDX, QCOW2, 7z e RAR.
 
 ## Supporto
 

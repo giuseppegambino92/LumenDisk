@@ -17,7 +17,7 @@
   <img src="docs/screenshots/en-01-volume.png" alt="LumenDisk: an ext4 volume with the disk health and speed card" width="860">
 </p>
 
-LumenDisk mounts **ext2/ext3/ext4, NTFS, FAT12/16/32 and exFAT** drives, SD cards and disk images on macOS with full read/write access, so they behave like any other drive in Finder. It also mounts **SFTP servers, WebDAV/NAS shares, other Macs on your network** and **remote `.img` / `.iso` files** without downloading them.
+LumenDisk mounts **ext2/ext3/ext4, NTFS, FAT12/16/32 and exFAT** drives, SD cards and disk images on macOS with full read/write access, so they behave like any other drive in Finder. It also mounts **SFTP servers, WebDAV/NAS shares, other Macs on your network** and **remote `.img` / `.iso` files** without downloading them. And it **formats drives** with eleven filesystems and **writes bootable media** for Windows, Linux and Raspberry Pi, like Rufus and Raspberry Pi Imager, natively on the Mac.
 
 Everything runs in user space: a Rust engine with its own filesystem drivers serves each volume to macOS through a private loopback NFS server, and macOS's own `mount_nfs` puts it in Finder. Nothing is installed in the kernel, and System Integrity Protection stays on.
 
@@ -44,6 +44,19 @@ Requires macOS 14 Sonoma or later.
 - **Multi-partition images**: drop a Raspberry Pi image and mount `bootfs` (FAT32) and `rootfs` (ext4) side by side, ready to edit before flashing.
 - **Drives macOS can't read** show up as *"Not mounted by macOS · Ready for LumenDisk"* with a one-click **Mount Now**.
 - **Create test disks**: blank ext4, NTFS, FAT32 or exFAT images in one click.
+
+### Format and bootable media
+- **Format any drive** with **ext2/3/4, FAT16, FAT32 (also above 32 GB), exFAT, NTFS, Btrfs, XFS, F2FS or UFS2**, on a **GPT, MBR or APM** partition table or none, with your own label and **cluster size**. Every filesystem is written by LumenDisk itself, with no external tools, and checked against the official ones (`e2fsck`, `fsck.vfat`, `fsck.exfat`, `ntfsfix`, `btrfs check`, `xfs_repair`, `fsck.f2fs`, FreeBSD `fsck_ffs`).
+- **Write images** to USB sticks and SD cards: `.iso`, `.img`, `.dmg`, `.vhd`, also compressed (`.xz`, `.gz`, `.bz2`, `.zst`, `.zip`). The image is checked against its SHA-256 before writing, and the drive is read back and compared afterwards.
+- **Windows 11, 10, 8.1 and 7 installation media**: FAT32 with `install.wim` split into `.swm` parts when it is larger than 4 GB, or NTFS with UEFI:NTFS. Both boot on UEFI (also with Secure Boot, on NTFS through the Microsoft-signed UEFI:NTFS) and on BIOS PCs.
+  - **Optional for Windows 11**: skip the TPM 2.0, Secure Boot, RAM and CPU checks; create a local account without a Microsoft account or network; skip the privacy questions; preset language and time zone. You can also supply your own `autounattend.xml`.
+- **Linux and BSD**: **DD mode** writes hybrid ISOs and images byte for byte. **ISO mode** copies the files onto a FAT32 drive that boots on UEFI and, for SYSLINUX-based ISOs, on BIOS, with an optional **persistence partition** for Ubuntu (casper) and Debian/Kali (live-boot) live systems.
+- **Raspberry Pi**: after writing Raspberry Pi OS or Ubuntu, set hostname, user and password, SSH (also with keys), Wi-Fi with its country, locale, time zone and keyboard, the way Raspberry Pi Imager does (firstrun or cloud-init, chosen from the image).
+- **Utilities**:
+  - **Checksums**: SHA-256, SHA-1 and MD5 of images and drives, compared with a value you paste or a `SHA256SUMS` file next to the image.
+  - **Secure wipe**: zeros, random, DoD 5220.22-M (3 or 7 passes) or Gutmann (35 passes).
+  - **Partition table doctor**: finds and repairs damaged GPT and MBR tables, and converts MBR to GPT and back in place, without moving data.
+- **Safety**: only external drives, SD cards and disk images can be written. The startup disk and internal drives are always refused, and you confirm every erase after seeing the drive's name, size and volumes. Writing to a drive uses macOS's own `authopen` permission prompt: LumenDisk never runs privileged code.
 
 ### Protection
 - **Ghost Shield**: `.DS_Store`, `._*` AppleDouble files, `.Spotlight-V100`, `.Trashes` and `.fseventsd` are kept in a local vault and never written to your Linux or Windows disk. Finder still works as usual.
@@ -156,6 +169,14 @@ The threat model (who can reach the loopback NFS server and why `AUTH_SYS` is sa
 - Most USB bridges hide SMART data from macOS; LumenDisk then says so plainly.
 - Every close() or `fsync` of a written file waits for an `F_FULLFSYNC` (about 4 ms on an Apple SSD; concurrent requests share one), so copying 1,500 small files with `cp` takes about 9 s instead of about 2 s. Large files are barely affected (150 MB: 0.23–0.32 s instead of 0.20–0.35 s). On a power cut, changes younger than about 100 ms that weren't closed or `fsync`ed can be missing. On SFTP, WebDAV and LAN volumes the guarantee is the remote cache's, not this one.
 - Shadow Mode: a commit can't be rolled back once it has started; the guarantee is that it can always be finished. The check that the disk wasn't changed elsewhere looks at filesystem metadata and at the files the session touched, so an edit made elsewhere that leaves both unchanged can go unnoticed; it isn't done while a commit is being finished. On SFTP, WebDAV and LAN volumes that check compares the size and modification time (to the second on SFTP) of what the session read, plus the ETag on WebDAV, so an edit on the server that keeps all of them goes unnoticed. Their saved sessions can only be checked and resumed by connecting to the server again, since no password is stored, and Finder waits while a commit uploads.
+- **Format and bootable media**:
+  - Windows media were tested with synthetic installation images, real UEFI:NTFS and Microsoft boot records in QEMU (BIOS, UEFI, Secure Boot), and `install.wim` sets verified with wimlib. Windows Setup itself (reading the `.swm` parts, applying `autounattend.xml`) was not run here, because no Windows ISO was used in the tests.
+  - Windows 7 x64 media boot on UEFI only if the ISO has `efi/boot` files.
+  - ISO mode boots on BIOS only for SYSLINUX 6.x ISOs: for GRUB-only ISOs (Ubuntu 20.10 and later) and older SYSLINUX, use DD mode for BIOS PCs, as LumenDisk suggests. Files over 4 GB need DD mode.
+  - On SSDs, USB sticks and SD cards, no number of overwrite passes guarantees that every copy of the data is gone (wear levelling, spare blocks): one pass plus the device's own secure erase is the reliable choice.
+  - Btrfs is single-device; F2FS and Btrfs are created without TRIM.
+  - `.gz` and `.bz2` images reveal their size only while decompressing, so a too-small drive is detected during the write instead of before.
+  - Old DMGs without an XML table, VHDX, QCOW2, 7z and RAR images aren't supported.
 
 ## Support
 

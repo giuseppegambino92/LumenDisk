@@ -25,6 +25,8 @@ cd "$ROOT"
 export PATH="$HOME/.cargo/bin:$PATH"
 # Everything this script runs is an ad-hoc development build (see the header).
 export LUMENDISK_ALLOW_UNVERIFIED_LOOPBACK=1
+# Forge tests write disks: only disk images they attach themselves, never a physical disk.
+export LUMENDISK_FORGE_VIRTUAL_ONLY=1
 
 bold() { printf '\n\033[1m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -219,6 +221,22 @@ if [ "$HAVE_DOCKER" = 1 ]; then
   run_suite "Remote Shadow sessions: SFTP / WebDAV / LAN share, kill -9, restore, commit to the server, drift on server-side edits" remote_shadow_e2e --nocapture
   run_suite "Persistent Shadow on an attached block device (/dev/diskNs1, /dev/rdiskN): kill -9, resume, commit, e2fsck; raw-node I/O" device_shadow_e2e --nocapture
   run_suite "Zero loss window: SIGKILL right after mkdir / create / rename / unlink / close / fsync, Shadow and read/write, ext4 and FAT32, fsck" durability_e2e --nocapture
+
+  # ── Forge (1.1): formatting, flashing, bootable media, utilities ──
+  run_suite "Format: GPT / MBR / APM / none × ext2-4, FAT16/32, exFAT, NTFS, cluster sizes, 4Kn; table doctor (repair, MBR⇄GPT); sgdisk, parted, every fsck, macOS diskutil" format_e2e
+  run_suite "Flash: raw, gz, xz, bz2, zstd, zip, VHD, DMG written to files and attached disks byte for byte; cancel; size and checksum refusals; hybrid ISOs" flash_e2e
+  run_suite "mkfs Btrfs / XFS vs btrfs check, xfs_repair, blkid, kernel mount + write; XFS headers identical to mkfs.xfs" mkfs_linux_e2e
+  if [ -n "${FULL:-}" ]; then
+    run_suite "mkfs F2FS vs fsck.f2fs / kernel, byte comparison with mkfs.f2fs; UFS2 vs FreeBSD 14.5 newfs + fsck_ffs + mount in a VM" mkfs_f2fs_ufs_e2e --nocapture
+    run_suite "Windows media: WIM split vs wimlib, FAT32 / NTFS+UEFI:NTFS, QEMU boots (OVMF, Secure Boot, SeaBIOS), >4 GiB WIM" windows_e2e --nocapture
+    run_suite "ISO 9660 / Joliet / Rock Ridge / UDF vs the Linux kernel; ISO mode: Alpine and Debian live booted with SeaBIOS and OVMF, persistence across a power cycle" iso_linux_e2e --nocapture
+    run_suite "Raspberry Pi OS trixie / bookworm and Ubuntu customised and booted in QEMU; SHA-512 crypt vs openssl / mkpasswd; secure wipe, every method" rpi_wipe_e2e --nocapture
+  else
+    run_suite "mkfs F2FS vs fsck.f2fs / kernel and byte comparison with mkfs.f2fs (UFS2 in a FreeBSD VM: FULL=1)" mkfs_f2fs_ufs_e2e --skip ufs2
+    run_suite "Windows media: WIM split vs wimlib, FAT32 / NTFS+UEFI:NTFS, QEMU boots (OVMF, Secure Boot, SeaBIOS) (>4 GiB WIM: FULL=1)" windows_e2e --skip big_wim_over_4gib
+    run_suite "ISO 9660 / Joliet / Rock Ridge / UDF vs the Linux kernel (real ISO boots and persistence: FULL=1)" iso_linux_e2e it_reader_matches_the_kernel_on_generated_images
+    run_suite "SHA-512 crypt vs openssl / mkpasswd; secure wipe, every method (real Raspberry Pi images: FULL=1)" rpi_wipe_e2e --skip raspios --skip ubuntu --skip qemu_boot
+  fi
 
   if [ -n "${FULL:-}" ]; then
     bold "Long driver suites (ntfs-3g / kernel ntfs3 / vfat / exfat / fsck_msdos / fsck_exfat)"
