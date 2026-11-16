@@ -38,6 +38,15 @@ const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 const BATCH_BYTES: usize = 8 << 20;
 const CHECKPOINT_BYTES: u64 = 64 << 20;
 
+/// Make the log durable (`F_FULLFSYNC` on macOS). Unit tests simulate crashes in-process,
+/// where the page cache survives: they skip the cache flush to stay fast.
+fn log_sync(f: &File) -> io::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    f.sync_data()
+}
+
 fn crc32c(data: &[u8]) -> u32 {
     !crate::vfs::ext4_fs::crc32c_raw(!0, data)
 }
@@ -132,7 +141,7 @@ impl WalDev {
         idb[..n].copy_from_slice(&id.as_bytes()[..n]);
         h.extend_from_slice(&idb);
         log.write_all_at(&h, 0)?;
-        log.sync_all()?;
+        log_sync(&log)?;
         Ok(Arc::new(WalDev {
             inner,
             path: path.to_path_buf(),
@@ -324,7 +333,7 @@ impl WalDev {
             }
             if let Some(rec) = &rec {
                 self.log.write_all_at(rec, at)?;
-                self.log.sync_data()?; // the record is durable before anything is written in place
+                log_sync(&self.log)?; // the record is durable before anything is written in place
             }
             Ok(())
         })();
@@ -370,7 +379,7 @@ impl WalDev {
             self.inner.flush()?;
             if s.log_len > HDR_LEN {
                 self.log.set_len(HDR_LEN)?;
-                self.log.sync_data()?;
+                log_sync(&self.log)?;
                 s.log_len = HDR_LEN;
             }
             s.wal_blocks.clear();

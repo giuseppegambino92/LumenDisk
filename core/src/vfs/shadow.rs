@@ -20,11 +20,15 @@
 //!   lower volume and re-executes the records through the same code paths in replay mode
 //!   (no re-logging, no data copies: chunk assignments point at the existing stage bytes).
 //!   Overlay ids are allocated by a deterministic counter, so they come out identical.
-//! * **Group commit.** Records are buffered and written as one CRC-protected frame at most
-//!   every 100 ms (and on `sync()`): stage file `F_FULLFSYNC` first, then the frame, then the
-//!   journal `F_FULLFSYNC`. Chunks referenced by a durable frame are never overwritten in place
+//! * **Group commit.** Records are buffered and written as one CRC-protected frame: stage file
+//!   barrier (`F_BARRIERFSYNC`) first, then the frame, then the journal `F_FULLFSYNC` (which
+//!   flushes the drive cache for the stage too). The NFS server runs one before every stable
+//!   reply — metadata operations, FILE_SYNC / DATA_SYNC writes, COMMIT — with the cache
+//!   flushes outside the volume lock ([`ShadowOverlay::durable_begin`]); requests arriving
+//!   meanwhile share the next one. UNSTABLE writes are covered by the next COMMIT or by the
+//!   100 ms timer. Chunks referenced by a written frame are never overwritten in place
 //!   (copy-on-write), so after a crash the recovered state is always a consistent prefix of
-//!   the operations.
+//!   the operations, and it includes every operation that was answered as stable.
 //! * **Drift detection.** The session stores a fingerprint of the lower volume
 //!   ([`FileSystem::fingerprint`]) and every record notes the attributes of the lower objects
 //!   it read. If the disk was modified elsewhere, recovery refuses and only Discard remains.
@@ -35,6 +39,34 @@
 //!   applied. After an error or a crash, `commit()` continues from the last checkpoint —
 //!   re-finding objects by path, so it also works on filesystems whose inode numbers are not
 //!   stable across mounts (FAT, exFAT).
+//!
+//! ## Redo semantics of a resumed commit
+//!
+//! A checkpoint is appended (and `F_FULLFSYNC`ed) only after the lower volume was synced, and
+//! the next window starts only after it, so after a crash exactly one window can be partly or
+//! wholly applied without a checkpoint: the one right after the last intact checkpoint frame
+//! (a torn frame at the end of `progress.ldj` is ignored, as if never written). The resume
+//! re-applies that window in *redo* mode, then continues normally. Within a window no two
+//! steps touch the same name or object, renames are alone, and steps are applied in order —
+//! so the state of each step's own name tells whether it ran:
+//!
+//! * **Create / Mkdir / Symlink**: the name exists → done, if it is what the step creates
+//!   (same kind; an empty file; the same symlink target), else the commit stops with an error
+//!   rather than adopt a foreign object. The object is mapped to what was found.
+//! * **Unlink / Rmdir**: the name is missing → done. The parent itself missing (a directory
+//!   emptied and removed in the same window) → done too: a later step of the window ran.
+//! * **Rename** (also over an existing target): source missing *and* target present → done;
+//!   source present → apply; both missing → error (the disk changed under the commit).
+//!   Only "not found" counts as missing: an I/O error stops the resume.
+//! * **SetAttr** (mode / owner): absolute values, applied again.
+//! * **File content**: truncate to the part of the old content that is kept, extend, write
+//!   every staged chunk, set the times — the same result however often it runs.
+//! * **Object map**: rebuilt by path from the plan's starting tree advanced to the window
+//!   start; an object whose path is known but missing is recorded as gone and never guessed
+//!   by its old inode number (freed, maybe reused, or renumbered on FAT/exFAT).
+//!
+//! Hard links are not part of plans (no LINK support); pre-existing ones are addressed by
+//! name like everything else.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -216,6 +248,8 @@ struct CommitRun {
     done: usize,
     /// plan object → lower inode, valid for the current mount.
     map: HashMap<Ino, Ino>,
+    /// Plan objects a resume looked for by path and didn't find (see `resolve_at`).
+    gone: HashSet<Ino>,
     /// Re-find objects and re-apply the last window idempotently before continuing.
     stale: bool,
     error: Option<String>,
@@ -549,6 +583,7 @@ impl ShadowOverlay {
                 done: done.min(plan.total()),
                 plan,
                 map: HashMap::new(),
+                gone: HashSet::new(),
                 stale: true,
                 error: manifest.commit_error.clone(),
                 progress: Some(progress),
@@ -1195,6 +1230,12 @@ impl ShadowOverlay {
             }
             let h = serde_json::to_vec(&Frame::Header { v: store::FORMAT_VERSION, next: s.next_start }).map_err(json_err)?;
             j.append(&h).map_err(io)?;
+            // The session itself must be durable before its first acknowledged operation:
+            // the directory entries of stage.bin / journal.ldj, and of the session directory.
+            store::sync_dir(&s.dir).map_err(io)?;
+            if let Some(p) = s.dir.parent() {
+                store::sync_dir(p).map_err(io)?;
+            }
             s.journal = Some(j);
         }
         let recs: Vec<JRec> = s.pending.drain(..k).collect();
@@ -1591,7 +1632,7 @@ impl ShadowOverlay {
                 s.manifest.updated = Timestamp::now().secs;
                 s.manifest.save(&s.dir, true).map_err(io)?;
             }
-            self.commit = Some(CommitRun { plan, done: 0, map: HashMap::new(), stale: false, error: None, progress, overlay_valid: true });
+            self.commit = Some(CommitRun { plan, done: 0, map: HashMap::new(), gone: HashSet::new(), stale: false, error: None, progress, overlay_valid: true });
         }
         let mut run = self.commit.take().unwrap();
         let res = self.run_commit(&mut run);
@@ -1618,13 +1659,24 @@ impl ShadowOverlay {
         }
     }
 
-    fn lo(run: &CommitRun, alias: &HashMap<Ino, Ino>, x: Ino) -> Ino {
-        *run.map.get(&x).or_else(|| alias.get(&x)).unwrap_or(&x)
+    /// Lower inode of plan object `x`. An object that a resume found missing from the disk
+    /// (see [`ShadowOverlay::resolve_at`]) has no inode: guessing one (its old number, freed
+    /// and maybe reused since; FAT/exFAT numbers that changed) could hit a different object.
+    fn lo(run: &CommitRun, alias: &HashMap<Ino, Ino>, x: Ino) -> FsResult<Ino> {
+        if run.gone.contains(&x) {
+            return Err(FsError::Io(crate::i18n::t(
+                "un oggetto del piano di applicazione non si trova più sul disco",
+                "an object of the commit plan is no longer on the disk",
+            )));
+        }
+        Ok(*run.map.get(&x).or_else(|| alias.get(&x)).unwrap_or(&x))
     }
 
     /// Re-find, by path, every object alive after `ops[..upto]` that the rest of the plan
-    /// refers to. Objects that can't be found keep their previous mapping.
-    fn resolve_at(&mut self, run: &mut CommitRun, upto: usize) {
+    /// refers to. An object whose path is known but which isn't on the disk is recorded as
+    /// gone (a redo uses that, see `apply_op`); one whose path isn't known yet (created later
+    /// in the plan) keeps its mapping. I/O errors stop the resume rather than count as "gone".
+    fn resolve_at(&mut self, run: &mut CommitRun, upto: usize) -> FsResult<()> {
         let t = sim_tree(&run.plan, upto);
         let root = run.plan.root;
         let mut wanted: Vec<Ino> = vec![];
@@ -1637,37 +1689,42 @@ impl ShadowOverlay {
             }
         }
         wanted.extend(run.plan.files.iter().map(|f| f.ino));
-        let mut cache: HashMap<Vec<String>, Ino> = HashMap::new();
-        cache.insert(vec![], self.lower.root_ino());
+        let mut cache: HashMap<Vec<String>, Option<Ino>> = HashMap::new();
+        cache.insert(vec![], Some(self.lower.root_ino()));
         for obj in wanted {
             if obj == root {
                 continue;
             }
             let Some(path) = tree_path(&t, root, obj) else { continue };
-            let mut cur = self.lower.root_ino();
-            let mut ok = true;
+            let mut cur = Some(self.lower.root_ino());
             for i in 0..path.len() {
                 if let Some(&c) = cache.get(&path[..=i]) {
                     cur = c;
-                    continue;
+                } else {
+                    cur = match self.lower.lookup(cur.unwrap(), &path[i]) {
+                        Ok(c) => Some(c),
+                        Err(FsError::NotFound | FsError::NotDir | FsError::Stale) => None,
+                        Err(e) => return Err(e),
+                    };
+                    cache.insert(path[..=i].to_vec(), cur);
                 }
-                match self.lower.lookup(cur, &path[i]) {
-                    Ok(c) => {
-                        cache.insert(path[..=i].to_vec(), c);
-                        cur = c;
-                    }
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
+                if cur.is_none() {
+                    break;
                 }
             }
-            if ok {
-                run.map.insert(obj, cur);
+            match cur {
+                Some(c) => {
+                    run.map.insert(obj, c);
+                    run.gone.remove(&obj);
+                }
+                None => {
+                    run.map.remove(&obj);
+                    run.gone.insert(obj);
+                }
             }
         }
+        Ok(())
     }
-
     fn checkpoint(&mut self, run: &mut CommitRun, step: usize) -> FsResult<()> {
         self.lower.sync()?;
         if let Some(p) = &mut run.progress {
@@ -1693,7 +1750,7 @@ impl ShadowOverlay {
         let total = run.plan.total();
         let mut step = run.done;
         if run.stale {
-            self.resolve_at(run, step.min(n_ops));
+            self.resolve_at(run, step.min(n_ops))?;
             if step < n_ops {
                 // The window after the last checkpoint may be partly applied already.
                 let w = window_end(&run.plan.ops, step);
@@ -1702,7 +1759,7 @@ impl ShadowOverlay {
                 }
                 self.checkpoint(run, w)?;
                 step = w;
-                self.resolve_at(run, step.min(n_ops));
+                self.resolve_at(run, step.min(n_ops))?;
             }
             run.stale = false;
         }
@@ -1753,13 +1810,16 @@ impl ShadowOverlay {
         }
     }
 
+    /// Apply structural step `k`. With `redo` the step may already be applied (it belongs to
+    /// the window after the last checkpoint, see the module docs): each kind checks for its
+    /// own effect first.
     fn apply_op(&mut self, run: &mut CommitRun, k: usize, redo: bool) -> FsResult<()> {
         let op = run.plan.ops[k].clone();
-        let lo = |x: Ino| Self::lo(run, &self.alias, x);
+        let unlink = matches!(op, Op::Unlink { .. });
         let gone = |e: &FsError| matches!(e, FsError::NotFound | FsError::Stale | FsError::NotDir);
         match op {
             Op::Create { parent, name, ino, perm, uid, gid } => {
-                let p = lo(parent);
+                let p = Self::lo(run, &self.alias, parent)?;
                 if redo {
                     if let Some(li) = self.redo_existing(p, &name, FileKind::File, None)? {
                         run.map.insert(ino, li);
@@ -1770,7 +1830,7 @@ impl ShadowOverlay {
                 run.map.insert(ino, li);
             }
             Op::Mkdir { parent, name, ino, perm, uid, gid } => {
-                let p = lo(parent);
+                let p = Self::lo(run, &self.alias, parent)?;
                 if redo {
                     if let Some(li) = self.redo_existing(p, &name, FileKind::Dir, None)? {
                         run.map.insert(ino, li);
@@ -1781,7 +1841,7 @@ impl ShadowOverlay {
                 run.map.insert(ino, li);
             }
             Op::Symlink { parent, name, target, ino, uid, gid } => {
-                let p = lo(parent);
+                let p = Self::lo(run, &self.alias, parent)?;
                 if redo {
                     if let Some(li) = self.redo_existing(p, &name, FileKind::Symlink, Some(&target))? {
                         run.map.insert(ino, li);
@@ -1792,31 +1852,48 @@ impl ShadowOverlay {
                 run.map.insert(ino, li);
             }
             Op::SetAttr { ino, set } => {
-                self.lower.setattr(lo(ino), &set)?;
+                let li = Self::lo(run, &self.alias, ino)?;
+                self.lower.setattr(li, &set)?;
             }
-            Op::Unlink { parent, name, .. } => match self.lower.unlink(lo(parent), &name) {
-                Err(e) if redo && gone(&e) => {}
-                r => r?,
-            },
-            Op::Rmdir { parent, name, .. } => match self.lower.rmdir(lo(parent), &name) {
-                Err(e) if redo && gone(&e) => {}
-                r => r?,
-            },
+            Op::Unlink { parent, name, .. } | Op::Rmdir { parent, name, .. } => {
+                // Redo with the parent gone: a later step of this window removed it (emptied
+                // directory, then rmdir), and steps are applied in order, so this one is done.
+                if redo && run.gone.contains(&parent) {
+                    return Ok(());
+                }
+                let p = Self::lo(run, &self.alias, parent)?;
+                let r = if unlink { self.lower.unlink(p, &name) } else { self.lower.rmdir(p, &name) };
+                match r {
+                    Err(e) if redo && gone(&e) => {} // already removed
+                    r => r?,
+                }
+            }
             Op::Rename { fp, fname, tp, tname, .. } => {
-                let (f, t) = (lo(fp), lo(tp));
-                if redo && self.lower.lookup(f, &fname).is_err() && self.lower.lookup(t, &tname).is_ok() {
-                    return Ok(()); // already renamed
+                let (f, t) = (Self::lo(run, &self.alias, fp)?, Self::lo(run, &self.alias, tp)?);
+                if redo {
+                    // A rename is alone in its window: the source missing means it was moved
+                    // (also over an existing target), but only if the target is there now.
+                    match self.lower.lookup(f, &fname) {
+                        Ok(_) => {}
+                        Err(FsError::NotFound) => {
+                            return match self.lower.lookup(t, &tname) {
+                                Ok(_) => Ok(()), // already renamed
+                                Err(FsError::NotFound) => Err(FsError::Io(format!("'{fname}' and '{tname}' are both missing from the disk"))),
+                                Err(e) => Err(e),
+                            };
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 self.lower.rename(f, &fname, t, &tname)?;
             }
         }
         Ok(())
     }
-
     /// Write the final content of one file. Safe to repeat.
     fn apply_file(&mut self, run: &mut CommitRun, i: usize) -> FsResult<()> {
         let it = run.plan.files[i].clone();
-        let li = Self::lo(run, &self.alias, it.ino);
+        let li = Self::lo(run, &self.alias, it.ino)?;
         let cur = self.lower.getattr(li)?.size;
         if it.base_limit < cur {
             self.lower.setattr(li, &SetAttr { size: Some(it.base_limit), ..Default::default() })?;

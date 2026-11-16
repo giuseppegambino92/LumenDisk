@@ -75,6 +75,9 @@ pub fn barrier_sync(f: &File) -> io::Result<()> {
 
 /// fsync a directory so that creates / renames / unlinks inside it are durable.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    if cfg!(test) {
+        return Ok(()); // see `full_sync`
+    }
     let d = File::open(dir)?;
     // F_FULLFSYNC is not supported on directories everywhere; a plain fsync orders the entry.
     // SAFETY: plain fsync on a valid descriptor.

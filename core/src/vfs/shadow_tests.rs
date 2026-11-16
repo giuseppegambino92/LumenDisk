@@ -602,7 +602,13 @@ fn fingerprints_are_stable_across_plain_mounts() {
 struct FaultCtl {
     count: usize,
     fail_at: Option<(usize, FsError)>,
+    /// Die *before* the N-th mutating call reaches the lower volume.
     crash_at: Option<usize>,
+    /// Let the N-th mutating call succeed, make it durable (WAL flushed), then die: the
+    /// commit never gets to record a checkpoint for it.
+    crash_after: Option<usize>,
+    /// Lookups of this name fail with an I/O error (a flaky disk), not "not found".
+    eio_lookup: Option<String>,
     dead: bool,
     sync_each: bool,
     wal: Option<Arc<WalDev>>,
@@ -613,6 +619,16 @@ struct FaultCtl {
 struct FaultFs {
     inner: Box<dyn FileSystem>,
     ctl: Arc<Mutex<FaultCtl>>,
+}
+
+impl FaultCtl {
+    fn die(&mut self) -> FsError {
+        self.dead = true;
+        if let Some(w) = &self.wal {
+            w.inject_fault(Fault::CrashBeforeWal);
+        }
+        FsError::Io("crash".into())
+    }
 }
 
 impl FaultFs {
@@ -627,17 +643,20 @@ impl FaultFs {
             return Err(c.fail_at.take().unwrap().1);
         }
         if c.crash_at == Some(n) {
-            c.dead = true;
-            if let Some(w) = &c.wal {
-                w.inject_fault(Fault::CrashBeforeWal);
-            }
-            return Err(FsError::Io("crash".into()));
+            return Err(c.die());
         }
         Ok(())
     }
     fn after<T>(&mut self, r: FsResult<T>) -> FsResult<T> {
-        if r.is_ok() && self.ctl.lock().unwrap().sync_each {
+        let (sync, crash) = {
+            let c = self.ctl.lock().unwrap();
+            (c.sync_each, c.crash_after == Some(c.count - 1))
+        };
+        if r.is_ok() && (sync || crash) {
             self.inner.sync()?;
+        }
+        if crash {
+            return Err(self.ctl.lock().unwrap().die());
         }
         r
     }
@@ -661,6 +680,9 @@ impl FileSystem for FaultFs {
     }
     fn lookup(&mut self, p: Ino, n: &str) -> FsResult<Ino> {
         self.alive()?;
+        if self.ctl.lock().unwrap().eio_lookup.as_deref() == Some(n) {
+            return Err(FsError::Io("read error".into()));
+        }
         self.inner.lookup(p, n)
     }
     fn getattr(&mut self, i: Ino) -> FsResult<Attr> {
@@ -734,10 +756,39 @@ impl FileSystem for FaultFs {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Kind {
     Ext4,
     Fat32,
+    ExFat,
+    Ntfs,
+}
+
+const NO_OWNERS: MountDefaults = MountDefaults { uid: 0, gid: 0, file_perm: 0o644, dir_perm: 0o755 };
+
+impl Kind {
+    fn driver(self, dev: Arc<dyn BlockDev>) -> Box<dyn FileSystem> {
+        match self {
+            Kind::Ext4 => Box::new(ext4_fs::Ext4Fs::open(dev, false).unwrap()),
+            Kind::Fat32 => Box::new(fat_fs::FatFs::open(dev, false, NO_OWNERS).unwrap()),
+            Kind::ExFat => Box::new(crate::vfs::exfat_fs::ExFatFs::open(dev, false, NO_OWNERS).unwrap()),
+            Kind::Ntfs => Box::new(crate::vfs::ntfs_fs::NtfsFs::open(dev, false, NO_OWNERS).unwrap()),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Ext4 => "EXT4",
+            Kind::Fat32 => "FAT32",
+            Kind::ExFat => "EXFAT",
+            Kind::Ntfs => "NTFS",
+        }
+    }
+    fn symlinks(self) -> bool {
+        matches!(self, Kind::Ext4 | Kind::Ntfs)
+    }
+    fn case_insensitive(self) -> bool {
+        !matches!(self, Kind::Ext4)
+    }
 }
 
 struct Rig {
@@ -755,27 +806,17 @@ impl Rig {
     /// The production stack: device → WAL → driver → Journaled → fault injector.
     fn lower(&self, ctl: &Arc<Mutex<FaultCtl>>) -> Box<dyn FileSystem> {
         let wal = WalDev::open(self.dev.clone(), &self.wal_path, "test").unwrap();
-        let driver: Box<dyn FileSystem> = match self.kind {
-            Kind::Ext4 => Box::new(ext4_fs::Ext4Fs::open(wal.clone(), false).unwrap()),
-            Kind::Fat32 => Box::new(fat_fs::FatFs::open(wal.clone(), false, MountDefaults { uid: 0, gid: 0, file_perm: 0o644, dir_perm: 0o755 }).unwrap()),
-        };
+        let driver = self.kind.driver(wal.clone());
         ctl.lock().unwrap().wal = Some(wal.clone());
         Box::new(FaultFs { inner: Box::new(Journaled { inner: driver, wal }), ctl: ctl.clone() })
     }
     fn open(&self, ctl: &Arc<Mutex<FaultCtl>>) -> ShadowOverlay {
-        let fs = match self.kind {
-            Kind::Ext4 => "EXT4",
-            Kind::Fat32 => "FAT32",
-        };
-        let mut s = ShadowOverlay::open_session(self.lower(ctl), self.dir.clone(), ident(fs)).unwrap();
+        let mut s = ShadowOverlay::open_session(self.lower(ctl), self.dir.clone(), ident(self.kind.label())).unwrap();
         s.flush_interval = Duration::from_secs(3600);
         s
     }
     fn plain(&self) -> Box<dyn FileSystem> {
-        match self.kind {
-            Kind::Ext4 => open_ext4(&self.dev),
-            Kind::Fat32 => Box::new(fat_fs::FatFs::open(self.dev.clone(), false, MountDefaults { uid: 0, gid: 0, file_perm: 0o644, dir_perm: 0o755 }).unwrap()),
-        }
+        self.kind.driver(self.dev.clone())
     }
 }
 
@@ -1073,4 +1114,286 @@ fn durable_rounds_cover_the_operations_answered_before_them() {
     r.simulate_crash();
     let mut r = session(&dev, &dir);
     assert_eq!(full_view(&mut r).0, want);
+}
+
+// ───────────── redo idempotency of the resumable commit ─────────────
+//
+// After a crash the commit resumes from its last checkpoint, so every step between that
+// checkpoint and the crash is applied a second time to a volume where it may already be done.
+// These tests crash (a) after a lower call succeeded and was made durable but before its
+// checkpoint, (b) with a torn frame at the end of progress.ldj, (c) again and again during the
+// resumes themselves, and require (d) exactly the intended tree and a clean volume at the end,
+// on ext4, FAT32, exFAT and NTFS.
+
+/// Base volume for the redo scenario: the usual content plus what `redo_extra` works on.
+fn redo_image(kind: Kind) -> Vec<u8> {
+    let dev: Arc<dyn BlockDev> = Arc::new(MemDev::new(48 << 20));
+    match kind {
+        Kind::Ext4 => ext4_fs::format(dev.clone(), FsType::Ext4, "REDO").unwrap(),
+        Kind::Fat32 => fat_fs::format(dev.clone(), FsType::Fat32, "REDO").unwrap(),
+        Kind::ExFat => crate::vfs::exfat_fs::format(dev.clone(), "REDO").unwrap(),
+        Kind::Ntfs => crate::vfs::ntfs_fs::format(dev.clone(), "REDO").unwrap(),
+    }
+    let mut fs = kind.driver(dev.clone());
+    let root = fs.root_ino();
+    let d = fs.mkdir(root, "boot", 0o755, 0, 0).unwrap();
+    let c = fs.create(d, "config.txt", 0o644, 0, 0).unwrap();
+    fs.write(c, 0, b"arm_64bit=1\n").unwrap();
+    let big = fs.create(root, "big.bin", 0o644, 0, 0).unwrap();
+    fs.write(big, 0, &testutil::pattern(500_000, 9)).unwrap();
+    fs.create(root, "obsolete.log", 0o644, 0, 0).unwrap();
+    let docs = fs.mkdir(root, "docs", 0o755, 0, 0).unwrap();
+    let a = fs.create(docs, "a.txt", 0o644, 0, 0).unwrap();
+    fs.write(a, 0, b"alpha").unwrap();
+    let b = fs.create(docs, "b.txt", 0o644, 0, 0).unwrap();
+    fs.write(b, 0, b"bravo").unwrap();
+    fs.mkdir(docs, "old", 0o755, 0, 0).unwrap();
+    let trash = fs.mkdir(root, "trash", 0o755, 0, 0).unwrap();
+    for n in ["t1", "t2"] {
+        let f = fs.create(trash, n, 0o644, 0, 0).unwrap();
+        fs.write(f, 0, n.as_bytes()).unwrap();
+    }
+    fs.mkdir(root, "cache", 0o755, 0, 0).unwrap();
+    fs.mkdir(root, "dest", 0o755, 0, 0).unwrap();
+    for (n, v) in [("swap_a.txt", "A"), ("swap_b.txt", "B"), ("Readme.txt", "read me")] {
+        let f = fs.create(root, n, 0o644, 0, 0).unwrap();
+        fs.write(f, 0, v.as_bytes()).unwrap();
+    }
+    fs.sync().unwrap();
+    drop(fs);
+    dev.read_vec(0, 48 << 20).unwrap()
+}
+
+/// Steps whose redo is ambiguous unless handled with care.
+fn redo_extra(s: &mut dyn FileSystem, kind: Kind) {
+    let root = s.root_ino();
+    // Empty a directory and remove it: one window, so a redo finds the parent of the unlinks gone.
+    let trash = s.lookup(root, "trash").unwrap();
+    s.unlink(trash, "t1").unwrap();
+    s.unlink(trash, "t2").unwrap();
+    s.rmdir(root, "trash").unwrap();
+    // Remove a directory and create one with the same name, then fill it.
+    s.rmdir(root, "cache").unwrap();
+    let c = s.mkdir(root, "cache", 0o755, 0, 0).unwrap();
+    let f = s.create(c, "new.bin", 0o644, 0, 0).unwrap();
+    s.write(f, 0, &testutil::pattern(100_000, 4)).unwrap();
+    // A new directory renamed over an existing empty one.
+    let proj = s.mkdir(root, "proj", 0o755, 0, 0).unwrap();
+    let p1 = s.create(proj, "p1.txt", 0o644, 0, 0).unwrap();
+    s.write(p1, 0, b"project").unwrap();
+    s.rename(root, "proj", root, "dest").unwrap();
+    // Swap two files through a temporary name (three renames, two of them over nothing).
+    s.rename(root, "swap_a.txt", root, "swap.tmp").unwrap();
+    s.rename(root, "swap_b.txt", root, "swap_a.txt").unwrap();
+    s.rename(root, "swap.tmp", root, "swap_b.txt").unwrap();
+    // Create, move out of its directory, move the directory; rename then unlink a lower file.
+    let n2 = s.mkdir(root, "n2", 0o755, 0, 0).unwrap();
+    let x = s.create(n2, "x", 0o644, 0, 0).unwrap();
+    s.write(x, 0, b"x").unwrap();
+    s.rename(n2, "x", root, "x-moved").unwrap();
+    s.rename(root, "n2", root, "n3").unwrap();
+    s.rename(root, "big.bin", root, "big-renamed.bin").unwrap();
+    s.unlink(root, "big-renamed.bin").unwrap();
+    // Truncate a lower file to nothing, then rewrite it.
+    let boot = s.lookup(root, "boot").unwrap();
+    let cfg = s.lookup(boot, "config.txt").unwrap();
+    s.setattr(cfg, &SetAttr { size: Some(0), ..Default::default() }).unwrap();
+    s.write(cfg, 0, b"new config\n").unwrap();
+    if kind.case_insensitive() {
+        // Same object, new case: the name exists before and after.
+        s.rename(root, "Readme.txt", root, "README.TXT").unwrap();
+    }
+    if !kind.case_insensitive() {
+        s.setattr(c, &SetAttr { perm: Some(0o750), ..Default::default() }).unwrap();
+    }
+}
+
+fn redo_scenario(s: &mut dyn FileSystem, kind: Kind) {
+    scenario(s, kind.symlinks());
+    redo_extra(s, kind);
+}
+
+/// Final tree of an uninterrupted commit, and the number of mutating lower calls it makes.
+fn redo_reference(kind: Kind, snap: &[u8]) -> (Vec<Entry>, usize) {
+    let rig = Rig::new(kind, snap);
+    let ctl = Arc::new(Mutex::new(FaultCtl::default()));
+    let mut s = rig.open(&ctl);
+    redo_scenario(&mut s, kind);
+    s.sync().unwrap();
+    ctl.lock().unwrap().count = 0;
+    s.commit().unwrap_or_else(|e| panic!("{kind:?}: uninterrupted commit: {e}"));
+    let ops = ctl.lock().unwrap().count;
+    drop(s);
+    let mut fs = rig.plain();
+    assert_eq!(fs.dirty_state(), DirtyState::Clean, "{kind:?}");
+    let t = tree(fs.as_mut());
+    let _ = std::fs::remove_dir_all(rig.dir.parent().unwrap());
+    (t, ops)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Hit {
+    /// The crash comes before the call reaches the volume.
+    Before,
+    /// The call is applied and durable; the crash comes before its checkpoint.
+    After,
+}
+
+fn arm(ctl: &Arc<Mutex<FaultCtl>>, at: usize, hit: Hit) {
+    let mut c = ctl.lock().unwrap();
+    c.count = 0;
+    match hit {
+        Hit::Before => c.crash_at = Some(at),
+        Hit::After => c.crash_after = Some(at),
+    }
+}
+
+/// A checkpoint frame cut short or corrupted, as a crash in the middle of its append leaves it.
+fn tear_progress(dir: &Path, how: usize) {
+    let p = dir.join(store::PROGRESS);
+    let before = RecordLog::read(&p).unwrap();
+    // A well-formed frame claiming the whole plan is done…
+    let scratch = dir.join("torn.ldj");
+    let _ = std::fs::remove_file(&scratch);
+    {
+        let (mut l, _) = RecordLog::open(&scratch).unwrap();
+        l.append(br#"{"step":999999}"#).unwrap();
+    }
+    let mut frame = std::fs::read(&scratch).unwrap();
+    std::fs::remove_file(&scratch).unwrap();
+    // …that never made it whole.
+    match how % 3 {
+        0 => frame.truncate(7),                       // inside the header
+        1 => frame.truncate(frame.len() - 3),         // payload cut short
+        _ => *frame.last_mut().unwrap() ^= 0x55,      // complete length, bad CRC
+    }
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(&frame).unwrap();
+    assert_eq!(RecordLog::read(&p).unwrap(), before, "a torn frame must not count");
+}
+
+/// Crash the commit at lower call `at`, then resume. With `chain`, every resume crashes too —
+/// at its 1st call, then its 2nd, … (alternating before / after the call) — until one gets
+/// through. With `tear`, every crash also leaves a torn checkpoint frame behind.
+fn crash_resume(kind: Kind, snap: &[u8], want: &[Entry], at: usize, hit: Hit, tear: bool, chain: bool) -> usize {
+    let what = format!("{kind:?} crash {hit:?} call {at} (tear={tear}, chain={chain})");
+    let rig = Rig::new(kind, snap);
+    let ctl = Arc::new(Mutex::new(FaultCtl::default()));
+    let mut s = rig.open(&ctl);
+    redo_scenario(&mut s, kind);
+    s.sync().unwrap();
+    arm(&ctl, at, hit);
+    let e = s.commit().expect_err(&what);
+    assert!(ctl.lock().unwrap().dead, "{what}: failed without crashing: {e}");
+    s.simulate_crash();
+    let mut resumes = 0;
+    loop {
+        if tear {
+            tear_progress(&rig.dir, at + resumes);
+        }
+        let ctl = Arc::new(Mutex::new(FaultCtl::default()));
+        let mut r = rig.open(&ctl);
+        assert!(r.commit_pending(), "{what}: the commit must be resumable");
+        if chain {
+            arm(&ctl, resumes, if resumes % 2 == 0 { Hit::Before } else { Hit::After });
+        }
+        resumes += 1;
+        match r.commit() {
+            Ok(_) => {
+                drop(r);
+                break;
+            }
+            Err(e) => {
+                assert!(chain && ctl.lock().unwrap().dead, "{what}: resume #{resumes} failed: {e}");
+                r.simulate_crash();
+            }
+        }
+        assert!(resumes < 100_000, "{what}: no progress");
+    }
+    assert!(!rig.dir.exists(), "{what}: the session is gone once the commit is done");
+    let mut fs = rig.plain();
+    let got = tree(fs.as_mut());
+    if got != want {
+        let gp: Vec<_> = got.iter().map(|e| (&e.path, e.size, e.perm)).collect();
+        let wp: Vec<_> = want.iter().map(|e| (&e.path, e.size, e.perm)).collect();
+        panic!("{what}: final tree differs after {resumes} resume(s)\n got: {gp:?}\nwant: {wp:?}");
+    }
+    assert_eq!(fs.dirty_state(), DirtyState::Clean, "{what}");
+    // and the volume still takes writes
+    let root = fs.root_ino();
+    let f = fs.create(root, "after", 0o644, 0, 0).unwrap();
+    fs.write(f, 0, &testutil::pattern(300_000, 5)).unwrap();
+    fs.sync().unwrap();
+    let _ = std::fs::remove_dir_all(rig.dir.parent().unwrap());
+    resumes
+}
+
+fn redo_suite(kind: Kind) {
+    let snap = redo_image(kind);
+    let (want, ops) = redo_reference(kind, &snap);
+    assert!(ops > 60, "{kind:?}: {ops} lower calls");
+    let (mut chains, mut chained) = (0, 0);
+    // Chains cost O(calls) resumes each: start one every few crash points.
+    let stride = (ops / 16).max(1);
+    for at in 0..ops {
+        // (a) applied and durable, checkpoint not recorded
+        crash_resume(kind, &snap, &want, at, Hit::After, false, false);
+        // (b) a torn checkpoint frame left by the crash (after the call or before it)
+        crash_resume(kind, &snap, &want, at, if at % 2 == 0 { Hit::Before } else { Hit::After }, true, false);
+        // (c) crashes during the resumes too, at their 1st call, 2nd, … until one gets through
+        if at % stride == 0 || at + 1 == ops {
+            chains += 1;
+            chained += crash_resume(kind, &snap, &want, at, if at % 2 == 0 { Hit::Before } else { Hit::After }, chains % 2 == 0, true);
+        }
+    }
+    println!("{kind:?}: {ops} lower calls, each a crash point; {chains} chains of crashing resumes ({chained} resumes): always the intended tree, clean volume");
+}
+
+#[test]
+fn commit_redo_is_idempotent_ext4() {
+    redo_suite(Kind::Ext4);
+}
+
+#[test]
+fn commit_redo_is_idempotent_fat32() {
+    redo_suite(Kind::Fat32);
+}
+
+#[test]
+fn commit_redo_is_idempotent_exfat() {
+    redo_suite(Kind::ExFat);
+}
+
+#[test]
+fn commit_redo_is_idempotent_ntfs() {
+    redo_suite(Kind::Ntfs);
+}
+
+/// A redo must tell "not there" from "couldn't look": when the lookup of a rename's source fails
+/// with an I/O error, the rename is not assumed done (the target exists either way, since it is
+/// renamed over) — the resume stops, and the next one applies it.
+#[test]
+fn redo_does_not_take_an_io_error_for_a_missing_name() {
+    let kind = Kind::Ext4;
+    let snap = redo_image(kind);
+    let (want, ops) = redo_reference(kind, &snap);
+    for at in 0..ops {
+        let rig = Rig::new(kind, &snap);
+        let ctl = Arc::new(Mutex::new(FaultCtl::default()));
+        let mut s = rig.open(&ctl);
+        redo_scenario(&mut s, kind);
+        s.sync().unwrap();
+        arm(&ctl, at, Hit::Before);
+        assert!(s.commit().is_err());
+        s.simulate_crash();
+        let ctl = Arc::new(Mutex::new(FaultCtl { eio_lookup: Some("f4.txt".into()), ..Default::default() }));
+        let mut r = rig.open(&ctl);
+        if r.commit().is_err() {
+            ctl.lock().unwrap().eio_lookup = None; // the disk recovers
+            r.commit().unwrap_or_else(|e| panic!("crash at {at}: retry: {e}"));
+        }
+        drop(r);
+        assert_eq!(tree(rig.plain().as_mut()), want, "crash before call {at}, then a read error while resuming");
+        let _ = std::fs::remove_dir_all(rig.dir.parent().unwrap());
+    }
 }
