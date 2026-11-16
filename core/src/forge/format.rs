@@ -41,9 +41,13 @@ pub fn sanitize_label(fs: TargetFs, label: &str) -> String {
         TargetFs::Xfs => 12,
         TargetFs::Btrfs => 255,
         TargetFs::F2fs => 512,
-        TargetFs::Ufs2 => 32,
+        TargetFs::Ufs2 => 31,
     };
     let mut out: String = label.chars().filter(|c| !c.is_control()).collect();
+    if fs == TargetFs::Ufs2 {
+        // newfs -L accepts only these (FreeBSD sbin/newfs/newfs.c).
+        out = out.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+    }
     if matches!(fs, TargetFs::Fat16 | TargetFs::Fat32) {
         out = out.to_uppercase().chars().filter(|c| c.is_ascii() && !"\"*+,./:;<=>?[\\]|".contains(*c)).collect();
     }
