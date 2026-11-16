@@ -2208,8 +2208,8 @@ fn sanitize_label(label: &str) -> Option<[u8; 11]> {
     Some(l)
 }
 
-/// FAT size (sectors) and cluster count for a candidate geometry.
-fn calc_geometry(kind: FsType, ts: u64, reserved: u64, rds: u64, spc: u64) -> Option<(u64, u64)> {
+/// FAT size (sectors) and cluster count for a candidate geometry (`bps`-byte sectors).
+fn calc_geometry(kind: FsType, ts: u64, reserved: u64, rds: u64, spc: u64, bps: u64) -> Option<(u64, u64)> {
     let bits: u64 = match kind {
         FsType::Fat12 => 12,
         FsType::Fat16 => 16,
@@ -2222,7 +2222,7 @@ fn calc_geometry(kind: FsType, ts: u64, reserved: u64, rds: u64, spc: u64) -> Op
             return None;
         }
         let clusters = (ts - meta) / spc;
-        let need = ((clusters + 2) * bits).div_ceil(8).div_ceil(512);
+        let need = ((clusters + 2) * bits).div_ceil(8).div_ceil(bps);
         if need <= fatsz {
             return Some((fatsz, clusters));
         }
@@ -2230,43 +2230,65 @@ fn calc_geometry(kind: FsType, ts: u64, reserved: u64, rds: u64, spc: u64) -> Op
     }
 }
 
-pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
-    if dev.read_only() {
-        return Err(FsError::ReadOnly);
+/// Valid cluster counts per FAT type (Microsoft FAT specification, "FAT type determination":
+/// FAT12 < 4085 ≤ FAT16 < 65525 ≤ FAT32; FAT32 entries are 28 bits, 0x0FFFFFF5 and up are
+/// reserved values).
+pub fn cluster_count_range(kind: FsType) -> (u64, u64) {
+    match kind {
+        FsType::Fat12 => (1, 4084),
+        FsType::Fat16 => (4085, 65524),
+        _ => (65525, 0x0FFF_FFF5),
     }
-    let kind = fs;
+}
+
+/// The geometry `mkfs` uses: sector size, sectors per cluster, reserved sectors, root
+/// directory entries, FAT size in sectors, cluster count, total sectors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FatGeometry {
+    pub bps: u64,
+    pub spc: u64,
+    pub reserved: u64,
+    pub root_entries: u64,
+    pub fat_sectors: u64,
+    pub clusters: u64,
+    pub total_sectors: u64,
+}
+
+impl FatGeometry {
+    pub fn cluster_bytes(&self) -> u64 {
+        self.bps * self.spc
+    }
+}
+
+/// Plan a FAT volume of `size` bytes without writing anything. `cluster`: bytes per cluster
+/// (a power of two from the sector size to 64 KiB) or None for the Microsoft default for that
+/// size. `bps`: bytes per sector (512, or the disk's logical sector size: 1024/2048/4096).
+pub fn plan(size: u64, kind: FsType, cluster: Option<u32>, bps: u64) -> FsResult<FatGeometry> {
     if !matches!(kind, FsType::Fat12 | FsType::Fat16 | FsType::Fat32) {
-        return Err(FsError::Invalid(format!(
-            "{} is not a FAT type",
-            kind.label()
-        )));
+        return Err(FsError::Invalid(format!("{} is not a FAT type", kind.label())));
     }
-    let ts = dev.size() / 512;
-    let ts = if kind == FsType::Fat32 {
-        ts.min(u32::MAX as u64)
-    } else {
-        ts
-    };
+    if !matches!(bps, 512 | 1024 | 2048 | 4096) {
+        return Err(FsError::Invalid(format!("unsupported sector size {bps} for FAT")));
+    }
+    let ts = size / bps;
+    // BPB_TotSec32 is 32 bits: a FAT32 volume can use at most 2^32-1 sectors (2 TiB with
+    // 512-byte sectors); anything beyond is left unused.
+    let ts = if kind == FsType::Fat32 { ts.min(u32::MAX as u64) } else { ts };
     if ts > u32::MAX as u64 {
-        return Err(FsError::Invalid(format!(
-            "volume too large for {}",
-            kind.label()
-        )));
+        return Err(FsError::Invalid(format!("volume too large for {}", kind.label())));
     }
     let (reserved, root_entries): (u64, u64) = match kind {
         FsType::Fat32 => (32, 0),
         FsType::Fat16 => (1, 512),
-        _ => (1, if ts <= 5760 { 224 } else { 512 }),
+        _ => (1, if ts * bps <= 5760 * 512 { 224 } else { 512 }),
     };
-    let rds = root_entries * 32 / 512;
-    let (min_c, max_c): (u64, u64) = match kind {
-        FsType::Fat12 => (1, 4084),
-        FsType::Fat16 => (4085, 65524),
-        _ => (65525, 0x0FFF_FFF5),
-    };
-    let preferred: u64 = match kind {
+    let rds = (root_entries * 32).div_ceil(bps);
+    let (min_c, max_c) = cluster_count_range(kind);
+    // Defaults by volume size (Microsoft's tables, expressed in 512-byte units).
+    let ts512 = ts * bps / 512;
+    let preferred_512: u64 = match kind {
         FsType::Fat12 => 1,
-        FsType::Fat16 => match ts {
+        FsType::Fat16 => match ts512 {
             0..=32680 => 2,
             32681..=262144 => 4,
             262145..=524288 => 8,
@@ -2274,7 +2296,7 @@ pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
             1048577..=2097152 => 32,
             _ => 64,
         },
-        _ => match ts {
+        _ => match ts512 {
             0..=532480 => 1,
             532481..=16777216 => 8,
             16777217..=33554432 => 16,
@@ -2282,40 +2304,86 @@ pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
             _ => 64,
         },
     };
-    let mut cands = vec![preferred];
-    cands.extend(
-        [1u64, 2, 4, 8, 16, 32, 64]
-            .iter()
-            .copied()
-            .filter(|&s| s != preferred),
-    );
-    let mut geo = None;
-    for spc in cands {
-        if let Some((fatsz, cl)) = calc_geometry(kind, ts, reserved, rds, spc) {
+    let cands: Vec<u64> = match cluster {
+        Some(c) => {
+            let c = c as u64;
+            if !c.is_power_of_two() || c < bps || c > 65536 {
+                return Err(FsError::Invalid(format!("invalid FAT cluster size {c}: a power of two from {bps} to 65536 bytes")));
+            }
+            vec![c / bps]
+        }
+        None => {
+            let preferred = (preferred_512 * 512 / bps).max(1);
+            let mut v = vec![preferred];
+            for s in [1u64, 2, 4, 8, 16, 32, 64].iter().map(|&s| s * 512 / bps) {
+                if s >= 1 && !v.contains(&s) {
+                    v.push(s);
+                }
+            }
+            v
+        }
+    };
+    let mut last = None;
+    for &spc in &cands {
+        if let Some((fatsz, cl)) = calc_geometry(kind, ts, reserved, rds, spc, bps) {
+            last = Some(cl);
             if cl >= min_c && cl <= max_c {
-                geo = Some((spc, fatsz, cl));
-                break;
+                return Ok(FatGeometry { bps, spc, reserved, root_entries, fat_sectors: fatsz, clusters: cl, total_sectors: ts });
             }
         }
     }
-    let Some((spc, fatsz, clusters)) = geo else {
-        return Err(FsError::Invalid(match kind {
+    Err(FsError::Invalid(match (cluster, last) {
+        (Some(c), Some(cl)) if cl < min_c => format!("{c}-byte clusters give {cl} clusters, fewer than the {min_c} {} needs: choose smaller clusters", kind.label()),
+        (Some(c), Some(cl)) => format!("{c}-byte clusters give {cl} clusters, more than {} allows ({max_c}): choose larger clusters", kind.label()),
+        _ => match kind {
             FsType::Fat32 => "volume too small for FAT32: at least 65525 clusters are needed (about 33 MiB with 512-byte clusters)".into(),
             FsType::Fat16 => "volume size out of range for FAT16 (about 2.1 MiB – 2 GiB)".into(),
             _ => "volume size out of range for FAT12 (up to about 127 MiB)".into(),
-        }));
-    };
+        },
+    }))
+}
+
+pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
+    mkfs(dev, fs, label, None, 512).map(|_| ())
+}
+
+/// The FAT sector size `format_with` uses on `dev`: its logical sector size (4K-native disks
+/// need 4096-byte FAT sectors), 512 when unknown.
+pub fn sector_size_for(dev: &dyn BlockDev) -> u64 {
+    match dev.logical_sector_size() {
+        Some(s @ (1024 | 2048 | 4096)) => s as u64,
+        _ => 512,
+    }
+}
+
+/// Like [`format`], with an explicit cluster size in bytes (None: the default for the size)
+/// and the device's logical sector size as FAT sector size. Returns the cluster size used.
+pub fn format_with(dev: Arc<dyn BlockDev>, fs: FsType, label: &str, cluster: Option<u32>) -> FsResult<u32> {
+    let bps = sector_size_for(dev.as_ref());
+    mkfs(dev, fs, label, cluster, bps)
+}
+
+fn mkfs(dev: Arc<dyn BlockDev>, fs: FsType, label: &str, cluster: Option<u32>, bps: u64) -> FsResult<u32> {
+    if dev.read_only() {
+        return Err(FsError::ReadOnly);
+    }
+    let kind = fs;
+    let g = plan(dev.size(), kind, cluster, bps)?;
+    let FatGeometry { spc, reserved, root_entries, fat_sectors: fatsz, clusters, total_sectors: ts, .. } = g;
+    let rds = (root_entries * 32).div_ceil(bps);
     let lab = sanitize_label(label);
     let now = Timestamp::now();
     let serial = (now.secs as u32).rotate_left(16) ^ now.nsecs;
     let fat32 = kind == FsType::Fat32;
+    let sec = bps as usize;
 
-    let mut bs = vec![0u8; 512];
+    let mut bs = vec![0u8; sec];
     bs[0] = 0xEB;
     bs[1] = if fat32 { 0x58 } else { 0x3C };
     bs[2] = 0x90;
     bs[3..11].copy_from_slice(b"MSWIN4.1");
-    wr16(&mut bs, 11, 512);
+    wr16(&mut bs, 11, bps as u16);
+    // BPB_SecPerClus is one byte: at most 128 (64 KiB clusters with 512-byte sectors).
     bs[13] = spc as u8;
     wr16(&mut bs, 14, reserved as u16);
     bs[16] = 2;
@@ -2352,24 +2420,25 @@ pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
     // Boot code: "int 18h" (no bootable OS) followed by a halt loop.
     let code = sig_off + 26;
     bs[code..code + 5].copy_from_slice(&[0xFA, 0xCD, 0x18, 0xEB, 0xFE]);
+    // Signature_word at offset 510 whatever the sector size (FAT spec, "Boot Sector").
     bs[510] = 0x55;
     bs[511] = 0xAA;
 
-    zero_dev(dev.as_ref(), 0, reserved * 512)?;
+    zero_dev(dev.as_ref(), 0, reserved * bps)?;
     dev.write_at(0, &bs)?;
     let clusters32 = clusters as u32;
     if fat32 {
-        let mut fsi = vec![0u8; 512];
+        let mut fsi = vec![0u8; sec];
         wr32(&mut fsi, 0, 0x4161_5252);
         wr32(&mut fsi, 484, 0x6141_7272);
         wr32(&mut fsi, 488, clusters32 - 1);
         wr32(&mut fsi, 492, 3);
         wr32(&mut fsi, 508, 0xAA55_0000);
-        dev.write_at(512, &fsi)?;
-        dev.write_at(6 * 512, &bs)?;
-        dev.write_at(7 * 512, &fsi)?;
+        dev.write_at(bps, &fsi)?;
+        dev.write_at(6 * bps, &bs)?;
+        dev.write_at(7 * bps, &fsi)?;
     }
-    let mut head = vec![0u8; 512];
+    let mut head = vec![0u8; sec];
     match kind {
         FsType::Fat12 => head[0..3].copy_from_slice(&[0xF8, 0xFF, 0xFF]),
         FsType::Fat16 => head[0..4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0xFF]),
@@ -2380,19 +2449,19 @@ pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
         }
     }
     for i in 0..2u64 {
-        let start = (reserved + i * fatsz) * 512;
-        zero_dev(dev.as_ref(), start, fatsz * 512)?;
+        let start = (reserved + i * fatsz) * bps;
+        zero_dev(dev.as_ref(), start, fatsz * bps)?;
         dev.write_at(start, &head)?;
     }
-    let root_off = (reserved + 2 * fatsz) * 512;
-    let root_len = if fat32 { spc * 512 } else { rds * 512 };
+    let root_off = (reserved + 2 * fatsz) * bps;
+    let root_len = if fat32 { spc * bps } else { rds * bps };
     zero_dev(dev.as_ref(), root_off, root_len)?;
     if let Some(l) = lab {
         let e = new_ent(l, 0, A_VOL, now);
         dev.write_at(root_off, &e)?;
     }
     dev.flush()?;
-    Ok(())
+    Ok(g.cluster_bytes() as u32)
 }
 
 // ───────────────────────────── tests ─────────────────────────────

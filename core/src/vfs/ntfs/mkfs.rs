@@ -1,5 +1,6 @@
-//! Minimal `mkntfs`: NTFS 3.1, 4096-byte clusters, 1024-byte MFT records, 4096-byte index
-//! blocks, system files 0..=15 plus $Extend/{$Quota,$ObjId,$Reparse}. The structure mirrors
+//! Minimal `mkntfs`: NTFS 3.1, 4096-byte clusters by default (512 B to 2 MiB on request),
+//! 1024-byte MFT records, 4096-byte index blocks, system files 0..=15 plus
+//! $Extend/{$Quota,$ObjId,$Reparse}. The structure mirrors
 //! what ntfs-3g's mkntfs writes (security descriptors, $Secure streams/indexes, $UpCase and
 //! its $Info stream, $AttrDef) so that ntfs-3g, ntfsfix and Windows accept the result.
 
@@ -11,8 +12,11 @@ use super::upcase;
 use crate::block::BlockDev;
 use crate::vfs::{FsError, FsResult};
 
+/// Default cluster size.
 const CS: u64 = 4096;
 const RS: usize = 1024;
+/// Largest cluster size: 2 MiB (Windows 10 1709+, ntfs-3g 2022.5.17+, Linux ntfs3).
+pub const MAX_CLUSTER: u64 = 2 << 20;
 const IBS: usize = 4096;
 const MFT_RECORDS: u64 = 64;
 
@@ -115,8 +119,8 @@ fn res(ty: u32, name: &str, value: Vec<u8>, rflags: u8) -> Attribute {
     a
 }
 
-fn nonres(ty: u32, name: &str, runs: Vec<Run>, size: u64) -> Attribute {
-    Attribute::nonresident(ty, &to_utf16(name), runs, size, CS)
+fn nonres(ty: u32, name: &str, runs: Vec<Run>, size: u64, cs: u64) -> Attribute {
+    Attribute::nonresident(ty, &to_utf16(name), runs, size, cs)
 }
 
 fn cmp_names(up: &[u16], a: &[u16], b: &[u16]) -> Ordering {
@@ -131,6 +135,35 @@ fn cmp_names(up: &[u16], a: &[u16], b: &[u16]) -> Ordering {
 }
 
 pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
+    mkfs(dev, label, CS).map(|_| ())
+}
+
+/// Default cluster size for a volume: 4 KiB up to 16 TiB, then the smallest size that keeps
+/// the cluster count below 2^32 (Microsoft's defaults for NTFS).
+pub fn default_cluster(size: u64) -> u64 {
+    let mut cs = CS;
+    while size / cs > u32::MAX as u64 && cs < MAX_CLUSTER {
+        cs *= 2;
+    }
+    cs
+}
+
+/// Like [`format`], with an explicit cluster size in bytes (a power of two from 512 B to
+/// 2 MiB; None: [`default_cluster`]). Returns the cluster size used.
+pub fn format_with(dev: Arc<dyn BlockDev>, label: &str, cluster: Option<u32>) -> FsResult<u32> {
+    let cs = match cluster {
+        None => default_cluster(dev.size()),
+        Some(c) if (c as u64).is_power_of_two() && (512..=MAX_CLUSTER).contains(&(c as u64)) => c as u64,
+        Some(c) => return Err(FsError::Invalid(format!("invalid NTFS cluster size {c}: a power of two from 512 to {MAX_CLUSTER} bytes"))),
+    };
+    mkfs(dev, label, cs).map_err(|e| match e {
+        // The system files did not fit: the volume is too small for clusters this large.
+        FsError::NoSpace => FsError::Invalid(format!("volume too small for NTFS with {cs}-byte clusters")),
+        e => e,
+    })
+}
+
+fn mkfs(dev: Arc<dyn BlockDev>, label: &str, cs: u64) -> FsResult<u32> {
     if dev.read_only() {
         return Err(FsError::ReadOnly);
     }
@@ -139,10 +172,21 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
         return Err(FsError::Invalid("device too small for NTFS (minimum 2 MiB)".into()));
     }
     let total_sectors = sectors - 1; // last sector holds the backup boot sector
-    let clusters = total_sectors / (CS / 512);
+    let spc = cs / 512;
+    let clusters = total_sectors / spc;
     if clusters > u32::MAX as u64 {
-        return Err(FsError::Invalid("volume too large for 4 KiB clusters".into()));
+        return Err(FsError::Invalid(format!("volume too large for {cs}-byte clusters")));
     }
+    // Sizes of the system files in clusters. The MFT holds at least 64 records, and at least
+    // one cluster: with clusters above 4 KiB, $MFTMirr mirrors a whole cluster of records
+    // (ntfs-3g: mftmirr_size = cluster_size / record_size when that exceeds 4), so the MFT
+    // must hold that many.
+    let mft_records = MFT_RECORDS.max(cs / RS as u64);
+    let mft_bytes = mft_records * RS as u64;
+    let mirr_bytes = (4 * RS as u64).max(cs);
+    let boot_cl = 8192u64.div_ceil(cs);
+    let mftbmp_lcn = boot_cl;
+    let mftbmp_bytes = align8(mft_records.div_ceil(8) as usize) as u64;
     let mut label16 = to_utf16(label);
     label16.truncate(128);
     let now = ntfs_now();
@@ -154,23 +198,30 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     for c in clusters..bm_bytes * 8 {
         bm.b[(c / 8) as usize] |= 1 << (c % 8); // bits past the end of the volume are "in use"
     }
-    let mft_cl = MFT_RECORDS * RS as u64 / CS;
-    bm.mark(0, 2); // $Boot
-    bm.mark(2, 1); // $MFT:$BITMAP
-    let mft_lcn = 4;
+    let mft_cl = mft_bytes.div_ceil(cs);
+    let mftbmp_cl = mftbmp_bytes.div_ceil(cs);
+    bm.mark(0, boot_cl); // $Boot
+    bm.mark(mftbmp_lcn, mftbmp_cl); // $MFT:$BITMAP
+    // 4 KiB clusters: $Boot 0-1, $MFT:$BITMAP 2, $MFT from 4 (what this mkfs always wrote).
+    let mft_lcn = (mftbmp_lcn + mftbmp_cl).max(16384 / cs);
     bm.mark(mft_lcn, mft_cl);
-    let mirr_lcn = bm.place(1, clusters / 2)?;
-    let log_bytes = logfile_size(clusters * CS);
-    let log_cl = log_bytes / CS;
+    let mirr_cl = mirr_bytes.div_ceil(cs);
+    let mirr_lcn = bm.place(mirr_cl, clusters / 2)?;
+    // $LogFile: a whole number of clusters.
+    let log_bytes = logfile_size(clusters * cs).div_ceil(cs) * cs;
+    let log_cl = log_bytes / cs;
     let log_lcn = bm.place(log_cl, mirr_lcn + 1)?;
     let zone = (mft_lcn + mft_cl).max(mft_lcn + clusters / 8);
-    let attrdef_lcn = bm.place(1, zone)?;
-    let rootia_lcn = bm.place(1, zone)?;
-    let bm_cl = bm_bytes.div_ceil(CS);
+    let attrdef_cl = 2560u64.div_ceil(cs);
+    let attrdef_lcn = bm.place(attrdef_cl, zone)?;
+    let ia_cl = (IBS as u64).div_ceil(cs);
+    let rootia_lcn = bm.place(ia_cl, zone)?;
+    let bm_cl = bm_bytes.div_ceil(cs);
     let bitmap_lcn = bm.place(bm_cl, zone)?;
-    let sds_cl = 0x41000 / CS;
+    let sds_cl = 0x41000u64.div_ceil(cs);
     let sds_lcn = bm.place(sds_cl, zone)?;
-    let upcase_lcn = bm.place(32, zone)?;
+    let upcase_cl = 131072u64.div_ceil(cs);
+    let upcase_lcn = bm.place(upcase_cl, zone)?;
 
     // ---- records
     let mref = |no: u64, seq: u16| mk_ref(no, seq);
@@ -200,7 +251,7 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
         ],
     );
 
-    let mut recs: Vec<Option<MftRecord>> = (0..MFT_RECORDS).map(|_| None).collect();
+    let mut recs: Vec<Option<MftRecord>> = (0..mft_records).map(|_| None).collect();
     // (record, name, FILE_NAME value) of files listed in the root directory
     let mut root_entries: Vec<(u64, Vec<u8>)> = vec![];
     let mut ext_entries: Vec<(u64, Vec<u8>)> = vec![];
@@ -221,22 +272,22 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
         recs[no as usize] = Some(r);
     };
 
-    let fn_mft = fname(now, root_ref, "$MFT", mft_cl * CS, mft_cl * CS, hs);
+    let fn_mft = fname(now, root_ref, "$MFT", mft_cl * cs, mft_bytes, hs);
     mk(
         0,
         0,
         vec![
             res(AT_STANDARD_INFORMATION, "", si72(now, hs, 0x100), 0),
             res(AT_FILE_NAME, "", fn_mft.clone(), 1),
-            nonres(AT_DATA, "", run(mft_lcn, mft_cl), mft_cl * CS),
-            nonres(AT_BITMAP, "", run(2, 1), MFT_RECORDS / 8),
+            nonres(AT_DATA, "", run(mft_lcn, mft_cl), mft_bytes, cs),
+            nonres(AT_BITMAP, "", run(mftbmp_lcn, mftbmp_cl), mftbmp_bytes, cs),
         ],
         Some((true, fn_mft)),
     );
-    let f = fname(now, root_ref, "$MFTMirr", CS, CS, hs);
-    mk(1, 0, vec![res(AT_STANDARD_INFORMATION, "", si72(now, hs, 0x100), 0), res(AT_FILE_NAME, "", f.clone(), 1), nonres(AT_DATA, "", run(mirr_lcn, 1), CS)], Some((true, f)));
+    let f = fname(now, root_ref, "$MFTMirr", mirr_cl * cs, mirr_bytes, hs);
+    mk(1, 0, vec![res(AT_STANDARD_INFORMATION, "", si72(now, hs, 0x100), 0), res(AT_FILE_NAME, "", f.clone(), 1), nonres(AT_DATA, "", run(mirr_lcn, mirr_cl), mirr_bytes, cs)], Some((true, f)));
     let f = fname(now, root_ref, "$LogFile", log_bytes, log_bytes, hs);
-    mk(2, 0, vec![res(AT_STANDARD_INFORMATION, "", si72(now, hs, 0x100), 0), res(AT_FILE_NAME, "", f.clone(), 1), nonres(AT_DATA, "", run(log_lcn, log_cl), log_bytes)], Some((true, f)));
+    mk(2, 0, vec![res(AT_STANDARD_INFORMATION, "", si72(now, hs, 0x100), 0), res(AT_FILE_NAME, "", f.clone(), 1), nonres(AT_DATA, "", run(log_lcn, log_cl), log_bytes, cs)], Some((true, f)));
     let f = fname(now, root_ref, "$Volume", 0, 0, hs);
     let mut volinfo = vec![0u8; 12];
     volinfo[8] = 3;
@@ -264,7 +315,7 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
         put64(e, 144, *min);
         put64(e, 152, *max);
     }
-    let f = fname(now, root_ref, "$AttrDef", CS, 2560, hs);
+    let f = fname(now, root_ref, "$AttrDef", attrdef_cl * cs, 2560, hs);
     mk(
         4,
         0,
@@ -272,12 +323,22 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
             res(AT_STANDARD_INFORMATION, "", si48(now, hs), 0),
             res(AT_FILE_NAME, "", f.clone(), 1),
             res(AT_SECURITY_DESCRIPTOR, "", sd_sys.clone(), 0),
-            nonres(AT_DATA, "", run(attrdef_lcn, 1), 2560),
+            nonres(AT_DATA, "", run(attrdef_lcn, attrdef_cl), 2560, cs),
         ],
         Some((true, f)),
     );
     let f = fname(now, root_ref, ".", 0, 0, hs | FILE_ATTR_DUP_DIR);
-    let root_hdr = IndexRootHdr { ty: AT_FILE_NAME, collation: 1, block_size: IBS as u32, clusters_per_block: 1 };
+    // "Clusters per index block": in clusters when a block is at least a cluster, otherwise
+    // in 512-byte units (and index VCNs count those units too).
+    let cpb = if IBS as u64 >= cs { IBS as u64 / cs } else { IBS as u64 / 512 };
+    let root_hdr = IndexRootHdr { ty: AT_FILE_NAME, collation: 1, block_size: IBS as u32, clusters_per_block: cpb as u8 };
+    // The view indexes ($Secure, $Quota, $ObjId, $Reparse) are stored as mkntfs writes them
+    // for 4 KiB clusters: their INDEX_ROOT header carries the same per-volume field.
+    let ir = |h: &str| {
+        let mut v = hex(h);
+        v[12] = cpb as u8;
+        v
+    };
     let mut bitmap_i30 = vec![0u8; 8];
     bitmap_i30[0] = 1;
     mk(
@@ -288,14 +349,14 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
             res(AT_FILE_NAME, "", f.clone(), 1),
             res(AT_SECURITY_DESCRIPTOR, "", sd_root, 0),
             res(AT_INDEX_ROOT, "$I30", index_root_value(&root_hdr, &Node { entries: vec![IEntry::end(Some(0))] }), 0),
-            nonres(AT_INDEX_ALLOCATION, "$I30", run(rootia_lcn, 1), IBS as u64),
+            nonres(AT_INDEX_ALLOCATION, "$I30", run(rootia_lcn, ia_cl), IBS as u64, cs),
             res(AT_BITMAP, "$I30", bitmap_i30, 0),
         ],
         Some((true, f)),
     );
-    let f = fname(now, root_ref, "$Bitmap", bm_cl * CS, bm_bytes, hs);
-    mk(6, 0, vec![res(AT_STANDARD_INFORMATION, "", si72(now, hs, 0x100), 0), res(AT_FILE_NAME, "", f.clone(), 1), nonres(AT_DATA, "", run(bitmap_lcn, bm_cl), bm_bytes)], Some((true, f)));
-    let f = fname(now, root_ref, "$Boot", 8192, 8192, hs);
+    let f = fname(now, root_ref, "$Bitmap", bm_cl * cs, bm_bytes, hs);
+    mk(6, 0, vec![res(AT_STANDARD_INFORMATION, "", si72(now, hs, 0x100), 0), res(AT_FILE_NAME, "", f.clone(), 1), nonres(AT_DATA, "", run(bitmap_lcn, bm_cl), bm_bytes, cs)], Some((true, f)));
+    let f = fname(now, root_ref, "$Boot", boot_cl * cs, 8192, hs);
     mk(
         7,
         0,
@@ -303,12 +364,12 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
             res(AT_STANDARD_INFORMATION, "", si48(now, hs), 0),
             res(AT_FILE_NAME, "", f.clone(), 1),
             res(AT_SECURITY_DESCRIPTOR, "", sd_sys.clone(), 0),
-            nonres(AT_DATA, "", run(0, 2), 8192),
+            nonres(AT_DATA, "", run(0, boot_cl), 8192, cs),
         ],
         Some((true, f)),
     );
     let f = fname(now, root_ref, "$BadClus", 0, 0, hs);
-    let mut bad = nonres(AT_DATA, "$Bad", vec![Run { vcn: 0, lcn: None, len: clusters }], clusters * CS);
+    let mut bad = nonres(AT_DATA, "$Bad", vec![Run { vcn: 0, lcn: None, len: clusters }], clusters * cs, cs);
     if let Body::NonRes(n) = &mut bad.body {
         n.init = 0;
     }
@@ -321,20 +382,20 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
         vec![
             res(AT_STANDARD_INFORMATION, "", si72(now, vi, 0x101), 0),
             res(AT_FILE_NAME, "", f.clone(), 1),
-            nonres(AT_DATA, "$SDS", run(sds_lcn, sds_cl), 0x400FC),
-            res(AT_INDEX_ROOT, "$SDH", hex(SDH_ROOT), 0),
-            res(AT_INDEX_ROOT, "$SII", hex(SII_ROOT), 0),
+            nonres(AT_DATA, "$SDS", run(sds_lcn, sds_cl), 0x400FC, cs),
+            res(AT_INDEX_ROOT, "$SDH", ir(SDH_ROOT), 0),
+            res(AT_INDEX_ROOT, "$SII", ir(SII_ROOT), 0),
         ],
         Some((true, f)),
     );
-    let f = fname(now, root_ref, "$UpCase", 131072, 131072, hs);
+    let f = fname(now, root_ref, "$UpCase", upcase_cl * cs, 131072, hs);
     mk(
         10,
         0,
         vec![
             res(AT_STANDARD_INFORMATION, "", si72(now, hs, 0x100), 0),
             res(AT_FILE_NAME, "", f.clone(), 1),
-            nonres(AT_DATA, "", run(upcase_lcn, 32), 131072),
+            nonres(AT_DATA, "", run(upcase_lcn, upcase_cl), 131072, cs),
             res(AT_DATA, "$Info", hex(upcase::UPCASE_INFO), 0),
         ],
         Some((true, f)),
@@ -344,11 +405,11 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     }
     let qa = hs | FILE_ATTR_ARCHIVE | FILE_ATTR_DUP_VIEW_INDEX;
     let f = fname(now, ext_ref, "$Quota", 0, 0, qa);
-    mk(24, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$O", hex(QUOTA_O_ROOT), 0), res(AT_INDEX_ROOT, "$Q", hex(QUOTA_Q_ROOT), 0)], Some((false, f)));
+    mk(24, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$O", ir(QUOTA_O_ROOT), 0), res(AT_INDEX_ROOT, "$Q", ir(QUOTA_Q_ROOT), 0)], Some((false, f)));
     let f = fname(now, ext_ref, "$ObjId", 0, 0, qa);
-    mk(25, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$O", hex(OBJID_O_ROOT), 0)], Some((false, f)));
+    mk(25, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$O", ir(OBJID_O_ROOT), 0)], Some((false, f)));
     let f = fname(now, ext_ref, "$Reparse", 0, 0, qa);
-    mk(26, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$R", hex(REPARSE_R_ROOT), 0)], Some((false, f)));
+    mk(26, 0x000C, vec![res(AT_STANDARD_INFORMATION, "", si72(now, qa, 0x101), 0), res(AT_FILE_NAME, "", f.clone(), 1), res(AT_INDEX_ROOT, "$R", ir(REPARSE_R_ROOT), 0)], Some((false, f)));
 
     // $Extend (needs its children's names for the index)
     let sort_entries = |v: &mut Vec<(u64, Vec<u8>)>| {
@@ -385,15 +446,15 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     let root_block = serialize_indx(&root_node, 0, IBS, 1).ok_or_else(|| FsError::Corrupt("root index overflow".into()))?;
 
     // ---- serialise the MFT
-    let mut mft = vec![0u8; MFT_RECORDS as usize * RS];
-    for no in 0..MFT_RECORDS {
+    let mut mft = vec![0u8; mft_records as usize * RS];
+    for no in 0..mft_records {
         let raw = match &mut recs[no as usize] {
             Some(r) => r.serialize(no, RS).ok_or_else(|| FsError::Corrupt(format!("system record {no} overflow")))?,
             None => empty_record(no, RS, seq_of(no)),
         };
         mft[no as usize * RS..(no as usize + 1) * RS].copy_from_slice(&raw);
     }
-    let mut mft_bitmap = vec![0u8; CS as usize];
+    let mut mft_bitmap = vec![0u8; (mftbmp_cl * cs) as usize];
     mft_bitmap[0] = 0xFF;
     mft_bitmap[1] = 0xFF;
     mft_bitmap[3] = 0x07;
@@ -403,7 +464,9 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     boot[0..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
     boot[3..11].copy_from_slice(b"NTFS    ");
     put16(&mut boot, 0x0B, 512);
-    boot[0x0D] = (CS / 512) as u8;
+    // Sectors per cluster: up to 128 as is, larger as a negative power of two (0xF4 = 2^12
+    // sectors = 2 MiB), as Windows writes it.
+    boot[0x0D] = if spc <= 128 { spc as u8 } else { (256 - spc.trailing_zeros()) as u8 };
     boot[0x15] = 0xF8;
     put16(&mut boot, 0x18, 63);
     put16(&mut boot, 0x1A, 255);
@@ -412,8 +475,9 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     put64(&mut boot, 0x28, total_sectors);
     put64(&mut boot, 0x30, mft_lcn);
     put64(&mut boot, 0x38, mirr_lcn);
-    boot[0x40] = (-10i8) as u8; // 2^10 = 1024-byte records
-    boot[0x44] = 1; // one cluster per index block
+    // Record and index block sizes: in clusters when at least a cluster, else -log2(bytes).
+    boot[0x40] = if RS as u64 >= cs { (RS as u64 / cs) as u8 } else { (-10i8) as u8 }; // 1024-byte records
+    boot[0x44] = if IBS as u64 >= cs { (IBS as u64 / cs) as u8 } else { (-12i8) as u8 }; // 4096-byte blocks
     let serial = crate::vfs::random_id();
     boot[0x48..0x50].copy_from_slice(&serial[..8]);
     let code = hex(BOOT_CODE);
@@ -422,30 +486,30 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     boot[511] = 0xAA;
 
     // ---- write everything
-    let w = |lcn: u64, data: &[u8]| -> FsResult<()> { Ok(dev.write_at(lcn * CS, data)?) };
+    let w = |lcn: u64, data: &[u8]| -> FsResult<()> { Ok(dev.write_at(lcn * cs, data)?) };
     let mut boot_area = vec![0u8; 8192];
     boot_area[..512].copy_from_slice(&boot);
     w(0, &boot_area)?;
-    w(2, &mft_bitmap)?;
+    w(mftbmp_lcn, &mft_bitmap)?;
     w(mft_lcn, &mft)?;
-    let mut mirr = vec![0u8; CS as usize];
-    mirr.copy_from_slice(&mft[..CS as usize]);
+    let mut mirr = vec![0u8; (mirr_cl * cs) as usize];
+    mirr[..mirr_bytes as usize].copy_from_slice(&mft[..mirr_bytes as usize]);
     w(mirr_lcn, &mirr)?;
     let ff = vec![0xFFu8; 1 << 20];
     let mut p = 0;
     while p < log_bytes {
         let n = (log_bytes - p).min(ff.len() as u64) as usize;
-        dev.write_at(log_lcn * CS + p, &ff[..n])?;
+        dev.write_at(log_lcn * cs + p, &ff[..n])?;
         p += n as u64;
     }
     let mut ad = attrdef.clone();
-    ad.resize(CS as usize, 0);
+    ad.resize((attrdef_cl * cs) as usize, 0);
     w(attrdef_lcn, &ad)?;
     w(rootia_lcn, &root_block)?;
     let mut bmv = bm.b.clone();
-    bmv.resize((bm_cl * CS) as usize, 0);
+    bmv.resize((bm_cl * cs) as usize, 0);
     w(bitmap_lcn, &bmv)?;
-    let mut sds = vec![0u8; (sds_cl * CS) as usize];
+    let mut sds = vec![0u8; (sds_cl * cs) as usize];
     let ent = hex(SDS_ENTRIES);
     sds[..ent.len()].copy_from_slice(&ent);
     sds[0x40000..0x40000 + ent.len()].copy_from_slice(&ent);
@@ -454,5 +518,5 @@ pub fn format(dev: Arc<dyn BlockDev>, label: &str) -> FsResult<()> {
     w(upcase_lcn, &upb)?;
     dev.write_at(total_sectors * 512, &boot)?;
     dev.flush()?;
-    Ok(())
+    Ok(cs as u32)
 }

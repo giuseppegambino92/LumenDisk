@@ -391,6 +391,18 @@ pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
     }
 }
 
+/// [`format`] with an explicit allocation unit in bytes (FAT / exFAT / NTFS cluster, ext
+/// block; None: the filesystem's default for the size) and, for FAT and exFAT, the device's
+/// logical sector size. Returns the allocation unit used.
+pub fn format_with(dev: Arc<dyn BlockDev>, fs: FsType, label: &str, cluster: Option<u32>) -> FsResult<u32> {
+    match fs {
+        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => ext4_fs::format_with(dev, fs, label, cluster),
+        FsType::Ntfs => ntfs_fs::format_with(dev, label, cluster),
+        FsType::ExFat => exfat_fs::format_with(dev, label, cluster),
+        FsType::Fat12 | FsType::Fat16 | FsType::Fat32 => fat_fs::format_with(dev, fs, label, cluster),
+    }
+}
+
 /// Wrapper that rejects every mutation. Used for read-only mounts and dirty volumes.
 pub struct ReadOnlyGuard {
     pub inner: Box<dyn FileSystem>,

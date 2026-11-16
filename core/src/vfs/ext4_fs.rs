@@ -3155,11 +3155,46 @@ impl FileSystem for Ext4Fs {
 
 /// Create a fresh ext2/ext3/ext4 filesystem on `dev`.
 pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
+    mkfs(dev, fs, label, None).map(|_| ())
+}
+
+/// Default block size for a volume (mke2fs.conf: "small" filesystems below 512 MiB use 1 KiB
+/// blocks; we switch at 256 MiB as LumenDisk always has).
+pub fn default_block_size(size: u64) -> u64 {
+    if size >= 256 * 1024 * 1024 {
+        4096
+    } else {
+        1024
+    }
+}
+
+/// Like [`format`], with an explicit block size (1024, 2048 or 4096; None: the default for
+/// the size). The block size can't be smaller than the device's logical sector size. Returns
+/// the block size used.
+pub fn format_with(dev: Arc<dyn BlockDev>, fs: FsType, label: &str, block: Option<u32>) -> FsResult<u32> {
+    let sector = dev.logical_sector_size().unwrap_or(512) as u64;
+    let bs = match block {
+        Some(b) if matches!(b, 1024 | 2048 | 4096) => b as u64,
+        Some(b) => return Err(FsError::Invalid(format!("invalid ext block size {b}: 1024, 2048 or 4096"))),
+        None => default_block_size(dev.size()).max(sector),
+    };
+    if bs < sector {
+        return Err(FsError::Invalid(format!("{bs}-byte blocks are smaller than the disk's {sector}-byte sectors")));
+    }
+    mkfs(dev, fs, label, Some(bs))
+}
+
+fn mkfs(dev: Arc<dyn BlockDev>, fs: FsType, label: &str, block: Option<u64>) -> FsResult<u32> {
     let size = dev.size();
     if size < 8 * 1024 * 1024 {
         return Err(FsError::Invalid("ext filesystems need at least 8 MiB".into()));
     }
-    let bs: u64 = if size >= 256 * 1024 * 1024 { 4096 } else { 1024 };
+    let bs: u64 = block.unwrap_or_else(|| default_block_size(size));
+    // s_blocks_count_lo is 32 bits and the 64bit feature is not used: 2^32 blocks at most
+    // (16 TiB with 4 KiB blocks, 4 TiB with 1 KiB blocks).
+    if size / bs > u32::MAX as u64 {
+        return Err(FsError::Invalid(format!("volume too large for ext with {bs}-byte blocks (at most {} TiB)", (bs << 32) >> 40)));
+    }
     let log = (bs / 1024).trailing_zeros();
     let fdb: u64 = if bs == 1024 { 1 } else { 0 };
     let mut blocks = size / bs;
@@ -3494,7 +3529,7 @@ pub fn format(dev: Arc<dyn BlockDev>, fs: FsType, label: &str) -> FsResult<()> {
     }
     f.sync()?;
     // Refresh the backup superblock in group 1 so free counts look consistent.
-    Ok(())
+    Ok(bs as u32)
 }
 
 // ───────────────────────────── tests ─────────────────────────────
