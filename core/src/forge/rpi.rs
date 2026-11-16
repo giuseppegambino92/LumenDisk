@@ -410,9 +410,9 @@ pub fn valid_locale(l: &str) -> bool {
     let alnum = |s: &str, min: usize, max: usize, extra: &[u8]| (min..=max).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || extra.contains(&b));
     l.len() <= 64
         && (alnum(ll, 2, 3, b"") && ll.bytes().all(|b| b.is_ascii_lowercase()) || ll == "C" || ll == "POSIX")
-        && cc.map_or(true, |c| alnum(c, 2, 3, b""))
-        && charset.map_or(true, |c| alnum(c, 1, 16, b"-"))
-        && modifier.map_or(true, |m| alnum(m, 1, 16, b""))
+        && cc.is_none_or(|c| alnum(c, 2, 3, b""))
+        && charset.is_none_or(|c| alnum(c, 1, 16, b"-"))
+        && modifier.is_none_or(|m| alnum(m, 1, 16, b""))
 }
 
 pub fn valid_time_zone(z: &str) -> bool {
@@ -775,15 +775,17 @@ fn o_push_raw(l: &mut impl FnMut(&str), body: &str) {
 
 /// Remove parameters LumenDisk may have added before (so customising twice doesn't stack them).
 fn strip_ours(cmdline: &str) -> String {
-    let mut out: Vec<&str> = vec![];
-    let mut words = cmdline.split_whitespace().peekable();
-    while let Some(w) = words.next() {
-        if w.starts_with("systemd.run=") || w.starts_with("systemd.run_success_action=") || w == "systemd.unit=kernel-command-line.target" || w.starts_with("cfg80211.ieee80211_regdom=") || w.starts_with("ds=nocloud") {
-            continue;
-        }
-        out.push(w);
-    }
-    out.join(" ")
+    cmdline
+        .split_whitespace()
+        .filter(|w| {
+            !(w.starts_with("systemd.run=")
+                || w.starts_with("systemd.run_success_action=")
+                || *w == "systemd.unit=kernel-command-line.target"
+                || w.starts_with("cfg80211.ieee80211_regdom=")
+                || w.starts_with("ds=nocloud"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `cmdline.txt` for the firstrun method: one line, + regdom + the systemd.run parameters.

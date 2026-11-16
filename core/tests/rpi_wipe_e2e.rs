@@ -357,6 +357,143 @@ fn ubuntu_server_raspi_cloud_init() {
     customise_real(&UBUNTU, "Ubuntu 26.04.1 LTS (Raspberry Pi)", "cloud-init");
 }
 
+// ───────────────────────────── QEMU boot ─────────────────────────────
+
+/// Boots an image on QEMU's `raspi3b` (TCG) from its own kernel / DTB / initramfs, with the
+/// kernel command line read from the image's cmdline.txt before each boot (the guest edits it
+/// between reboots, and QEMU's direct kernel boot doesn't read it). Waits for the login prompt
+/// with the customised host name, signs in with the customised account and password, and
+/// prints `id` / `hostname` / sshd state. Exit 0 on success; the console goes to console.log.
+const QEMU_DRIVER_PY: &str = r#"
+import os, re, select, subprocess, sys, time
+img, user, pw, host, deadline_s = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+off = int(subprocess.check_output(["sh", "-c", "sfdisk -d %s | awk '/ : start=/{gsub(\",\",\"\");print $4; exit}'" % img]).strip()) * 512
+def mtype(name):
+    return subprocess.run(["mtype", "-i", "%s@@%d" % (img, off), "::" + name], capture_output=True).stdout
+# The Pi 2 B v1.2 device tree (same BCM2837): no Bluetooth holding the PL011, so ttyAMA0 is
+# a console (on the 3 B / 3 B+ trees it belongs to the BT serdev and nothing is printed).
+for f in ["kernel8.img", "bcm2710-rpi-2-b.dtb", "initramfs8"]:
+    open("/tmp/" + f, "wb").write(mtype(f))
+log = open("/w/console.log", "ab")
+t_end = time.time() + deadline_s
+for boot in range(1, 6):
+    cmdline = mtype("cmdline.txt").decode().strip()
+    words = [w for w in cmdline.split() if not w.startswith("console=")]
+    # QEMU's BCM2835 watchdog resets the guest during boot: its driver is left out.
+    append = " ".join(["console=ttyAMA0,115200", "initcall_blacklist=bcm2835_wdt_driver_init"] + words)
+    print("boot %d: %s" % (boot, append), flush=True)
+    args = ["qemu-system-aarch64", "-M", "raspi3b", "-m", "1G", "-smp", "4",
+            "-kernel", "/tmp/kernel8.img", "-dtb", "/tmp/bcm2710-rpi-2-b.dtb",
+            "-drive", "file=%s,if=sd,format=raw" % img, "-append", append,
+            "-serial", "stdio", "-display", "none", "-monitor", "none", "-no-reboot"]
+    # Only the firstrun flow needs the initramfs
+    # (bookworm's imager_fixup), so it is used only when systemd.run is on the command line.
+    if "systemd.run=" in cmdline and len(mtype("initramfs8")) > 0:
+        args[args.index("-append"):args.index("-append")] = ["-initrd", "/tmp/initramfs8"]
+    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    buf = b""
+    def wait(pattern, secs):
+        global buf
+        end = min(time.time() + secs, t_end)
+        rx = re.compile(pattern)
+        while time.time() < end:
+            m = rx.search(buf)
+            if m:
+                buf = buf[m.end():]
+                return m
+            r, _, _ = select.select([p.stdout], [], [], 1)
+            if r:
+                d = os.read(p.stdout.fileno(), 65536)
+                if not d:
+                    return None
+                log.write(d); log.flush()
+                buf += d
+        return None
+    def send(s):
+        p.stdin.write(s.encode()); p.stdin.flush()
+    m = wait(rb"([A-Za-z0-9-]+) login: ", deadline_s)
+    if m is None:
+        p.wait(timeout=30) if p.poll() is not None else None
+        if p.poll() is not None:
+            print("boot %d: QEMU exited (guest rebooted), %.0f s left" % (boot, t_end - time.time()), flush=True)
+            continue
+        print("no login prompt in time", flush=True); p.kill(); sys.exit(2)
+    name = m.group(1).decode()
+    print("boot %d: login prompt of %r" % (boot, name), flush=True)
+    if name != host:
+        # cloud-init may still be running; give it the time to finish and retry the prompt.
+        send("\n")
+        if wait((r"%s login: " % re.escape(host)).encode(), 600) is None:
+            print("host name never became %r" % host, flush=True); p.kill(); sys.exit(3)
+    time.sleep(20)
+    send(user + "\n")
+    if wait(rb"Password: ", 120) is None:
+        print("no password prompt", flush=True); p.kill(); sys.exit(4)
+    time.sleep(1)
+    send(pw + "\n")
+    m = wait(rb"Login incorrect|\$ ", 180)
+    if m is None or m.group(0) == b"Login incorrect":
+        print("login failed", flush=True); p.kill(); sys.exit(5)
+    print("boot %d: signed in as %s" % (boot, user), flush=True)
+    # runcmd (enabling sshd) runs in cloud-init's final stage: wait for it to finish.
+    send("cloud-init status --wait >/dev/null 2>&1; echo ID=$(id -un):$(id -Gn | tr ' ' ,) HOST=$(hostname) SSH=$(systemctl is-enabled ssh) CI=$(cloud-init status 2>/dev/null | sed -n 's/^status: //p') TZ=$(readlink /etc/localtime | sed 's,.*zoneinfo/,,')\n")
+    m = wait(rb"(ID=\S+ HOST=\S+ SSH=\S+ CI=\S* TZ=\S*)\r?\n", 900)
+    print("RESULT " + (m.group(1).decode() if m else "none"), flush=True)
+    send("sudo -n poweroff || echo no-sudo\n")
+    try:
+        p.wait(timeout=10)
+    except Exception:
+        p.kill()
+    sys.exit(0 if m else 6)
+print("too many reboots", flush=True)
+sys.exit(7)
+"#;
+
+fn qemu_boot(src: &Source, minutes: u64) {
+    require_virtual_only();
+    ensure_qa_image();
+    let img = pristine(src);
+    let dir = common::workdir(&format!("rpi-qemu-{}", src.name));
+    let work = work_copy(&img, &dir);
+    {
+        let dev = block::open_source(&work.to_string_lossy(), false, None).unwrap();
+        let mut o = options();
+        o.wifi = None; // no Wi-Fi on raspi3b; keeps the network config the image's own
+        let v = rpi::customize(dev, &o, &JobCtx::detached(false)).unwrap();
+        eprintln!("{}: {v}", src.name);
+    }
+    // QEMU's SD card wants a power-of-two size.
+    let len = std::fs::metadata(&work).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(&work).unwrap().set_len(len.next_power_of_two()).unwrap();
+    std::fs::write(dir.join("driver.py"), QEMU_DRIVER_PY).unwrap();
+    let fname = work.file_name().unwrap().to_string_lossy().into_owned();
+    let t0 = Instant::now();
+    let (rc, log) = docker_in(
+        QA_IMAGE,
+        &[(&dir, "/w", false)],
+        &format!("python3 -I /w/driver.py '/w/{fname}' mario \"$(cat /w/pw)\" lumen-pi {}", minutes * 60).replace("\"$(cat /w/pw)\"", &format!("'{}'", PASSWORD.replace('\'', "'\"'\"'"))),
+    );
+    eprintln!("{log}\nQEMU {} finished in {:?} (console: {})", src.name, t0.elapsed(), dir.join("console.log").display());
+    assert_eq!(rc, 0, "boot check failed");
+    let result = log.lines().find(|l| l.starts_with("RESULT ")).unwrap();
+    assert!(result.contains("ID=mario:") && result.contains("HOST=lumen-pi") && result.contains("SSH=enabled") && result.contains("TZ=Europe/Rome"), "{result}");
+    let _ = std::fs::remove_file(&work);
+}
+
+/// Optional (slow): Raspberry Pi OS trixie, cloud-init applied on the first boot.
+#[test]
+#[ignore]
+fn qemu_boot_trixie() {
+    qemu_boot(&TRIXIE, 40);
+}
+
+/// Optional (slow): Raspberry Pi OS bookworm, firstrun.sh across its reboots.
+#[test]
+#[ignore]
+fn qemu_boot_bookworm() {
+    qemu_boot(&BOOKWORM, 50);
+}
+
 // ───────────────────────────── crypt ─────────────────────────────
 
 #[test]

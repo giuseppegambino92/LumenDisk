@@ -261,7 +261,7 @@ pub fn wipe_dev(dev: &dyn BlockDev, method: WipeMethod, verify: bool, ctx: &JobC
     if size == 0 {
         return Err(ForgeError::Invalid(t("la destinazione è vuota (0 byte): niente da cancellare", "the target is empty (0 bytes): nothing to erase")));
     }
-    if chunk == 0 || chunk % 12 != 0 {
+    if chunk == 0 || !chunk.is_multiple_of(12) {
         return Err(ForgeError::Invalid(format!("wipe chunk {chunk} is not a multiple of 12")));
     }
     let plan = passes(method, master);
