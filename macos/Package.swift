@@ -60,6 +60,15 @@ let package = Package(
                 .linkedFramework("CoreImage"),
             ]
         ),
+        // Unit tests of the non-view logic (request JSON, decoding, validation, formatting).
+        .testTarget(
+            name: "LumenDiskTests",
+            dependencies: ["LumenDisk"],
+            path: "Tests/LumenDiskTests",
+            swiftSettings: [
+                .enableUpcomingFeature("ExistentialAny"),
+            ]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

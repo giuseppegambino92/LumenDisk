@@ -128,6 +128,11 @@ struct SidebarView: View {
                     .tag(SidebarItem.ghost)
             }
 
+            Section(L("Crea", "Create")) {
+                ForgeSidebarRow()
+                    .tag(SidebarItem.forge)
+            }
+
             Section(L("Gestione", "Manage")) {
                 Label(L("Immagini Disco (.img)", "Disk Images (.img)"), systemImage: "opticaldiscdrive")
                     .tag(SidebarItem.images)
@@ -164,6 +169,9 @@ private struct SidebarFooter: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            ForEach(model.forge.runningJobs) { job in
+                ForgeRunningChip(job: job)
+            }
             if let error = model.startupError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption2)
@@ -176,6 +184,72 @@ private struct SidebarFooter: View {
         .padding(.horizontal, 10)
         .padding(.bottom, 10)
         .animation(.snappy, value: model.totalGhostBlocked)
+    }
+}
+
+/// "Crea & Formatta" in the sidebar, with a progress ring while a job runs.
+private struct ForgeSidebarRow: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let running = model.forge.runningJobs.first
+        HStack(spacing: 6) {
+            Label(L("Crea & Formatta", "Create & Format"), systemImage: "wand.and.rays")
+            Spacer(minLength: 0)
+            if let running {
+                ForgeProgressRing(fraction: running.snapshot?.fraction)
+                    .help(running.title)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(running.map { L("Operazione in corso: \($0.title)", "Operation running: \($0.title)") } ?? "")
+    }
+}
+
+struct ForgeProgressRing: View {
+    var fraction: Double?
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.primary.opacity(0.12), lineWidth: 2.5)
+            if let fraction {
+                Circle().trim(from: 0, to: max(0.02, fraction))
+                    .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.smooth, value: fraction)
+            } else {
+                ProgressView().controlSize(.mini)
+            }
+        }
+        .frame(width: 14, height: 14)
+    }
+}
+
+/// Running forge job in the sidebar footer: click to go back to it.
+private struct ForgeRunningChip: View {
+    @Environment(AppModel.self) private var model
+    var job: ForgeJob
+
+    var body: some View {
+        Button {
+            model.forge.tool = job.tool
+            model.selection = .forge
+        } label: {
+            HStack(spacing: 8) {
+                ForgeProgressRing(fraction: job.snapshot?.fraction)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(job.title).font(.caption.weight(.semibold)).lineLimit(1).truncationMode(.middle)
+                    Text(ForgeFormat.phaseTitle(job.snapshot?.phase ?? .preparing)
+                         + (job.snapshot?.fraction.map { " · " + $0.formatted(.percent.precision(.fractionLength(0)).locale(L10n.locale)) } ?? ""))
+                        .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                }
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(L("Torna all'operazione in corso", "Go back to the running operation"))
+        .accessibilityLabel(L("Operazione in corso: \(job.title)", "Operation running: \(job.title)"))
     }
 }
 
@@ -354,6 +428,8 @@ struct DetailRouter: View {
                 DiskImageMountView()
             case .rules?:
                 AutomountRulesView()
+            case .forge?:
+                ForgeView()
             case nil:
                 WelcomeView()
             }

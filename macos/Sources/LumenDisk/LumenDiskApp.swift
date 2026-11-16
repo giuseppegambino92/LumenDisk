@@ -15,7 +15,7 @@ struct LumenDiskApp: App {
             MainWindowView()
                 .environment(model)
                 .environment(\.locale, language.locale)
-                .frame(minWidth: 900, minHeight: 600)
+                .frame(minWidth: 960, minHeight: 620)
         }
         .defaultSize(width: 1040, height: 700)
         .windowResizability(.contentMinSize)

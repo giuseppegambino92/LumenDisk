@@ -11,6 +11,7 @@ enum SidebarItem: Hashable, Sendable {
     case ghost
     case images
     case rules
+    case forge
 }
 
 struct AppAlert: Identifiable, Sendable {
@@ -115,6 +116,8 @@ final class AppModel {
     let diskMonitor = DiskMonitor()
     let rules = AutomountStore()
     let lanDiscovery = LANDiscovery()
+    /// Formatting, bootable media and disk utilities (jobs survive closing the window).
+    let forge = ForgeCenter()
     let settings = AppSettings.shared
     @ObservationIgnored private let bridge = CoreBridge.shared
     @ObservationIgnored private let bonjour = BonjourPublisher()
@@ -247,6 +250,9 @@ final class AppModel {
         }
         diskMonitor.onPartitionsChanged = { [weak self] in
             self?.scheduleShadowSessionsRefresh()
+        }
+        diskMonitor.onDisksChanged = { [weak self] in
+            self?.forge.scheduleDiskRefresh()
         }
         diskMonitor.start()
 

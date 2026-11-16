@@ -352,6 +352,9 @@ final class DiskMonitor {
     /// Called after a rebuild that added or removed partitions, or changed one's identity
     /// (media UUID, label), after the `onPartitionAppeared` calls.
     @ObservationIgnored var onPartitionsChanged: (() -> Void)?
+    /// Called after every rebuild caused by a DiskArbitration event (any disk, including blank
+    /// disks and attached images that LumenDisk itself doesn't list).
+    @ObservationIgnored var onDisksChanged: (() -> Void)?
 
     @ObservationIgnored private var descriptions: [String: DiskDescription] = [:]
     @ObservationIgnored private let engine = DiskArbitrationEngine()
@@ -498,5 +501,6 @@ final class DiskMonitor {
             onPartitionAppeared?(partition)
         }
         if partitionsChanged { onPartitionsChanged?() }
+        onDisksChanged?()
     }
 }
