@@ -44,9 +44,13 @@ bzip2 = "0.6"
 ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"] }
 lzfse_rust = "0.2"
 crc32fast = "1"
-# Forge checksums (forge/hash.rs): same `digest` 0.10 family as sha2.
-sha1 = "0.10"
-md-5 = "0.10"
+# Forge checksums (forge/hash.rs, forge/flash.rs): the `digest` 0.11 family, whose SHA-256 and
+# SHA-1 use the ARMv8 SHA instructions when the CPU has them (runtime detection, no assembly
+# to build); sha2 0.10 above is software-only on Apple silicon (≈ 5× slower). sha2 0.11 is
+# already in the build through lzma-rust2.
+sha2_hw = { package = "sha2", version = "0.11" }
+sha1 = "0.11"
+md-5 = "0.11"
 
 [dev-dependencies]
 libc = "0.2"

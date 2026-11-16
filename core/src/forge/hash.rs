@@ -76,22 +76,22 @@ fn hex(b: &[u8]) -> String {
 }
 
 enum State {
-    Sha256(sha2::Sha256),
+    Sha256(sha2_hw::Sha256),
     Sha1(sha1::Sha1),
     Md5(md5::Md5),
 }
 
 impl State {
     fn new(a: Algo) -> Self {
-        use sha2::Digest;
+        use sha2_hw::Digest;
         match a {
-            Algo::Sha256 => State::Sha256(sha2::Sha256::new()),
+            Algo::Sha256 => State::Sha256(sha2_hw::Sha256::new()),
             Algo::Sha1 => State::Sha1(sha1::Sha1::new()),
             Algo::Md5 => State::Md5(md5::Md5::new()),
         }
     }
     fn update(&mut self, d: &[u8]) {
-        use sha2::Digest;
+        use sha2_hw::Digest;
         match self {
             State::Sha256(h) => h.update(d),
             State::Sha1(h) => h.update(d),
@@ -99,7 +99,7 @@ impl State {
         }
     }
     fn finish(self) -> String {
-        use sha2::Digest;
+        use sha2_hw::Digest;
         match self {
             State::Sha256(h) => hex(&h.finalize()),
             State::Sha1(h) => hex(&h.finalize()),

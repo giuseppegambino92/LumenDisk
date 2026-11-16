@@ -32,7 +32,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha2_hw::{Digest, Sha256};
 
 use super::hash::{self, Expected};
 use super::image::{self, Image, CHUNK};

@@ -254,7 +254,9 @@ fn parse_mish(b: &[u8], df_off: u64, df_len: u64, size: u64, out: &mut Vec<Chunk
             }
             (df_off + rel, clen)
         };
-        if len > MAX_CHUNK || clen > MAX_CHUNK {
+        // Zero and raw runs are never decoded into memory (UDRO uses runs of any length);
+        // compressed ones are, whole.
+        if !matches!(kind, Kind::Zero | Kind::Raw) && (len > MAX_CHUNK || clen > MAX_CHUNK) {
             return Err(ForgeError::Unsupported(t("DMG con blocchi troppo grandi", "DMG with oversized chunks")));
         }
         if kind == Kind::Raw && clen < len {
