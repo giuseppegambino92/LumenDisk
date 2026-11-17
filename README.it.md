@@ -2,20 +2,37 @@
 
 [English](README.md) | **Italiano**
 
-<a href="https://paypal.me/giuseppegambino92"><img src="https://www.paypalobjects.com/it_IT/IT/i/btn/btn_donateCC_LG.gif" alt="Fai una donazione con PayPal"></a>
+**Apri, copia, modifica ed elimina i file dei dischi Linux e Windows (ext4, NTFS, FAT32, exFAT) direttamente dal Finder del tuo Mac.** Gratuito e open source. Senza macFUSE, senza estensioni del kernel, senza toccare la sicurezza dalla modalità di recupero.
 
-**I dischi Linux e Windows sul tuo Mac, in lettura e scrittura, nel Finder. Senza macFUSE, senza estensioni del kernel, senza toccare la sicurezza dalla modalità di recupero.**
-
-![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
-![Universal](https://img.shields.io/badge/Universal-Apple%20Silicon%20%2B%20Intel-blue)
-![Notarizzata](https://img.shields.io/badge/notarizzata-Apple-brightgreen?logo=apple)
-![Rust](https://img.shields.io/badge/core-Rust-orange?logo=rust)
-![Swift 6](https://img.shields.io/badge/app-Swift%206-F05138?logo=swift)
-![ext4 NTFS FAT32 exFAT](https://img.shields.io/badge/ext2%2F3%2F4%20·%20NTFS%20·%20FAT%20·%20exFAT-lettura%20%2B%20scrittura-success)
+[![CI](https://github.com/giuseppegambino92/LumenDisk/actions/workflows/ci.yml/badge.svg)](https://github.com/giuseppegambino92/LumenDisk/actions/workflows/ci.yml)
+[![Ultima versione](https://img.shields.io/github/v/release/giuseppegambino92/LumenDisk)](https://github.com/giuseppegambino92/LumenDisk/releases/latest)
+[![Licenza: GPL-3.0-or-later](https://img.shields.io/github/license/giuseppegambino92/LumenDisk)](LICENSE)
 
 <p align="center">
-  <img src="docs/screenshots/it-01-volume.png" alt="LumenDisk: un volume ext4 con la scheda Salute e Velocità Disco" width="860">
+  <img src="docs/screenshots/it-02-usb.png" alt="LumenDisk: una chiavetta USB ext4 che macOS non sa leggere, pronta da montare in lettura e scrittura, in modalità Shadow o in sola lettura" width="860">
 </p>
+
+**[Scarica LumenDisk 1.1.0 per qualsiasi Mac (DMG universale)](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-universal.dmg)** · macOS 14 Sonoma o successivo · firmata e notarizzata da Apple · [altri download](#download)
+
+## I miei dati sono al sicuro?
+
+- **Scegli tu come montare ogni disco**: **Sola lettura**, **Modalità Shadow** (ogni modifica resta in sospeso sul Mac: la controlli, poi scegli Commit o Rollback) oppure **Lettura/Scrittura**. Le regole di montaggio automatico permettono di impostarlo disco per disco.
+- **Scritture a prova di crash**: un journal ordinato dei metadati, come ext4 `data=ordered`. Una modifica viene confermata a macOS solo quando è già nel journal sul Mac, quindi un crash o un'uscita forzata non fanno perdere nulla di confermato; dopo un'interruzione di corrente il disco viene riparato automaticamente al montaggio successivo.
+- **I dischi "sporchi" vengono riconosciuti**: i volumi lasciati in stato non pulito da Windows o Linux (flag dirty, ibernazione, journal ext4 non riprodotto) vengono segnalati e si riparano con un clic.
+- **Formattazione e scrittura di immagini sono protette**: si possono cancellare solo dischi esterni, schede SD e immagini disco. Il disco di avvio e i dischi interni vengono sempre rifiutati, ogni cancellazione va confermata dopo aver visto nome, dimensione e volumi del disco, e LumenDisk non esegue mai codice con privilegi (usa la richiesta di autorizzazione `authopen` di macOS).
+- **Niente nel kernel**: tutto gira in spazio utente e la Protezione dell'integrità del sistema resta attiva.
+- **Verificato con gli strumenti ufficiali**: 318 test unitari, 37 test end-to-end con montaggi reali controllati da `e2fsck`/`fsck` (anche con `kill -9` nel mezzo di scritture e commit), 16.000 immagini corrotte che non devono mai mandare in crash o bloccare l'app, e fuzzing. Vedi [Verifica](#verifica), il [modello di minaccia](SECURITY.md) e i [limiti noti](#limiti-noti) (per esempio, NTFS non è ancora stato verificato con `chkdsk` di Windows).
+
+## In cosa è diverso
+
+| | LumenDisk |
+|---|---|
+| macFUSE | non serve: i volumi passano dal client NFS già integrato in macOS |
+| Estensione del kernel / sicurezza ridotta dalla modalità di recupero | nessuna: solo spazio utente, SIP resta attiva |
+| Prezzo e licenza | gratuito, GPL-3.0 o successiva |
+| Formati | lettura/scrittura ext2/3/4, NTFS, FAT12/16/32, exFAT; formatta con 11 filesystem; crea chiavette USB avviabili |
+
+## Panoramica
 
 LumenDisk monta su macOS dischi, schede SD e immagini disco **ext2/ext3/ext4, NTFS, FAT12/16/32 ed exFAT** in lettura e scrittura completa, così si comportano come qualsiasi altro disco nel Finder. Monta anche **server SFTP, condivisioni WebDAV/NAS, altri Mac della tua rete** e **file `.img` / `.iso` remoti** senza scaricarli. E **formatta unità** con undici filesystem e **crea supporti avviabili** per Windows, Linux e Raspberry Pi, come Rufus e Raspberry Pi Imager, direttamente sul Mac.
 
@@ -23,17 +40,17 @@ Tutto gira in spazio utente: un motore in Rust, con i suoi driver dei file syste
 
 ## Download
 
-Scarica l'ultima versione da **[Releases](../../releases)**:
+Scarica l'ultima versione da **[Releases](https://github.com/giuseppegambino92/LumenDisk/releases/latest)**:
 
 | File | Per |
 |---|---|
-| **LumenDisk-1.1.0-universal.dmg** | **qualsiasi Mac**, Apple Silicon e Intel (consigliato) |
-| LumenDisk-1.1.0-arm64.dmg | solo Apple Silicon (M1, M2, M3, M4…) |
-| LumenDisk-1.1.0-x86_64.dmg | solo Intel |
-| LumenDisk-1.1.0-universal.zip | l'app universale, in formato zip |
-| lumendisk-cli-1.1.0-macos-universal.tar.gz | lo strumento da riga di comando `lumendisk` |
+| **[LumenDisk-1.1.0-universal.dmg](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-universal.dmg)** | **qualsiasi Mac**, Apple Silicon e Intel (consigliato) |
+| [LumenDisk-1.1.0-arm64.dmg](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-arm64.dmg) | solo Apple Silicon (M1, M2, M3, M4…) |
+| [LumenDisk-1.1.0-x86_64.dmg](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-x86_64.dmg) | solo Intel |
+| [LumenDisk-1.1.0-universal.zip](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-universal.zip) | l'app universale, in formato zip |
+| [lumendisk-cli-1.1.0-macos-universal.tar.gz](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/lumendisk-cli-1.1.0-macos-universal.tar.gz) | lo strumento da riga di comando `lumendisk` |
 
-Apri il DMG e trascina **LumenDisk** su **Applicazioni**. L'app è firmata con un Developer ID e notarizzata da Apple, quindi si apre come qualsiasi altra app. I checksum sono in `SHA256SUMS.txt`.
+Apri il DMG e trascina **LumenDisk** su **Applicazioni**. L'app è firmata con un Developer ID e notarizzata da Apple, quindi si apre come qualsiasi altra app. I checksum sono in [`SHA256SUMS.txt`](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/SHA256SUMS.txt).
 
 Richiede macOS 14 Sonoma o successivo.
 

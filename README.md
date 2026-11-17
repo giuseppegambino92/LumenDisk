@@ -2,20 +2,37 @@
 
 **English** | [Italiano](README.it.md)
 
-<a href="https://paypal.me/giuseppegambino92"><img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif" alt="Donate with PayPal"></a>
+**Open, copy, edit and delete files on Linux and Windows drives (ext4, NTFS, FAT32, exFAT) from your Mac's Finder.** Free and open source. No macFUSE, no kernel extensions, no Recovery-mode security changes.
 
-**Linux and Windows drives on your Mac, read and write, in Finder. No macFUSE, no kernel extensions, no Recovery-mode security changes.**
-
-![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
-![Universal](https://img.shields.io/badge/Universal-Apple%20Silicon%20%2B%20Intel-blue)
-![Notarized](https://img.shields.io/badge/notarized-Apple-brightgreen?logo=apple)
-![Rust](https://img.shields.io/badge/core-Rust-orange?logo=rust)
-![Swift 6](https://img.shields.io/badge/app-Swift%206-F05138?logo=swift)
-![ext4 NTFS FAT32 exFAT](https://img.shields.io/badge/ext2%2F3%2F4%20·%20NTFS%20·%20FAT%20·%20exFAT-read%20%2B%20write-success)
+[![CI](https://github.com/giuseppegambino92/LumenDisk/actions/workflows/ci.yml/badge.svg)](https://github.com/giuseppegambino92/LumenDisk/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/giuseppegambino92/LumenDisk)](https://github.com/giuseppegambino92/LumenDisk/releases/latest)
+[![License: GPL-3.0-or-later](https://img.shields.io/github/license/giuseppegambino92/LumenDisk)](LICENSE)
 
 <p align="center">
-  <img src="docs/screenshots/en-01-volume.png" alt="LumenDisk: an ext4 volume with the disk health and speed card" width="860">
+  <img src="docs/screenshots/en-02-usb.png" alt="LumenDisk: an ext4 USB drive that macOS can't read, ready to mount read/write, in Shadow Mode or read-only" width="860">
 </p>
+
+**[Download LumenDisk 1.1.0 for any Mac (universal DMG)](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-universal.dmg)** · macOS 14 Sonoma or later · signed and notarized by Apple · [other downloads](#download)
+
+## Is my data safe?
+
+- **You choose how each disk is mounted**: **Read Only**, **Shadow Mode** (every change is staged on the Mac; you review it, then Commit or Rollback) or **Read/Write**. Automount rules can set this per disk.
+- **Crash-safe writes**: an ordered metadata journal, like ext4 `data=ordered`. A change is confirmed to macOS only once it is in the journal on the Mac, so a crash or force-quit loses nothing that was confirmed; after a power cut the disk is repaired automatically at the next mount.
+- **Dirty disks are detected**: volumes left dirty by Windows or Linux (dirty flag, hibernation, unreplayed ext4 journal) are flagged and can be repaired in one click.
+- **Format and image writing are fenced**: only external drives, SD cards and disk images can be erased. The startup disk and internal drives are always refused, every erase is confirmed after seeing the drive's name, size and volumes, and LumenDisk never runs privileged code (it uses macOS's own `authopen` prompt).
+- **Nothing in the kernel**: everything runs in user space and System Integrity Protection stays on.
+- **Tested against the official tools**: 318 unit tests, 37 end-to-end tests with real mounts checked by `e2fsck`/`fsck` (including `kill -9` in the middle of writes and commits), 16,000 corrupted images that must never crash or hang the app, and fuzzing. See [Verification](#verification), the [threat model](SECURITY.md) and the [known limitations](#known-limitations) (for example, NTFS is not yet verified against Windows `chkdsk`).
+
+## How it differs
+
+| | LumenDisk |
+|---|---|
+| macFUSE | not needed: volumes are served through macOS's own built-in NFS client |
+| Kernel extension / lowered security in Recovery mode | none: user space only, SIP stays on |
+| Price and license | free, GPL-3.0-or-later |
+| Formats | read/write ext2/3/4, NTFS, FAT12/16/32, exFAT; formats 11 filesystems; writes bootable USB media |
+
+## Overview
 
 LumenDisk mounts **ext2/ext3/ext4, NTFS, FAT12/16/32 and exFAT** drives, SD cards and disk images on macOS with full read/write access, so they behave like any other drive in Finder. It also mounts **SFTP servers, WebDAV/NAS shares, other Macs on your network** and **remote `.img` / `.iso` files** without downloading them. And it **formats drives** with eleven filesystems and **writes bootable media** for Windows, Linux and Raspberry Pi, like Rufus and Raspberry Pi Imager, natively on the Mac.
 
@@ -23,17 +40,17 @@ Everything runs in user space: a Rust engine with its own filesystem drivers ser
 
 ## Download
 
-Get the latest version from **[Releases](../../releases)**:
+Get the latest version from **[Releases](https://github.com/giuseppegambino92/LumenDisk/releases/latest)**:
 
 | File | For |
 |---|---|
-| **LumenDisk-1.1.0-universal.dmg** | **any Mac**: Apple Silicon and Intel (recommended) |
-| LumenDisk-1.1.0-arm64.dmg | Apple Silicon only (M1, M2, M3, M4…) |
-| LumenDisk-1.1.0-x86_64.dmg | Intel only |
-| LumenDisk-1.1.0-universal.zip | the universal app, as a zip |
-| lumendisk-cli-1.1.0-macos-universal.tar.gz | the `lumendisk` command-line tool |
+| **[LumenDisk-1.1.0-universal.dmg](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-universal.dmg)** | **any Mac**: Apple Silicon and Intel (recommended) |
+| [LumenDisk-1.1.0-arm64.dmg](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-arm64.dmg) | Apple Silicon only (M1, M2, M3, M4…) |
+| [LumenDisk-1.1.0-x86_64.dmg](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-x86_64.dmg) | Intel only |
+| [LumenDisk-1.1.0-universal.zip](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/LumenDisk-1.1.0-universal.zip) | the universal app, as a zip |
+| [lumendisk-cli-1.1.0-macos-universal.tar.gz](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/lumendisk-cli-1.1.0-macos-universal.tar.gz) | the `lumendisk` command-line tool |
 
-Open the DMG and drag **LumenDisk** onto **Applications**. The app is signed with a Developer ID and notarized by Apple, so it opens like any other app. Checksums are in `SHA256SUMS.txt`.
+Open the DMG and drag **LumenDisk** onto **Applications**. The app is signed with a Developer ID and notarized by Apple, so it opens like any other app. Checksums are in [`SHA256SUMS.txt`](https://github.com/giuseppegambino92/LumenDisk/releases/download/v1.1.0/SHA256SUMS.txt).
 
 Requires macOS 14 Sonoma or later.
 
