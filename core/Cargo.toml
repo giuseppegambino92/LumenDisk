@@ -1,6 +1,6 @@
 [package]
 name = "lumendisk-core"
-version = "1.0.3"
+version = "1.1.0"
 edition = "2021"
 description = "LumenDisk user-space filesystem engine (ext2/3/4, FAT12/16/32, exFAT, NTFS) with NFSv3 loopback bridge"
 license = "GPL-3.0-or-later"

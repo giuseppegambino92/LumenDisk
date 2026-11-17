@@ -27,11 +27,11 @@ Get the latest version from **[Releases](../../releases)**:
 
 | File | For |
 |---|---|
-| **LumenDisk-1.0.0-universal.dmg** | **any Mac**: Apple Silicon and Intel (recommended) |
-| LumenDisk-1.0.0-arm64.dmg | Apple Silicon only (M1, M2, M3, M4…) |
-| LumenDisk-1.0.0-x86_64.dmg | Intel only |
-| LumenDisk-1.0.0-universal.zip | the universal app, as a zip |
-| lumendisk-cli-1.0.0-macos-universal.tar.gz | the `lumendisk` command-line tool |
+| **LumenDisk-1.1.0-universal.dmg** | **any Mac**: Apple Silicon and Intel (recommended) |
+| LumenDisk-1.1.0-arm64.dmg | Apple Silicon only (M1, M2, M3, M4…) |
+| LumenDisk-1.1.0-x86_64.dmg | Intel only |
+| LumenDisk-1.1.0-universal.zip | the universal app, as a zip |
+| lumendisk-cli-1.1.0-macos-universal.tar.gz | the `lumendisk` command-line tool |
 
 Open the DMG and drag **LumenDisk** onto **Applications**. The app is signed with a Developer ID and notarized by Apple, so it opens like any other app. Checksums are in `SHA256SUMS.txt`.
 
@@ -144,16 +144,17 @@ mount_nfs 127.0.0.1:/<random export>  →  ~/Volumes/<Name>
 
 ## Verification
 
-`scripts/build_and_verify.sh` builds everything and proves it works against independent, upstream tools running in Docker (e2fsprogs, ntfs-3g, dosfstools, exfatprogs, OpenSSH, Apache). On every push and pull request, [CI](.github/workflows/ci.yml) runs it on a GitHub macOS runner without Docker and fuzzing: universal build, unit, cache race, corrupted-image and LAN server tests, the app launch and the UI screens. The end-to-end suites need Docker, real mounts and attached disks, so they run locally.
+`scripts/build_and_verify.sh` builds everything and proves it works against independent, upstream tools running in Docker (e2fsprogs, ntfs-3g, dosfstools, exfatprogs, btrfs-progs, xfsprogs, f2fs-tools, wimlib, OpenSSH, Apache, QEMU with SeaBIOS and OVMF, and a FreeBSD 14.5 VM). On every push and pull request, [CI](.github/workflows/ci.yml) runs it on a GitHub macOS runner without Docker and fuzzing: universal build, unit, cache race, corrupted-image and LAN server tests, the app launch and the UI screens. The end-to-end suites need Docker, real mounts and attached disks, so they run locally.
 
 | Suite | What it proves |
 |---|---|
-| Unit (136) | every driver passes the same conformance suite; WAL crash replay; Ghost Shield; Shadow, incl. journal replay of random sessions, torn journals, a simulated crash at every step of a commit on ext4, FAT32, exFAT and NTFS (before and right after each step, with a torn checkpoint, and again during the resumes), and changes made to the disk elsewhere; a failed directory `fsync` while a session is removed (it comes back whole after a crash, never half deleted); group commit; remote cache races; a driver panic fails only its volume, fast (EIO), without poisoning locks |
+| Unit (318) | every driver passes the same conformance suite; WAL crash replay; Ghost Shield; Shadow, incl. journal replay of random sessions, torn journals, a simulated crash at every step of a commit on ext4, FAT32, exFAT and NTFS (before and right after each step, with a torn checkpoint, and again during the resumes), and changes made to the disk elsewhere; a failed directory `fsync` while a session is removed (it comes back whole after a crash, never half deleted); group commit; remote cache races; a driver panic fails only its volume, fast (EIO), without poisoning locks; partition tables, every mkfs, ISO 9660 / UDF reader, WIM split, image decoders, SHA-512 crypt, jobs and device safety policy |
 | ext4 vs e2fsprogs (5) | real `mkfs.ext4` volumes (64bit, flex_bg, metadata_csum, orphan_file) modified by LumenDisk stay `e2fsck`-clean; jbd2 replay of a real transaction |
 | End-to-end (37) | real `mount_nfs` + Finder's NFS client on ext4 / FAT32 / exFAT / NTFS; Shadow, incl. `kill -9` of the server with staged changes and in the middle of a commit, then `e2fsck`; zero loss window: `kill -9` the instant a mkdir / create / rename / unlink / rmdir / close / fsync returns, in Shadow and read/write mode on ext4 and FAT32, then nothing acknowledged is missing and `fsck` is clean; Shadow on a real block device node (`/dev/diskNs1`, `/dev/rdiskN`): `kill -9` with zero delay and in the middle of a commit, resume, `e2fsck`; Shadow on SFTP, WebDAV and LAN shares: `kill -9`, restore, commit checked on the server, edits made on the server detected; Doctor; Raspberry Pi image; NTFS symlinks; loopback security; HTTP Range images; offline LAN shares; SFTP; power loss with a 64 MB file; Apache WebDAV with offline queue across restarts; TLS through a sniffing proxy (no plaintext); a real attached block device |
+| Format and bootable media (57) | every filesystem on GPT / MBR / APM / none, checked by its official `fsck` and mounted by the Linux kernel (UFS2 by FreeBSD 14.5); XFS, F2FS and UFS2 compared byte for byte with `mkfs.xfs`, `mkfs.f2fs` and `newfs`; table doctor checked by `sgdisk` and `parted`; every image format written to attached disk images and read back; Windows media with WIMs split as wimlib does, booted in QEMU (SeaBIOS, OVMF, Secure Boot); Alpine and Debian live in ISO mode booted, persistence surviving a power cycle; Raspberry Pi OS and Ubuntu customised and booted with login; every wipe method |
 | Corrupted images (16,000 mutants + regressions) | valid, populated volumes (ext2/ext4 with extents, htree, symlinks and a pending journal transaction; NTFS with index blocks, attribute lists, LZNT1-compressed files and reparse points; FAT12/16/32; exFAT) mutated with a bias towards metadata, plus mutated MBR/GPT tables and every bug found as a regression case: each mutant is mounted read-only and read-write, walked, modified and repaired with no panic, no hang (20 s limit) and no allocation over 1 GiB. A driver panic disables only that volume (EIO from then on) and never wedges it. `LUMENDISK_CORRUPT_CASES` raises the count |
 | LAN server (22) · SFTP (4) | WebDAV/portal protocol over TLS; OpenSSH auth, timeouts and reconnects |
-| UI | every screen driven with the real engine and real volumes, in English and Italian |
+| UI · Swift unit (19) | every screen driven with the real engine and real volumes, in English and Italian |
 
 ## Security
 

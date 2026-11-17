@@ -27,11 +27,11 @@ Scarica l'ultima versione da **[Releases](../../releases)**:
 
 | File | Per |
 |---|---|
-| **LumenDisk-1.0.0-universal.dmg** | **qualsiasi Mac**, Apple Silicon e Intel (consigliato) |
-| LumenDisk-1.0.0-arm64.dmg | solo Apple Silicon (M1, M2, M3, M4…) |
-| LumenDisk-1.0.0-x86_64.dmg | solo Intel |
-| LumenDisk-1.0.0-universal.zip | l'app universale, in formato zip |
-| lumendisk-cli-1.0.0-macos-universal.tar.gz | lo strumento da riga di comando `lumendisk` |
+| **LumenDisk-1.1.0-universal.dmg** | **qualsiasi Mac**, Apple Silicon e Intel (consigliato) |
+| LumenDisk-1.1.0-arm64.dmg | solo Apple Silicon (M1, M2, M3, M4…) |
+| LumenDisk-1.1.0-x86_64.dmg | solo Intel |
+| LumenDisk-1.1.0-universal.zip | l'app universale, in formato zip |
+| lumendisk-cli-1.1.0-macos-universal.tar.gz | lo strumento da riga di comando `lumendisk` |
 
 Apri il DMG e trascina **LumenDisk** su **Applicazioni**. L'app è firmata con un Developer ID e notarizzata da Apple, quindi si apre come qualsiasi altra app. I checksum sono in `SHA256SUMS.txt`.
 
@@ -144,16 +144,17 @@ mount_nfs 127.0.0.1:/<export casuale>  →  ~/Volumes/<Nome>
 
 ## Verifica
 
-`scripts/build_and_verify.sh` compila tutto e verifica il funzionamento contro strumenti ufficiali e indipendenti eseguiti in Docker (e2fsprogs, ntfs-3g, dosfstools, exfatprogs, OpenSSH, Apache). A ogni push e pull request la [CI](.github/workflows/ci.yml) lo esegue su un Mac di GitHub senza Docker e fuzzing: build universale, test unitari, race della cache, immagini corrotte, server LAN, avvio dell'app e schermate dell'interfaccia. Le suite end-to-end richiedono Docker, montaggi reali e dischi collegati, quindi girano in locale.
+`scripts/build_and_verify.sh` compila tutto e verifica il funzionamento contro strumenti ufficiali e indipendenti eseguiti in Docker (e2fsprogs, ntfs-3g, dosfstools, exfatprogs, btrfs-progs, xfsprogs, f2fs-tools, wimlib, OpenSSH, Apache, QEMU con SeaBIOS e OVMF, e una VM FreeBSD 14.5). A ogni push e pull request la [CI](.github/workflows/ci.yml) lo esegue su un Mac di GitHub senza Docker e fuzzing: build universale, test unitari, race della cache, immagini corrotte, server LAN, avvio dell'app e schermate dell'interfaccia. Le suite end-to-end richiedono Docker, montaggi reali e dischi collegati, quindi girano in locale.
 
 | Suite | Cosa dimostra |
 |---|---|
-| Unitari (136) | ogni driver supera la stessa suite di conformità; replay del journal dopo un crash; Ghost Shield; Shadow, compresi il replay del journal di sessioni casuali, journal troncati, un crash simulato a ogni passo dell'applicazione su ext4, FAT32, exFAT e NTFS (prima e subito dopo ogni passo, con un checkpoint troncato, e di nuovo durante le riprese) e modifiche fatte al disco altrove; un `fsync` della cartella che fallisce mentre una sessione viene eliminata (dopo un crash torna intera, mai a metà); group commit; race della cache remota; un panic di un driver mette fuori uso solo il suo volume, subito (EIO), senza avvelenare i lock |
+| Unitari (318) | ogni driver supera la stessa suite di conformità; replay del journal dopo un crash; Ghost Shield; Shadow, compresi il replay del journal di sessioni casuali, journal troncati, un crash simulato a ogni passo dell'applicazione su ext4, FAT32, exFAT e NTFS (prima e subito dopo ogni passo, con un checkpoint troncato, e di nuovo durante le riprese) e modifiche fatte al disco altrove; un `fsync` della cartella che fallisce mentre una sessione viene eliminata (dopo un crash torna intera, mai a metà); group commit; race della cache remota; un panic di un driver mette fuori uso solo il suo volume, subito (EIO), senza avvelenare i lock; tabelle delle partizioni, ogni mkfs, lettore ISO 9660 / UDF, divisione dei WIM, decodificatori di immagini, crypt SHA-512, operazioni e regole di sicurezza sui dispositivi |
 | ext4 contro e2fsprogs (5) | volumi creati con il vero `mkfs.ext4` (64bit, flex_bg, metadata_csum, orphan_file) modificati da LumenDisk restano puliti per `e2fsck`; replay jbd2 di una transazione reale |
 | End-to-end (37) | `mount_nfs` reale + client NFS del Finder su ext4 / FAT32 / exFAT / NTFS; Shadow, compreso il `kill -9` del server con modifiche in sospeso e a metà applicazione, poi `e2fsck`; nessuna finestra di perdita: `kill -9` nell'istante in cui un mkdir / create / rename / unlink / rmdir / close / fsync ritorna, in Shadow e in lettura/scrittura su ext4 e FAT32, senza perdere nulla di confermato e con `fsck` pulito; Shadow su un vero dispositivo a blocchi (`/dev/diskNs1`, `/dev/rdiskN`): `kill -9` senza attesa e a metà applicazione, ripresa, `e2fsck`; Shadow su SFTP, WebDAV e condivisioni LAN: `kill -9`, ripristino, applicazione verificata sul server, modifiche fatte sul server rilevate; riparazione; immagine Raspberry Pi; symlink NTFS; sicurezza del loopback; immagini via HTTP Range; condivisione LAN offline; SFTP; blackout con un file da 64 MB; WebDAV Apache con coda offline tra riavvii; TLS attraverso un proxy intercettatore (niente in chiaro); un dispositivo a blocchi reale collegato |
+| Formattazione e supporti avviabili (57) | ogni filesystem su GPT / MBR / APM / nessuna tabella, controllato dal suo `fsck` ufficiale e montato dal kernel Linux (UFS2 da FreeBSD 14.5); XFS, F2FS e UFS2 confrontati byte per byte con `mkfs.xfs`, `mkfs.f2fs` e `newfs`; dottore delle tabelle verificato con `sgdisk` e `parted`; ogni formato di immagine scritto su immagini disco collegate e riletto; supporti Windows con WIM divisi come fa wimlib, avviati in QEMU (SeaBIOS, OVMF, Secure Boot); Alpine e Debian live in modalità ISO avviate, con la persistenza che sopravvive a uno spegnimento; Raspberry Pi OS e Ubuntu personalizzati e avviati con login; ogni metodo di cancellazione |
 | Immagini corrotte (16.000 varianti + regressioni) | volumi validi e popolati (ext2/ext4 con extent, htree, symlink e una transazione del journal in sospeso; NTFS con blocchi di indice, liste di attributi, file compressi LZNT1 e reparse point; FAT12/16/32; exFAT) alterati privilegiando i metadati, più tabelle MBR/GPT alterate e un caso di regressione per ogni bug trovato: ogni variante viene montata in sola lettura e in lettura/scrittura, esplorata, modificata e riparata senza panic, senza blocchi (limite di 20 s) e senza allocazioni oltre 1 GiB. Un panic di un driver disattiva solo quel volume (da lì in poi EIO) e non lo blocca mai. `LUMENDISK_CORRUPT_CASES` aumenta il numero di casi |
 | Server LAN (22) · SFTP (4) | protocollo WebDAV/portale su TLS; autenticazione, timeout e riconnessioni con OpenSSH |
-| Interfaccia | ogni schermata guidata dal motore reale con volumi reali, in italiano e inglese |
+| Interfaccia · unitari Swift (19) | ogni schermata guidata dal motore reale con volumi reali, in italiano e inglese |
 
 ## Sicurezza
 
