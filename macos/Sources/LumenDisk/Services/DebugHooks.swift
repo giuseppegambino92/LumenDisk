@@ -1,3 +1,11 @@
+/// Set only by LUMENDISK_SCREENSHOT_MODE=1 in debug builds (see DebugHooks below): hides the drives
+/// of the Mac taking the screenshots, so README images show just the test disk images. Declared
+/// outside `#if DEBUG` because DiskMonitor and ForgeCenter read it in release builds too, where it
+/// stays false.
+enum ScreenshotMode {
+    nonisolated(unsafe) static var enabled = false
+}
+
 #if DEBUG
 import AppKit
 import SwiftUI
@@ -32,12 +40,6 @@ import SwiftUI
 ///   LUMENDISK_READY_FILE=<path>     written when every launch hook above has finished
 ///   LUMENDISK_CONTROL=<path>        runtime command file, see `run(command:)`
 ///   LUMENDISK_QUIT_AFTER=<seconds>  eject everything and quit
-/// Set only by LUMENDISK_SCREENSHOT_MODE=1 (see above): hides the drives of the Mac taking the
-/// screenshots, so README images show just the test disk images.
-enum ScreenshotMode {
-    nonisolated(unsafe) static var enabled = false
-}
-
 @MainActor
 enum DebugHooks {
     private static var panel: NSPanel?
