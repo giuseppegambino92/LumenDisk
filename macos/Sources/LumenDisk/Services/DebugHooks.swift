@@ -415,8 +415,17 @@ enum DebugHooks {
         case "wipe-method": if let m = WipeMethod(rawValue: arg) { forge.wipeMethod = m }
         case "doctor-check":
             forge.tool = .doctor
-            NSLog("DEBUG: forge doctor check started=\(forge.prepareDoctor(.check))")
-            try? await Task.sleep(for: .milliseconds(300))
+            // prepareDoctor(.check) starts the job from a Task: wait until it is registered
+            // (or refused) so a later `wait doctor` never races it on a slow machine.
+            let previous = forge.jobs[.doctor]?.id
+            let started = forge.prepareDoctor(.check)
+            if started {
+                let deadline = ContinuousClock.now + .seconds(10)
+                while forge.jobs[.doctor]?.id == previous, forge.startErrors[.doctor] == nil, ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+            }
+            NSLog("DEBUG: forge doctor check started=\(started) job=\(forge.jobs[.doctor].map { "\($0.id)" } ?? "none") error=\(forge.startErrors[.doctor] ?? "-")")
         default: NSLog("DEBUG: unknown forge command \(line)")
         }
     }
