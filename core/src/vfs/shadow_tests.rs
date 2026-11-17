@@ -404,7 +404,7 @@ fn replay_reproduces_random_sessions_exactly() {
         let (dev, _) = setup();
         let dir = tmp("replay").join("s");
         let mut s = session(&dev, &dir);
-        let mut rng = Rng(seed * 0x9E37_79B9_7F4A_7C15);
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         for i in 0..250 {
             random_op(&mut s, &mut rng);
             if rng.below(15) == 0 || i == 249 {
