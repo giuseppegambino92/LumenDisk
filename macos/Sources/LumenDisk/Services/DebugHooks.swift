@@ -9,6 +9,9 @@ import SwiftUI
 /// Launch-time environment:
 ///   LUMENDISK_LANG=<it|en>          interface language (not persisted)
 ///   LUMENDISK_DARK=1                dark appearance
+///   LUMENDISK_SCREENSHOT_MODE=1     README screenshots: list only disk images (and, in Create &
+///                                   Format, the startup disk as the refused example), never the
+///                                   Mac's other drives
 ///   LUMENDISK_SELECT=<spec>         see `select(_:)`
 ///   LUMENDISK_SHEET=<spec>          see `sheet(_:)`
 ///   LUMENDISK_TECH=1                "Dettagli tecnici" starts expanded
@@ -29,6 +32,12 @@ import SwiftUI
 ///   LUMENDISK_READY_FILE=<path>     written when every launch hook above has finished
 ///   LUMENDISK_CONTROL=<path>        runtime command file, see `run(command:)`
 ///   LUMENDISK_QUIT_AFTER=<seconds>  eject everything and quit
+/// Set only by LUMENDISK_SCREENSHOT_MODE=1 (see above): hides the drives of the Mac taking the
+/// screenshots, so README images show just the test disk images.
+enum ScreenshotMode {
+    nonisolated(unsafe) static var enabled = false
+}
+
 @MainActor
 enum DebugHooks {
     private static var panel: NSPanel?
@@ -42,6 +51,7 @@ enum DebugHooks {
             LanguageStore.shared.override(lang)
         }
         if env["LUMENDISK_DARK"] == "1" { NSApp.appearance = NSAppearance(named: .darkAqua) }
+        ScreenshotMode.enabled = env["LUMENDISK_SCREENSHOT_MODE"] == "1"
         if env["LUMENDISK_TECH"] == "1" { TechnicalDetailsCard.startExpanded = true }
         if env["LUMENDISK_SCROLL"] == "bottom" { DetailCanvasDebug.startAtBottom = true }
         ConnectServerSheet.debugPrefill = env["LUMENDISK_SHEET"] == "connect-filled"
@@ -377,6 +387,12 @@ enum DebugHooks {
             forge.plan.rpi.ssid = "Casa"
             forge.plan.rpi.wifiPassword = "short"
             forge.plan.rpi.country = ""
+            if ScreenshotMode.enabled {
+                // README images show a complete, valid setup instead of the validation messages.
+                forge.plan.rpi.password = "lumendisk"
+                forge.plan.rpi.wifiPassword = "lumendisk-wifi"
+                forge.plan.rpi.country = L("IT", "GB")
+            }
         case "reset-options":
             let target = forge.plan.targetBSD
             forge.plan = ForgePlan()

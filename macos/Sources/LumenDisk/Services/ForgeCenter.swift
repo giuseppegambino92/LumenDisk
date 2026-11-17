@@ -161,7 +161,7 @@ final class ForgeCenter {
             refreshAgain = false
             do {
                 let list = try await bridge.forgeDisks()
-                disks = ForgeDiskRules.sorted(list)
+                disks = ForgeDiskRules.sorted(ScreenshotMode.enabled ? list.filter { $0.allowed || $0.boot } : list)
                 disksError = nil
             } catch {
                 disksError = error.localizedDescription

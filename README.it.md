@@ -92,6 +92,19 @@ Richiede macOS 14 Sonoma o successivo.
 | ![Immagini disco](docs/screenshots/it-07-images.png) | ![Barra dei menu](docs/screenshots/it-08-menubar.png) |
 | **Immagini disco**: trascina, da URL, crea un disco di prova | **Barra dei menu** |
 
+### Crea & Formatta
+
+| | |
+|---|---|
+| ![Crea & Formatta: un'immagine pronta da scrivere](docs/screenshots/it-09-forge-image.png) | ![Opzioni per i supporti di installazione di Windows](docs/screenshots/it-10-forge-windows.png) |
+| **Scrivi un'immagine**: trascinala, LumenDisk la analizza, consiglia la modalità DD o ISO e la verifica con `SHA256SUMS` | **Supporti Windows**: salta i controlli hardware di Windows 11, account locale, niente domande sulla privacy, lingua e fuso orario |
+| ![Impostazioni del primo avvio del Raspberry Pi](docs/screenshots/it-11-forge-rpi.png) | ![Conferma della cancellazione](docs/screenshots/it-12-forge-confirm.png) |
+| **Raspberry Pi**: nome host, utente, SSH, Wi-Fi, lingua, come Raspberry Pi Imager | **Ogni cancellazione va confermata** dopo aver visto nome, dimensione, dispositivo e volumi dell'unità |
+| ![Avanzamento in tempo reale](docs/screenshots/it-13-forge-progress.png) | ![Risultato della formattazione](docs/screenshots/it-14-forge-result.png) |
+| **Avanzamento in tempo reale**: velocità, tempo rimanente, fasi; le operazioni continuano anche a finestra chiusa | **Risultato**: tabella delle partizioni e filesystem scritti, fasi e registro |
+| ![Cancellazione sicura](docs/screenshots/it-15-forge-wipe.png) | ![Dottore delle tabelle delle partizioni](docs/screenshots/it-16-forge-doctor.png) |
+| **Cancellazione sicura**: zeri, casuale, DoD 5220.22-M, Gutmann, con il tempo stimato | **Dottore delle tabelle delle partizioni**: controllo, riparazione, MBR ⇄ GPT |
+
 Tutti gli screenshot vengono dal motore reale con volumi reali (vedi [Verifica](#verifica)).
 
 ## Compilare dai sorgenti

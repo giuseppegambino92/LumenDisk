@@ -92,6 +92,19 @@ Requires macOS 14 Sonoma or later.
 | ![Disk images](docs/screenshots/en-07-images.png) | ![Menu bar](docs/screenshots/en-08-menubar.png) |
 | **Disk images**: drag & drop, URL, create a test disk | **Menu bar** companion |
 
+### Create & Format
+
+| | |
+|---|---|
+| ![Create & Format: an image ready to write](docs/screenshots/en-09-forge-image.png) | ![Windows installation media options](docs/screenshots/en-10-forge-windows.png) |
+| **Write an image**: drop it, LumenDisk inspects it and recommends DD or ISO mode, and checks it against `SHA256SUMS` | **Windows media**: skip the Windows 11 hardware checks, local account, no privacy questions, language and time zone |
+| ![Raspberry Pi first boot settings](docs/screenshots/en-11-forge-rpi.png) | ![Erase confirmation](docs/screenshots/en-12-forge-confirm.png) |
+| **Raspberry Pi**: hostname, user, SSH, Wi-Fi, locale, like Raspberry Pi Imager | **Every erase is confirmed** after seeing the drive's name, size, device and volumes |
+| ![Live progress](docs/screenshots/en-13-forge-progress.png) | ![Format result](docs/screenshots/en-14-forge-result.png) |
+| **Live progress**: speed, time left, phases; jobs keep running when the window is closed | **Result**: the partition table and filesystem written, phases and log |
+| ![Secure wipe](docs/screenshots/en-15-forge-wipe.png) | ![Partition table doctor](docs/screenshots/en-16-forge-doctor.png) |
+| **Secure wipe**: zeros, random, DoD 5220.22-M, Gutmann, with time estimates | **Partition table doctor**: check, repair, MBR ⇄ GPT |
+
 All screenshots come from the real engine with real volumes (see [Verification](#verification)).
 
 ## Build from source

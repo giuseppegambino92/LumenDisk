@@ -494,6 +494,7 @@ final class DiskMonitor {
             Set(list.flatMap(\.partitions).map { "\($0.bsdName)|\($0.mediaUUID ?? "")|\($0.volumeName ?? "")|\($0.probedLabel ?? "")" })
         }
         let partitionsChanged = identity(result) != identity(disks)
+        if ScreenshotMode.enabled { result.removeAll { !$0.whole.isDiskImage } }
         if result != disks { disks = result }
 
         for partition in result.flatMap(\.partitions) where !announced.contains(partition.bsdName) {

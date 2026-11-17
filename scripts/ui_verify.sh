@@ -97,6 +97,10 @@ PY
 ISO_SHA=$(cut -d' ' -f1 "$W/forge/SHA256SUMS")
 mkfile -n 3g "$W/forge/big.img"
 
+# UI_SCREENSHOT_MODE=1: dark appearance and only disk images listed (no drives of this Mac), for
+# the README screenshots in docs/screenshots.
+if [ -n "${UI_SCREENSHOT_MODE:-}" ]; then export LUMENDISK_SCREENSHOT_MODE=1 LUMENDISK_DARK=1; fi
+
 FAIL=0
 for LANG_CODE in it en; do
   rm -f "$W/ready" "$W/control" "$W/control.ack"
