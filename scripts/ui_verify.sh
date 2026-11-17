@@ -189,7 +189,7 @@ for LANG_CODE in it en; do
   # Partition doctor (read-only check) on the freshly formatted disk.
   run 60 "forge logs closed" "forge done create" "select forge:doctor" "forge target $FBSD doctor" "forge doctor-check" "forge wait doctor 40"
   grep -q 'forge job [0-9]* doctor state=succeeded.*"healthy":true' "$LOG" && echo "  ✓ [$LANG_CODE] forge: doctor check: healthy GPT" \
-    || { echo "  ✗ [$LANG_CODE] forge: doctor check failed"; FAIL=1; }
+    || { echo "  ✗ [$LANG_CODE] forge: doctor check failed"; grep -E "DEBUG: forge (target|doctor|job|wait|confirmed)" "$LOG" | tail -6 | sed 's/^/    ✗ log: /' | cut -c1-400; FAIL=1; }
   shot forge_doctor
   # Checksums: a 3 GB sparse file in progress, then the ISO compared with SHA256SUMS and a pasted value.
   run 20 "forge done doctor" "select forge:hash" "forge hash $W/forge/big.img"
