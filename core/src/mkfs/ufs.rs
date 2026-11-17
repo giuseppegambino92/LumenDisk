@@ -302,7 +302,9 @@ fn geometry_inner(bytes: u64, bsize: u32) -> Result<Geometry, Inner> {
     if cs_end > cg0_ndblk {
         return Err(if ncg > 1 { Inner::TooBig } else { Inner::TooSmall });
     }
-    if (cg0_ndblk - roundup(cs_end, fr)) / fr < 2 {
+    // cs_end ≤ cg0_ndblk, but rounding it up to a block can pass the end of a group whose
+    // size is not a whole number of blocks: that leaves no free block at all.
+    if cg0_ndblk.checked_sub(roundup(cs_end, fr)).is_none_or(|free| free / fr < 2) {
         return Err(Inner::TooSmall);
     }
 
